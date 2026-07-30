@@ -11,6 +11,7 @@ export interface PlacedTile {
   y: number;
   width: number;
   height: number;
+  thumbhash: string | null;
 }
 
 export interface Placement {
@@ -19,19 +20,27 @@ export interface Placement {
   contentHeight: number;
 }
 
-/** justified 配置 (day / month)。 */
+/** justified 配置 (day / month)。thumbhash はタイルへ引き継ぐ。 */
 export function placeJustified(
   items: LayoutItem[],
   containerWidth: number,
   targetRowHeight: number,
-  gap: number
+  gap: number,
+  thumbhashById?: Map<string, string | null>
 ): Placement {
   const rows = justifiedLayout(items, { containerWidth, targetRowHeight, gap });
   const tiles: PlacedTile[] = [];
   let y = 0;
   for (const row of rows) {
     for (const t of row.tiles) {
-      tiles.push({ id: t.id, x: t.x, y, width: t.width, height: row.height });
+      tiles.push({
+        id: t.id,
+        x: t.x,
+        y,
+        width: t.width,
+        height: row.height,
+        thumbhash: thumbhashById?.get(t.id) ?? null
+      });
     }
     y += row.height + gap;
   }
@@ -41,14 +50,14 @@ export function placeJustified(
 
 /** 正方形グリッド配置 (year)。cell は 1 辺の目標サイズ。 */
 export function placeSquareGrid(
-  ids: { id: string }[],
+  items: { id: string; thumbhash?: string | null }[],
   containerWidth: number,
   cell: number,
   gap: number
 ): Placement {
   const perRow = Math.max(1, Math.floor((containerWidth + gap) / (cell + gap)));
   // 端数を width に均等分配せず、cell 固定 (docs/04: 均一グリッド)。
-  const tiles: PlacedTile[] = ids.map((it, i) => {
+  const tiles: PlacedTile[] = items.map((it, i) => {
     const col = i % perRow;
     const row = Math.floor(i / perRow);
     return {
@@ -56,10 +65,11 @@ export function placeSquareGrid(
       x: col * (cell + gap),
       y: row * (cell + gap),
       width: cell,
-      height: cell
+      height: cell,
+      thumbhash: it.thumbhash ?? null
     };
   });
-  const rowCount = Math.ceil(ids.length / perRow);
+  const rowCount = Math.ceil(items.length / perRow);
   const contentHeight = rowCount > 0 ? rowCount * (cell + gap) - gap : 0;
   return { tiles, contentHeight };
 }
@@ -109,5 +119,6 @@ export function place(
     return placeSquareGrid(items, containerWidth, target, TILE_GAP);
   }
   const layoutItems: LayoutItem[] = items.map((it) => ({ id: it.id, ratio: it.ratio }));
-  return placeJustified(layoutItems, containerWidth, target, TILE_GAP);
+  const thumbhashById = new Map(items.map((it) => [it.id, it.thumbhash]));
+  return placeJustified(layoutItems, containerWidth, target, TILE_GAP, thumbhashById);
 }

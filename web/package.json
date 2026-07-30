@@ -25,10 +25,12 @@
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-svelte": "^2.45.1",
     "fast-check": "^4.9.0",
+    "hash-wasm": "^4.12.0",
     "prettier": "^3.3.3",
     "prettier-plugin-svelte": "^3.2.6",
     "svelte": "^5.53.10",
     "svelte-check": "^4.0.0",
+    "thumbhash": "^0.1.1",
     "typescript": "^5.5.4",
     "vite": "^5.4.21",
     "vitest": "^1.6.1"

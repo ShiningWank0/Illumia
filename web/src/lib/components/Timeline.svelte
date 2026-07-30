@@ -6,9 +6,12 @@
   //  - 画面外バケットは DOM から外す。データは LRU キャッシュに残す
   import { onMount } from 'svelte';
   import { getApi, type Bucket, type BucketItem, type Granularity } from '$lib/api';
+  import { WS_SUPPORTED, connectAssetsWs, type WsHandle } from '$lib/api/ws';
   import { LruCache } from '$lib/timeline/lru';
   import { bucketLabel } from '$lib/timeline/format';
   import { estimateContentHeight, place, type PlacedTile } from '$lib/timeline/place';
+  import { toasts } from '$lib/toast.svelte';
+  import AssetImage from './AssetImage.svelte';
   import Viewer from './Viewer.svelte';
 
   const api = getApi();
@@ -46,6 +49,15 @@
   let errorMsg = $state<string | null>(null);
 
   let scrollEl: HTMLDivElement | undefined;
+  let fileInput: HTMLInputElement | undefined;
+  let wsHandle: WsHandle | undefined;
+
+  // アップロード / ドラッグ状態。
+  let dragging = $state(false);
+  let uploading = $state(false);
+
+  // ビューアで参照するため、id → thumbhash / ratio を保持する。
+  const itemMeta = new Map<string, { thumbhash: string | null }>();
 
   // ビューア状態。
   let viewerOpen = $state(false);
@@ -153,6 +165,7 @@
     const oldHeight = b.height;
     const wasAbove = b.top + oldHeight <= scrollTop;
 
+    for (const it of items) itemMeta.set(it.id, { thumbhash: it.thumbhash });
     b.tiles = placement.tiles;
     b.contentHeight = placement.contentHeight;
     b.height = HEADER_HEIGHT + placement.contentHeight;
@@ -261,11 +274,126 @@
     viewerOpen = true;
   }
 
-  // 画像プレースホルダ色 (thumbhash デコードは将来対応。ここは id ハッシュ由来)。
-  function placeholderColor(id: string): string {
-    let h = 0;
-    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) % 360;
-    return `hsl(${h} 25% 22%)`;
+  // ---- アップロード ----
+  function pad2(n: number): string {
+    return n < 10 ? `0${n}` : String(n);
+  }
+
+  /** ファイルのローカル日付から各粒度のバケットキーを返す。 */
+  function bucketKeysOf(file: File): Record<Granularity, string> {
+    const d = new Date(file.lastModified);
+    const y = d.getFullYear();
+    const day = `${y}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+    return { day, month: day.slice(0, 7), year: day.slice(0, 4) };
+  }
+
+  function invalidateFile(file: File) {
+    const keys = bucketKeysOf(file);
+    cache.delete(cacheKey('day', keys.day));
+    cache.delete(cacheKey('month', keys.month));
+    cache.delete(cacheKey('year', keys.year));
+  }
+
+  async function handleFiles(files: FileList | File[]) {
+    const arr = [...files].filter((f) => f.type.startsWith('image/'));
+    if (arr.length === 0) return;
+    uploading = true;
+    let created = 0;
+    let dup = 0;
+    let failed = 0;
+    const affected = new Set<string>();
+    for (const f of arr) {
+      try {
+        const r = await api.uploadAsset(f);
+        if (r.status === 'duplicate') dup++;
+        else created++;
+        affected.add(bucketKeysOf(f)[granularity]);
+        invalidateFile(f);
+      } catch (e) {
+        failed++;
+        toasts.error(`${f.name}: ${e instanceof Error ? e.message : 'アップロード失敗'}`);
+      }
+    }
+    uploading = false;
+    const parts = [`新規 ${created}`, `重複 ${dup}`];
+    if (failed) parts.push(`失敗 ${failed}`);
+    toasts.push(`アップロード完了: ${parts.join(' / ')}`, failed ? 'error' : 'success');
+    if (created > 0 || dup > 0) await syncBuckets(affected);
+  }
+
+  function onDrop(e: DragEvent) {
+    e.preventDefault();
+    dragging = false;
+    if (e.dataTransfer?.files) void handleFiles(e.dataTransfer.files);
+  }
+  function onDragOver(e: DragEvent) {
+    e.preventDefault();
+    dragging = true;
+  }
+  function onDragLeave() {
+    dragging = false;
+  }
+  function onFilePicked(e: Event) {
+    const input = e.target as HTMLInputElement;
+    if (input.files) void handleFiles(input.files);
+    input.value = '';
+  }
+
+  /**
+   * バケット一覧を再取得し、スクロール位置を保ちつつ差分だけ反映する。
+   * 変更のないバケットは計測済みレイアウトを再利用する (全体再計算を避ける)。
+   */
+  async function syncBuckets(invalidateKeys: Set<string>) {
+    let list: Bucket[];
+    try {
+      list = await api.getBuckets(granularity);
+    } catch {
+      return;
+    }
+    const prev = new Map(buckets.map((b) => [b.key, b]));
+    const [anchorIdx] = computeVisibleRange();
+    const anchor = buckets[anchorIdx];
+    const anchorKey = anchor?.key;
+    const anchorDelta = anchor ? scrollTop - anchor.top : 0;
+
+    buckets = list.map((b) => {
+      const old = prev.get(b.key);
+      const reuse = old && old.measured && old.count === b.count && !invalidateKeys.has(b.key);
+      if (reuse) return old;
+      return {
+        key: b.key,
+        count: b.count,
+        top: 0,
+        height: estimateHeight(b.count),
+        contentHeight: 0,
+        measured: false,
+        loading: false,
+        tiles: [],
+        itemIds: []
+      };
+    });
+    recomputeTops();
+    if (anchorKey && scrollEl) {
+      const na = buckets.find((x) => x.key === anchorKey);
+      if (na) {
+        scrollEl.scrollTop = na.top + anchorDelta;
+        scrollTop = scrollEl.scrollTop;
+      }
+    }
+    updateVisible();
+  }
+
+  /** WS assets_added (現状 WS_SUPPORTED=false のため未使用パス)。 */
+  function handleAssetsAdded(dayKeys: string[]) {
+    const affected = new Set<string>();
+    for (const dayKey of dayKeys) {
+      const gk = granularity === 'day' ? dayKey : dayKey.slice(0, granularity === 'month' ? 7 : 4);
+      cache.delete(cacheKey('day', dayKey));
+      cache.delete(cacheKey('month', dayKey.slice(0, 7)));
+      cache.delete(cacheKey('year', dayKey.slice(0, 4)));
+      affected.add(gk);
+    }
+    void syncBuckets(affected);
   }
 
   // 幅変化に追従して再レイアウト。relayout() が containerWidth を読むので依存に入る。
@@ -282,63 +410,94 @@
       el.addEventListener('touchmove', onTouchMove, { passive: true });
       el.addEventListener('touchend', onTouchEnd, { passive: true });
     }
+    // WS は require_auth (Bearer ヘッダ) 配下でブラウザから接続不可のため、
+    // WS_SUPPORTED=false の間は接続しない (→ src/lib/api/ws.ts の注記)。
+    if (WS_SUPPORTED) {
+      wsHandle = connectAssetsWs(handleAssetsAdded);
+    }
     return () => {
       if (el) {
         el.removeEventListener('wheel', onWheel);
         el.removeEventListener('touchmove', onTouchMove);
         el.removeEventListener('touchend', onTouchEnd);
       }
+      wsHandle?.close();
     };
   });
 </script>
 
-<div class="toolbar">
-  <div class="zoom">
-    {#each zoomOrder as g (g)}
-      <button
-        class:active={granularity === g}
-        onclick={() => setGranularity(g)}
-        aria-pressed={granularity === g}
-      >
-        {g === 'day' ? '日' : g === 'month' ? '月' : '年'}
-      </button>
-    {/each}
+<div class="timeline">
+  <div class="toolbar">
+    <div class="zoom">
+      {#each zoomOrder as g (g)}
+        <button
+          class:active={granularity === g}
+          onclick={() => setGranularity(g)}
+          aria-pressed={granularity === g}
+        >
+          {g === 'day' ? '日' : g === 'month' ? '月' : '年'}
+        </button>
+      {/each}
+    </div>
+    <div class="hint">Ctrl+ホイール / ピンチでズーム</div>
+    <button class="upload" onclick={() => fileInput?.click()} disabled={uploading}>
+      {uploading ? 'アップロード中…' : 'アップロード'}
+    </button>
+    <input
+      bind:this={fileInput}
+      type="file"
+      accept="image/*"
+      multiple
+      hidden
+      onchange={onFilePicked}
+    />
   </div>
-  <div class="hint">Ctrl+ホイール / ピンチでズーム</div>
-</div>
 
-<div class="scroller" bind:this={scrollEl} onscroll={onScroll} bind:clientHeight={viewportHeight}>
-  {#if errorMsg}
-    <p class="status error">{errorMsg}</p>
-  {:else if loadingBuckets}
-    <p class="status">読み込み中…</p>
-  {:else if buckets.length === 0}
-    <p class="status">画像がありません。</p>
-  {/if}
+  <div
+    class="scroller"
+    class:dragging
+    bind:this={scrollEl}
+    onscroll={onScroll}
+    bind:clientHeight={viewportHeight}
+    ondrop={onDrop}
+    ondragover={onDragOver}
+    ondragleave={onDragLeave}
+    role="list"
+  >
+    {#if errorMsg}
+      <p class="status error">{errorMsg}</p>
+    {:else if loadingBuckets}
+      <p class="status">読み込み中…</p>
+    {:else if buckets.length === 0}
+      <p class="status">画像がありません。ドラッグ&ドロップかアップロードで追加できます。</p>
+    {/if}
 
-  <div class="spacer" style="height:{totalHeight}px" bind:clientWidth={containerWidth}>
-    {#each visibleBuckets as b (b.key)}
-      <section class="bucket" style="transform: translateY({b.top}px)">
-        <h2 class="bucket-header" style="height:{HEADER_HEIGHT}px">
-          {bucketLabel(granularity, b.key)}
-          <span class="count">{b.count}</span>
-        </h2>
-        <div class="bucket-body" style="height:{b.contentHeight}px; top:{HEADER_HEIGHT}px">
-          {#each b.tiles as t (t.id)}
-            <button
-              class="tile"
-              style="left:{t.x}px; top:{t.y}px; width:{t.width}px; height:{t.height}px; background:{placeholderColor(
-                t.id
-              )}"
-              onclick={() => openViewer(t.id)}
-              aria-label="画像を開く"
-            >
-              <img src={api.thumbnailUrl(t.id)} alt="" loading="lazy" draggable="false" />
-            </button>
-          {/each}
-        </div>
-      </section>
-    {/each}
+    {#if dragging}
+      <div class="drop-hint">ここにドロップしてアップロード</div>
+    {/if}
+
+    <div class="spacer" style="height:{totalHeight}px" bind:clientWidth={containerWidth}>
+      {#each visibleBuckets as b (b.key)}
+        <section class="bucket" style="transform: translateY({b.top}px)">
+          <h2 class="bucket-header" style="height:{HEADER_HEIGHT}px">
+            {bucketLabel(granularity, b.key)}
+            <span class="count">{b.count}</span>
+          </h2>
+          <div class="bucket-body" style="height:{b.contentHeight}px; top:{HEADER_HEIGHT}px">
+            {#each b.tiles as t (t.id)}
+              <button
+                class="tile"
+                style="left:{t.x}px; top:{t.y}px; width:{t.width}px; height:{t.height}px"
+                onclick={() => openViewer(t.id)}
+                aria-label="画像を開く"
+              >
+                <AssetImage id={t.id} thumbhash={t.thumbhash} />
+              </button>
+            {/each}
+          </div>
+        </section>
+      {/each}
+    </div>
   </div>
 </div>
 
@@ -346,20 +505,42 @@
   <Viewer
     ids={viewerIds}
     index={viewerIndex}
+    thumbhashOf={(id) => itemMeta.get(id)?.thumbhash ?? null}
     onClose={() => (viewerOpen = false)}
     onIndex={(i) => (viewerIndex = i)}
   />
 {/if}
 
 <style>
+  .timeline {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+  }
   .toolbar {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 1rem;
     padding: 0.5rem 0.75rem;
     border-bottom: 1px solid #26262e;
     background: #16161c;
+    flex-shrink: 0;
+  }
+  .toolbar .hint {
+    flex: 1;
+  }
+  .upload {
+    border: none;
+    border-radius: 8px;
+    background: #6d5bd0;
+    color: #fff;
+    padding: 6px 14px;
+    cursor: pointer;
+    font-size: 0.9rem;
+  }
+  .upload:disabled {
+    opacity: 0.6;
+    cursor: default;
   }
   .zoom {
     display: inline-flex;
@@ -387,11 +568,26 @@
   }
   .scroller {
     position: relative;
-    height: calc(100vh - 49px);
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
     padding: 0 12px;
     background: #101116;
+  }
+  .scroller.dragging {
+    outline: 2px dashed #6d5bd0;
+    outline-offset: -6px;
+  }
+  .drop-hint {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    text-align: center;
+    padding: 0.75rem;
+    color: #c4b5fd;
+    background: rgba(109, 91, 208, 0.15);
+    pointer-events: none;
   }
   .spacer {
     position: relative;
@@ -442,11 +638,6 @@
     overflow: hidden;
     cursor: pointer;
     display: block;
-  }
-  .tile img {
-    width: 100%;
-    height: 100%;
-    object-fit: cover;
-    display: block;
+    background: #1c1c22;
   }
 </style>

@@ -18,6 +18,13 @@ module.exports = {
     sourceType: 'module'
   },
   plugins: ['@typescript-eslint'],
+  rules: {
+    // 先頭 _ の引数/変数は未使用を許可 (インタフェース実装のスタブ等)。
+    '@typescript-eslint/no-unused-vars': [
+      'error',
+      { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' }
+    ]
+  },
   overrides: [
     {
       files: ['*.svelte'],

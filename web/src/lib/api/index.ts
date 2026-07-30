@@ -5,21 +5,22 @@
 
 import { createHttpClient, defaultBaseUrl } from './client';
 import { createMockClient } from './mock';
-import type { TimelineApi } from './types';
+import type { IllumiaApi } from './types';
 
 export * from './types';
 export { getToken, setToken } from './token';
 export { defaultBaseUrl } from './client';
 
-function useMock(): boolean {
+/** モックモードか。VITE_USE_MOCK=1 で有効。 */
+export function isMock(): boolean {
   return import.meta.env?.VITE_USE_MOCK === '1' || import.meta.env?.VITE_USE_MOCK === 'true';
 }
 
-let singleton: TimelineApi | null = null;
+let singleton: IllumiaApi | null = null;
 
-/** アプリ全体で共有する TimelineApi を返す。 */
-export function getApi(): TimelineApi {
+/** アプリ全体で共有する IllumiaApi を返す。 */
+export function getApi(): IllumiaApi {
   if (singleton) return singleton;
-  singleton = useMock() ? createMockClient() : createHttpClient({ baseUrl: defaultBaseUrl() });
+  singleton = isMock() ? createMockClient() : createHttpClient({ baseUrl: defaultBaseUrl() });
   return singleton;
 }

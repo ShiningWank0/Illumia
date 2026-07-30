@@ -1,7 +1,24 @@
-// docs/03_api.md の型定義。REST + WS のうち、タイムライン UI で使う範囲を定義する。
+// docs/03_api.md の型定義。M1 (illumia-server) が公開する範囲を UI 向けに型付けする。
 
 /** タイムラインのズーム粒度。docs/04 の 3 段階。 */
 export type Granularity = 'day' | 'month' | 'year';
+
+/** `GET /api/server/info` (未認証可)。 */
+export interface ServerInfo {
+  version: string;
+  setup_completed: boolean;
+}
+
+/** setup / login リクエスト body。 */
+export interface AuthRequest {
+  password: string;
+  device_name: string;
+}
+
+/** setup / login レスポンス。 */
+export interface TokenResponse {
+  token: string;
+}
 
 /**
  * bucket 集計の 1 エントリ (`GET /api/timeline/buckets`)。
@@ -20,22 +37,47 @@ export interface Bucket {
 export interface BucketItem {
   id: string;
   ratio: number;
-  thumbhash: string;
+  thumbhash: string | null;
   taken_at: string; // ISO 8601
 }
 
-/** アセット詳細 (`GET /api/assets/{id}`)。将来のビューア/詳細で使用。 */
+/** アセット詳細 / trash / duplicate で共有する形 (`AssetResponse`)。 */
 export interface Asset {
   id: string;
   filename: string;
   width: number;
   height: number;
   ratio: number;
-  thumbhash: string;
+  thumbhash: string | null;
   taken_at: string;
   created_at: string;
-  status: 'created' | 'duplicate' | 'trashed';
+  status: 'created' | 'duplicate' | 'trashed' | 'purging';
   duplicate_of?: string;
+  trashed_at?: string;
+  purge_after?: string;
+}
+
+/** アップロード結果 (`POST /api/assets`)。 */
+export interface UploadResult {
+  id: string;
+  status: 'created' | 'duplicate';
+  duplicate_of?: string;
+}
+
+/** 重複ペア (`GET /api/duplicates`)。 */
+export interface DuplicatePair {
+  dup: Asset;
+  original: Asset;
+  purge_after?: string;
+}
+
+/** 設定 (`GET/PATCH /api/settings`)。UI が扱うキーのみ抜粋。 */
+export interface AppSettings {
+  'trash.retention_days': number;
+  'dedup.retention_days': number;
+  'jobs.thumbnail_concurrency': number;
+  'jobs.ml_concurrency': number;
+  [key: string]: number | string | null;
 }
 
 /** WS メッセージ (docs/03)。タイムラインは assets_added を購読する。 */
@@ -62,16 +104,36 @@ export class ApiError extends Error {
 }
 
 /**
- * タイムライン UI が依存する API 抽象。実サーバー実装 (client.ts) と
+ * UI が依存する API 抽象。実サーバー実装 (client.ts) と
  * モック実装 (mock.ts) の両方がこれを満たす。
  */
-export interface TimelineApi {
-  /** 全バケットの件数集計を取得。 */
+export interface IllumiaApi {
+  // --- メタ / 認証 ---
+  serverInfo(): Promise<ServerInfo>;
+  setup(req: AuthRequest): Promise<TokenResponse>;
+  login(req: AuthRequest): Promise<TokenResponse>;
+
+  // --- タイムライン ---
   getBuckets(granularity: Granularity): Promise<Bucket[]>;
-  /** 指定バケットの実データ (taken_at DESC) を取得。 */
   getBucketItems(granularity: Granularity, key: string): Promise<BucketItem[]>;
-  /** 240px サムネイル URL。 */
+  /** 240px サムネイル URL (要認証。取得は image.ts 経由)。 */
   thumbnailUrl(id: string): string;
   /** 1440px プレビュー URL (全画面ビューア用)。 */
   previewUrl(id: string): string;
+  /** 原本ダウンロード URL。 */
+  originalUrl(id: string): string;
+
+  // --- アセット操作 ---
+  uploadAsset(file: File): Promise<UploadResult>;
+  trashAsset(id: string): Promise<void>;
+  restoreAsset(id: string): Promise<void>;
+
+  // --- ゴミ箱 / 重複 ---
+  getTrash(): Promise<Asset[]>;
+  getDuplicates(): Promise<DuplicatePair[]>;
+  purgeNow(id: string): Promise<void>;
+
+  // --- 設定 ---
+  getSettings(): Promise<AppSettings>;
+  patchSettings(patch: Partial<AppSettings>): Promise<AppSettings>;
 }

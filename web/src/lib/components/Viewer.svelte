@@ -1,16 +1,16 @@
 <script lang="ts">
-  // 全画面ビューアの骨格。左右キー/スワイプで前後、Esc で閉じる。preview URL を使う。
-  import { getApi } from '$lib/api';
+  // 全画面ビューアの骨格。左右キー/スワイプで前後、Esc で閉じる。preview を使う。
+  import AssetImage from './AssetImage.svelte';
 
   interface Props {
     ids: string[]; // 表示順の asset id 列 (読み込み済み範囲)
     index: number; // 現在位置
+    thumbhashOf?: (id: string) => string | null;
     onClose: () => void;
     onIndex: (i: number) => void;
   }
 
-  const { ids, index, onClose, onIndex }: Props = $props();
-  const api = getApi();
+  const { ids, index, thumbhashOf, onClose, onIndex }: Props = $props();
 
   const current = $derived(ids[index]);
   const canPrev = $derived(index > 0);
@@ -58,7 +58,17 @@
   <button class="nav prev" onclick={prev} disabled={!canPrev} aria-label="前へ">‹</button>
 
   {#if current}
-    <img class="stage" src={api.previewUrl(current)} alt={current} draggable="false" />
+    <div class="stage">
+      {#key current}
+        <AssetImage
+          id={current}
+          variant="preview"
+          thumbhash={thumbhashOf?.(current) ?? null}
+          fit="contain"
+          alt={current}
+        />
+      {/key}
+    </div>
   {/if}
 
   <button class="nav next" onclick={next} disabled={!canNext} aria-label="次へ">›</button>
@@ -76,9 +86,8 @@
     user-select: none;
   }
   .stage {
-    max-width: 92vw;
-    max-height: 92vh;
-    object-fit: contain;
+    width: 92vw;
+    height: 92vh;
     box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
   }
   .close {

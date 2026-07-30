@@ -1,8 +1,20 @@
-// 開発用モック。サーバー未完成のため、TimelineApi と同一インタフェースで
-// 決定的な擬似データ (縦長 / 横長 / 正方形を混ぜた数千件) を返す。
-// VITE_USE_MOCK=1 で選択される (index.ts)。
+// 開発用モック。サーバー未完成でも UI を動かせるよう、IllumiaApi と同一
+// インタフェースで決定的な擬似データ (縦長 / 横長 / 正方形を混ぜた数千件) を返す。
+// VITE_USE_MOCK=1 で選択される (index.ts)。認証・ゴミ箱・重複・設定はスタブ。
 
-import { type Bucket, type BucketItem, type Granularity, type TimelineApi } from './types';
+import {
+  type AppSettings,
+  type Asset,
+  type AuthRequest,
+  type Bucket,
+  type BucketItem,
+  type DuplicatePair,
+  type Granularity,
+  type IllumiaApi,
+  type ServerInfo,
+  type TokenResponse,
+  type UploadResult
+} from './types';
 
 /** mulberry32: 決定的な擬似乱数 (seed から再現可能)。 */
 function mulberry32(seed: number): () => number {
@@ -101,16 +113,33 @@ function svgDataUri(a: MockAsset, size: number): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
-/** モック TimelineApi を生成する。count 件を保持する。 */
-export function createMockClient(count = 3000): TimelineApi {
+/** モック IllumiaApi を生成する。count 件を保持する。 */
+export function createMockClient(count = 3000): IllumiaApi {
   const assets = generateAssets(count);
   const byId = new Map(assets.map((a) => [a.id, a]));
+  const settings: AppSettings = {
+    'trash.retention_days': 30,
+    'dedup.retention_days': 14,
+    'jobs.thumbnail_concurrency': 3,
+    'jobs.ml_concurrency': 1
+  };
 
   // 疑似ネットワーク遅延 (レイアウト/仮想スクロールの挙動確認用)。
   const delay = <T>(value: T): Promise<T> =>
     new Promise((resolve) => setTimeout(() => resolve(value), 30 + Math.random() * 60));
 
   return {
+    // --- 認証 (モックは常にセットアップ済み・任意パスワードでログイン成功) ---
+    async serverInfo(): Promise<ServerInfo> {
+      return delay({ version: 'mock', setup_completed: true });
+    },
+    async setup(_req: AuthRequest): Promise<TokenResponse> {
+      return delay({ token: 'mock-token' });
+    },
+    async login(_req: AuthRequest): Promise<TokenResponse> {
+      return delay({ token: 'mock-token' });
+    },
+
     async getBuckets(g: Granularity): Promise<Bucket[]> {
       const counts = new Map<string, number>();
       for (const a of assets) {
@@ -130,7 +159,7 @@ export function createMockClient(count = 3000): TimelineApi {
         .map((a) => ({
           id: a.id,
           ratio: a.ratio,
-          thumbhash: `mockhash-${a.id}`,
+          thumbhash: null, // モックはプレースホルダ色で代替 (実 thumbhash ではない)
           taken_at: a.taken_at
         }));
       return delay(items);
@@ -140,10 +169,40 @@ export function createMockClient(count = 3000): TimelineApi {
       const a = byId.get(id);
       return a ? svgDataUri(a, 240) : '';
     },
-
     previewUrl(id: string): string {
       const a = byId.get(id);
       return a ? svgDataUri(a, 1440) : '';
+    },
+    originalUrl(id: string): string {
+      const a = byId.get(id);
+      return a ? svgDataUri(a, 1440) : '';
+    },
+
+    // --- 操作系スタブ ---
+    async uploadAsset(_file: File): Promise<UploadResult> {
+      return delay({ id: 'mock-upload', status: 'created' });
+    },
+    async trashAsset(_id: string): Promise<void> {
+      return delay(undefined);
+    },
+    async restoreAsset(_id: string): Promise<void> {
+      return delay(undefined);
+    },
+    async getTrash(): Promise<Asset[]> {
+      return delay([]);
+    },
+    async getDuplicates(): Promise<DuplicatePair[]> {
+      return delay([]);
+    },
+    async purgeNow(_id: string): Promise<void> {
+      return delay(undefined);
+    },
+    async getSettings(): Promise<AppSettings> {
+      return delay({ ...settings });
+    },
+    async patchSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
+      Object.assign(settings, patch);
+      return delay({ ...settings });
     }
   };
 }
