@@ -4,7 +4,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use illumia_core::{
     PurgeService,
     assets::{Asset, AssetService, Lifecycle},
-    db::{Database, Result},
+    db::{Database, Error, Result},
     settings::Settings,
     stacks::StackService,
     timeline::{Granularity, TimelineService},
@@ -227,6 +227,35 @@ fn i5_purge_deletes_only_the_rows_owned_files() -> Result<()> {
 
     assert_eq!(fs::read(&original_path)?, bytes);
     assert!(!duplicate_path.exists());
+    Ok(())
+}
+
+#[test]
+fn purge_rejects_non_uuid_vault_blob_ids_before_deleting_files() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let uploaded = instant(2025, 5, 2, 0);
+    let asset = fixture.ingest(51, "invalid-blob.png", uploaded);
+    let asset_path = fixture.absolute_path(&asset);
+    let vault_dir = fixture.database.data_root().join("vault");
+    fs::create_dir_all(vault_dir.join("blobs"))?;
+    let traversal_target = vault_dir.join("sentinel");
+    fs::write(&traversal_target, b"must remain")?;
+    fixture.database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO vault_blobs(blob_id, wrapped_key, kind, asset_id)
+             VALUES ('../sentinel', X'00', 'original', ?1)",
+            [&asset.id],
+        )?;
+        Ok(())
+    })?;
+    fixture.assets.trash_at(&asset.id, uploaded)?;
+
+    assert!(matches!(
+        fixture.purge.purge_now(&asset.id),
+        Err(Error::InvalidVaultBlob)
+    ));
+    assert!(asset_path.is_file());
+    assert_eq!(fs::read(traversal_target)?, b"must remain");
     Ok(())
 }
 

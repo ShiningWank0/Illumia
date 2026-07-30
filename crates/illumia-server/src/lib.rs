@@ -105,6 +105,7 @@ fn app_with_events(
         .route("/vault/timeline/buckets", get(api::timeline_buckets))
         .route("/vault/timeline/buckets/{key}", get(api::timeline_bucket))
         .route("/vault/trash", get(api::trash))
+        .route("/vault/trash/{id}", delete(api::purge_now))
         .route("/vault/duplicates", get(api::duplicates))
         .route(
             "/vault/stacks",

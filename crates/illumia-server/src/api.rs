@@ -838,8 +838,10 @@ pub async fn duplicates(
 pub async fn purge_now(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<StatusCode> {
-    PurgeService::new(state.database).purge_now(&id)?;
+    let selected = SelectedDatabase::from_request(&state, access);
+    selected.result(PurgeService::new(selected.database.clone()).purge_now(&id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

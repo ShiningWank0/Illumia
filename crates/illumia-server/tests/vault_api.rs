@@ -14,7 +14,7 @@ use illumia_core::{
     assets::AssetService,
     db::Database,
     uuid::Uuid,
-    vault::{KdfParams, init_with_kdf},
+    vault::{KdfParams, VaultHandle, init_with_kdf},
 };
 use serde_json::{Value, json};
 use tower::ServiceExt;
@@ -489,6 +489,135 @@ async fn vault_session_expires_at_injected_ttl() {
         status.json(),
         json!({"initialized": true, "unlocked": false})
     );
+}
+
+#[tokio::test]
+async fn vault_manual_purge_deletes_only_the_selected_assets_row_and_blobs() {
+    let directory = TestDirectory::new();
+    let database = Database::open(&directory.path).expect("test database should open");
+    init_with_kdf(
+        &directory.path,
+        "vault purge password",
+        KdfParams::for_tests(),
+    )
+    .expect("test vault should initialize");
+    let app = TestApp {
+        router: illumia_server::app_with_vault_ttl(
+            database.clone(),
+            None,
+            Duration::from_secs(15 * 60),
+        ),
+        database,
+        _directory: directory,
+    };
+    let auth = app.setup().await;
+    let unlocked = app
+        .request(
+            Method::POST,
+            "/api/vault/unlock",
+            Some(&auth),
+            None,
+            Some(json!({"password": "vault purge password"})),
+        )
+        .await;
+    assert_eq!(unlocked.status, StatusCode::OK);
+    let session = unlocked.json()["vault_session"]
+        .as_str()
+        .expect("vault session")
+        .to_owned();
+
+    let bytes = one_pixel_png();
+    let survivor = AssetService::new(app.database.clone())
+        .ingest(&bytes, "survivor.png", None)
+        .expect("survivor asset should ingest")
+        .asset;
+    let target = AssetService::new(app.database.clone())
+        .ingest(&bytes, "target.png", None)
+        .expect("target asset should ingest")
+        .asset;
+    let imported = app
+        .request(
+            Method::POST,
+            "/api/vault/import",
+            Some(&auth),
+            Some(&session),
+            Some(json!({"asset_ids": [survivor.id, target.id]})),
+        )
+        .await;
+    assert_eq!(imported.status, StatusCode::NO_CONTENT);
+
+    let vault = VaultHandle::unlock(app.root(), "vault purge password")
+        .expect("vault should open for assertions");
+    let target_blob_ids = asset_blob_ids(&vault.db, &target.id);
+    let survivor_blob_ids = asset_blob_ids(&vault.db, &survivor.id);
+    assert_eq!(target_blob_ids.len(), 3);
+    assert_eq!(survivor_blob_ids.len(), 3);
+    for blob_id in target_blob_ids.iter().chain(&survivor_blob_ids) {
+        assert!(vault_blob_path(app.root(), blob_id).is_file());
+    }
+
+    let trashed = app
+        .request(
+            Method::DELETE,
+            &format!("/api/vault/assets/{}", target.id),
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(trashed.status, StatusCode::OK);
+    let purged = app
+        .request(
+            Method::DELETE,
+            &format!("/api/vault/trash/{}", target.id),
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(purged.status, StatusCode::NO_CONTENT);
+
+    assert_eq!(asset_row_count(&vault.db, &target.id), 0);
+    assert!(asset_blob_ids(&vault.db, &target.id).is_empty());
+    for blob_id in &target_blob_ids {
+        assert!(!vault_blob_path(app.root(), blob_id).exists());
+    }
+    assert_eq!(asset_row_count(&vault.db, &survivor.id), 1);
+    assert_eq!(asset_blob_ids(&vault.db, &survivor.id), survivor_blob_ids);
+    for blob_id in &survivor_blob_ids {
+        assert!(vault_blob_path(app.root(), blob_id).is_file());
+    }
+}
+
+fn asset_blob_ids(database: &Database, asset_id: &str) -> Vec<String> {
+    database
+        .with_connection(|connection| {
+            let mut statement = connection
+                .prepare("SELECT blob_id FROM vault_blobs WHERE asset_id = ?1 ORDER BY kind")?;
+            let ids = statement
+                .query_map([asset_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(ids)
+        })
+        .expect("vault blob rows should be readable")
+}
+
+fn asset_row_count(database: &Database, asset_id: &str) -> i64 {
+    database
+        .with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT count(*) FROM assets WHERE id = ?1",
+                    [asset_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+        .expect("vault asset row should be countable")
+}
+
+fn vault_blob_path(data_root: &Path, blob_id: &str) -> PathBuf {
+    data_root.join("vault").join("blobs").join(blob_id)
 }
 
 fn assert_plaintext_trace_absent(database: &Database, asset_id: &str, search_term: &str) {

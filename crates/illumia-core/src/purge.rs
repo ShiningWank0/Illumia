@@ -114,8 +114,8 @@ impl PurgeService {
     }
 
     fn finish_purging(&self, id: &str) -> Result<()> {
-        let library_path = self.database.with_connection(|connection| {
-            connection
+        let (library_path, blob_ids) = self.database.with_connection(|connection| {
+            let library_path = connection
                 .query_row(
                     "SELECT library_path FROM assets
                      WHERE id = ?1 AND lifecycle = 'purging'",
@@ -123,10 +123,20 @@ impl PurgeService {
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
-                .ok_or(Error::AssetNotFound)
+                .ok_or(Error::AssetNotFound)?;
+            let mut statement =
+                connection.prepare("SELECT blob_id FROM vault_blobs WHERE asset_id = ?1")?;
+            let blob_ids = statement
+                .query_map([id], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok((library_path, blob_ids))
         })?;
 
+        let blob_paths = checked_vault_blob_paths(self.database.data_root(), &blob_ids)?;
         purge_asset_files(self.database.data_root(), id, &library_path)?;
+        for path in blob_paths {
+            remove_owned_file(&path)?;
+        }
 
         self.database.with_connection(|connection| {
             connection.execute(
@@ -145,6 +155,17 @@ pub(crate) fn purge_asset_files(data_root: &Path, id: &str, library_path: &str) 
     remove_owned_file(&data_root.join("thumbs").join(format!("{id}_t.webp")))?;
     remove_owned_file(&data_root.join("thumbs").join(format!("{id}_p.webp")))?;
     Ok(())
+}
+
+/// `vault: no-log`
+fn checked_vault_blob_paths(data_root: &Path, blob_ids: &[String]) -> Result<Vec<PathBuf>> {
+    blob_ids
+        .iter()
+        .map(|blob_id| {
+            Uuid::parse_str(blob_id).map_err(|_| Error::InvalidVaultBlob)?;
+            Ok(data_root.join("vault").join("blobs").join(blob_id))
+        })
+        .collect()
 }
 
 fn checked_relative_path(path: &str) -> Result<PathBuf> {
