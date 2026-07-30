@@ -8,8 +8,12 @@ use std::{
 
 use rusqlite::Connection;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
-const MIGRATIONS: &[(u32, &str)] = &[(1, include_str!("../migrations/0001_init.sql"))];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, include_str!("../migrations/0001_init.sql")),
+    (2, include_str!("../migrations/0002_vault_blobs.sql")),
+];
 
 /// illumia-core の共通エラー。
 #[derive(Debug, Error)]
@@ -52,6 +56,30 @@ pub enum Error {
     JobRunnerAlreadyStarted,
     #[error("a job worker thread panicked")]
     JobWorkerPanicked,
+    #[error("vault is already initialized")]
+    VaultAlreadyInitialized,
+    #[error("vault is not initialized")]
+    VaultNotInitialized,
+    #[error("vault authentication failed")]
+    VaultAuthenticationFailed,
+    #[error("invalid vault key file")]
+    InvalidVaultKeyFile,
+    #[error("vault cryptographic operation failed")]
+    VaultCrypto,
+    #[error("invalid vault blob")]
+    InvalidVaultBlob,
+    #[error("vault blob not found")]
+    VaultBlobNotFound,
+    #[error("invalid recovery key")]
+    InvalidRecoveryKey,
+    #[error("invalid Argon2 parameters")]
+    InvalidKdfParameters,
+    #[error("random number generation failed")]
+    RandomGeneration,
+    #[error("vault transfer requires at least one asset")]
+    EmptyVaultTransfer,
+    #[error("vault transfer source is incomplete")]
+    IncompleteVaultTransfer,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -74,6 +102,33 @@ impl Database {
         let data_root = data_root.as_ref();
         fs::create_dir_all(data_root)?;
         let mut connection = Connection::open(data_root.join("illumia.db"))?;
+        configure(&connection)?;
+        migrate(&mut connection)?;
+
+        Ok(Self {
+            inner: Arc::new(DatabaseInner {
+                connection: Mutex::new(connection),
+                data_root: data_root.to_path_buf(),
+            }),
+        })
+    }
+
+    /// SQLCipher 鍵を設定して `<data_root>/vault/vault.db` を開く。
+    ///
+    /// `vault: no-log` — 呼び出し元は鍵・パス・asset id をログへ出さないこと。
+    pub(crate) fn open_vault(data_root: &Path, sqlcipher_key: &[u8; 32]) -> Result<Self> {
+        let vault_dir = data_root.join("vault");
+        fs::create_dir_all(vault_dir.join("blobs"))?;
+        let mut connection = Connection::open(vault_dir.join("vault.db"))?;
+        let key = Zeroizing::new(hex::encode(sqlcipher_key));
+        let key_pragma = Zeroizing::new(format!(
+            "PRAGMA key = \"x'{}'\";
+             PRAGMA cipher_memory_security = ON;",
+            key.as_str()
+        ));
+        connection.execute_batch(&key_pragma)?;
+        // Wrong keys fail on the first schema read. Do this before any migration.
+        connection.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
         configure(&connection)?;
         migrate(&mut connection)?;
 
@@ -115,6 +170,14 @@ impl Database {
             .map_err(|_| Error::DatabasePoisoned)?;
         operation(&mut connection)
     }
+
+    /// WAL の内容を DB 本体へ反映して切り詰める。
+    pub fn checkpoint_truncate(&self) -> Result<()> {
+        self.with_connection(|connection| {
+            connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(())
+        })
+    }
 }
 
 fn configure(connection: &Connection) -> Result<()> {
@@ -122,6 +185,8 @@ fn configure(connection: &Connection) -> Result<()> {
         "
         PRAGMA journal_mode = WAL;
         PRAGMA foreign_keys = ON;
+        PRAGMA secure_delete = ON;
+        PRAGMA temp_store = MEMORY;
         PRAGMA busy_timeout = 5000;
         ",
     )?;

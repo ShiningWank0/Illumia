@@ -11,6 +11,7 @@ pub mod settings;
 pub mod stacks;
 pub mod thumbnails;
 pub mod timeline;
+pub mod vault;
 
 pub use purge::PurgeService;
 pub use {argon2, blake3, chrono, hex, rand, sha2, uuid};

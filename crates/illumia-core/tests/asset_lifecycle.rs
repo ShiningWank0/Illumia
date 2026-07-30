@@ -459,7 +459,7 @@ fn migration_and_typed_settings_are_configured() -> Result<()> {
     fixture.database.with_connection(|connection| {
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
-            1
+            2
         );
         assert_eq!(
             connection.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,

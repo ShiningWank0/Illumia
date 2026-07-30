@@ -27,6 +27,12 @@ const PREVIEW_LONG_EDGE: u32 = 1440;
 const THUMBHASH_LONG_EDGE: u32 = 100;
 const WEBP_QUALITY: f32 = 80.0;
 
+pub(crate) struct InMemoryVariants {
+    pub thumbnail: Vec<u8>,
+    pub preview: Vec<u8>,
+    pub thumbhash: Vec<u8>,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ThumbnailPayload {
     pub asset_id: String,
@@ -121,6 +127,18 @@ pub fn generate_thumbnails(database: &Database, asset_id: &str) -> Result<()> {
             )?;
         }
         Ok(())
+    })
+}
+
+/// Vault 向けに平文ファイルを作らず、全派生画像をメモリ内で生成する。
+pub(crate) fn generate_variants_in_memory(source_bytes: &[u8]) -> Result<InMemoryVariants> {
+    let decoded = image::load_from_memory(source_bytes)?;
+    let (source_width, source_height) = decoded.dimensions();
+    let rgba = decoded.to_rgba8().into_raw();
+    Ok(InMemoryVariants {
+        thumbnail: encode_variant(&rgba, source_width, source_height, THUMBNAIL_LONG_EDGE)?,
+        preview: encode_variant(&rgba, source_width, source_height, PREVIEW_LONG_EDGE)?,
+        thumbhash: make_thumbhash(&rgba, source_width, source_height)?,
     })
 }
 
