@@ -1,0 +1,117 @@
+# CI: push / PR で変更のあったコンポーネントのみ lint + test を実行する。
+# docs のみの変更でも必ず green になる (集約ジョブ ci-ok を必須チェックにする)。
+# 仕様: docs/09_dev_workflow.md
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      web: ${{ steps.filter.outputs.web }}
+      ml: ${{ steps.filter.outputs.ml }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust:
+              - 'crates/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+            web:
+              - 'web/**'
+            ml:
+              - 'ml/**'
+
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace
+
+  web:
+    needs: changes
+    if: needs.changes.outputs.web == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - name: lint / check
+        run: |
+          npm run lint --if-present
+          npm run check --if-present
+      - name: test
+        run: npm test --if-present
+      - name: build
+        run: npm run build
+
+  ml:
+    needs: changes
+    if: needs.changes.outputs.ml == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync
+      - name: ruff
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: pytest
+        run: |
+          if [ -d tests ]; then uv run pytest; else echo "no tests yet"; fi
+
+  # ブランチ保護の必須チェックはこのジョブだけを指定する。
+  # skip されたジョブは成功扱い、failure / cancelled があれば落とす。
+  ci-ok:
+    needs: [changes, rust, web, ml]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: verify results
+        run: |
+          results='${{ join(needs.*.result, ' ') }}'
+          echo "job results: $results"
+          case "$results" in
+            *failure*|*cancelled*) echo "CI failed"; exit 1 ;;
+            *) echo "CI ok" ;;
+          esac
