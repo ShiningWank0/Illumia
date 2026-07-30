@@ -74,12 +74,6 @@ pub struct DuplicatePair {
     pub original: Asset,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StackLocation {
-    pub stack_id: String,
-    pub chapter_id: String,
-}
-
 #[derive(Clone, Debug)]
 pub struct AssetService {
     database: Database,
@@ -353,85 +347,6 @@ impl AssetService {
         })
     }
 
-    /// 最小のスタックと第 1 章を作る。ページ追加は [`Self::add_to_stack`] で行う。
-    pub fn create_stack(&self, title: &str) -> Result<StackLocation> {
-        let stack_id = Uuid::now_v7().to_string();
-        let chapter_id = Uuid::now_v7().to_string();
-        let now = timestamp(Utc::now());
-        self.database.with_connection_mut(|connection| {
-            let transaction = connection.transaction()?;
-            transaction.execute(
-                "INSERT INTO manga_stacks(id, title, cover_asset_id, created_at, updated_at)
-                 VALUES (?1, ?2, NULL, ?3, ?3)",
-                params![stack_id, title, now],
-            )?;
-            transaction.execute(
-                "INSERT INTO stack_chapters(id, stack_id, chapter_no, title)
-                 VALUES (?1, ?2, 1, NULL)",
-                params![chapter_id, stack_id],
-            )?;
-            transaction.commit()?;
-            Ok(StackLocation {
-                stack_id,
-                chapter_id,
-            })
-        })
-    }
-
-    /// ページ追加と duplicate の active 昇格、可視フラグ更新を同一 transaction で行う。
-    pub fn add_to_stack(
-        &self,
-        location: &StackLocation,
-        asset_id: &str,
-        page_no: u32,
-        show_in_timeline: bool,
-    ) -> Result<()> {
-        self.database.with_connection_mut(|connection| {
-            let transaction = connection.transaction()?;
-            transaction.execute(
-                "INSERT INTO stack_pages(
-                    stack_id, chapter_id, asset_id, page_no, show_in_timeline
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    location.stack_id,
-                    location.chapter_id,
-                    asset_id,
-                    page_no,
-                    show_in_timeline
-                ],
-            )?;
-            let changed = transaction.execute(
-                "UPDATE assets
-                 SET lifecycle = CASE
-                       WHEN lifecycle = 'duplicate' THEN 'active'
-                       ELSE lifecycle
-                     END,
-                     purge_after = CASE
-                       WHEN lifecycle = 'duplicate' THEN NULL
-                       ELSE purge_after
-                     END,
-                     visible_in_timeline = CASE
-                       WHEN lifecycle IN ('active','duplicate')
-                        AND in_timeline = 1
-                        AND NOT EXISTS (
-                          SELECT 1 FROM stack_pages sp
-                          WHERE sp.asset_id = assets.id
-                            AND sp.show_in_timeline = 0
-                        )
-                       THEN 1 ELSE 0
-                     END
-                 WHERE id = ?1
-                   AND lifecycle IN ('active','duplicate','trashed')",
-                [asset_id],
-            )?;
-            if changed == 0 {
-                return Err(Error::AssetNotFound);
-            }
-            transaction.commit()?;
-            Ok(())
-        })
-    }
-
     fn get_with_connection(
         &self,
         connection: &rusqlite::Connection,
@@ -464,7 +379,7 @@ impl AssetService {
     }
 }
 
-fn asset_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Asset> {
+pub(crate) fn asset_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<Asset> {
     let lifecycle: String = row.get(offset + 14)?;
     Ok(Asset {
         id: row.get(offset)?,

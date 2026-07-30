@@ -388,6 +388,245 @@ async fn complete_m1_api_flow() {
     assert_eq!(original["id"], first_id);
 }
 
+#[tokio::test]
+async fn manga_stack_api_preserves_structure_when_a_page_is_trashed() {
+    let app = TestApp::new();
+    let (status, setup) = app
+        .json(
+            Method::POST,
+            "/api/auth/setup",
+            None,
+            json!({"password": "stack password", "device_name": "stack test"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let token = setup["token"]
+        .as_str()
+        .expect("setup should issue a token")
+        .to_owned();
+
+    let (status, unauthorized) = app
+        .json(
+            Method::POST,
+            "/api/stacks",
+            None,
+            json!({"title": "銀河漫画作品", "asset_ids": []}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized["error"]["code"], "unauthorized");
+
+    let png = one_pixel_png();
+    let checksum = blake3::hash(&png).to_hex().to_string();
+    let mut asset_ids = Vec::new();
+    for (index, filename) in ["一頁.png", "二頁.png", "三頁.png"].iter().enumerate() {
+        let (status, asset) = upload(
+            &app,
+            &token,
+            &png,
+            filename,
+            &checksum,
+            &format!("2026-07-30T12:3{}:56+09:00", index + 1),
+        )
+        .await;
+        assert!(
+            matches!(status, StatusCode::CREATED | StatusCode::OK),
+            "{asset:?}"
+        );
+        asset_ids.push(asset["id"].as_str().expect("asset id").to_owned());
+    }
+
+    let (status, created) = app
+        .json(
+            Method::POST,
+            "/api/stacks",
+            Some(&token),
+            json!({
+                "title": "銀河漫画作品",
+                "asset_ids": [asset_ids[0], asset_ids[1]]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created:?}");
+    let stack_id = created["id"].as_str().expect("stack id").to_owned();
+    assert_eq!(created["cover_asset_id"], asset_ids[0]);
+    assert_eq!(
+        created["chapters"][0]["pages"]
+            .as_array()
+            .expect("pages should be an array")
+            .len(),
+        2
+    );
+    assert_eq!(created["chapters"][0]["pages"][0]["page_no"], 1);
+
+    let (status, stacks) = app.get("/api/stacks", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(stacks[0]["id"], stack_id);
+    assert_eq!(stacks[0]["chapter_count"], 1);
+    assert_eq!(stacks[0]["page_count"], 2);
+
+    let (status, patched) = app
+        .json(
+            Method::PATCH,
+            &format!("/api/stacks/{stack_id}"),
+            Some(&token),
+            json!({"title": "銀河漫画完全版", "cover_asset_id": asset_ids[1]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(patched["title"], "銀河漫画完全版");
+    assert_eq!(patched["cover_asset_id"], asset_ids[1]);
+
+    let (status, replaced) = app
+        .json(
+            Method::PUT,
+            &format!("/api/stacks/{stack_id}/structure"),
+            Some(&token),
+            json!({
+                "chapters": [
+                    {"title": "前編", "pages": [asset_ids[1], asset_ids[2]]},
+                    {"title": null, "pages": [asset_ids[0]]}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replaced:?}");
+    assert_eq!(replaced["chapters"][0]["chapter_no"], 1);
+    assert_eq!(replaced["chapters"][0]["pages"][0]["page_no"], 1);
+    assert_eq!(replaced["chapters"][0]["pages"][1]["page_no"], 2);
+    assert_eq!(replaced["chapters"][1]["chapter_no"], 2);
+    assert_eq!(replaced["chapters"][1]["pages"][0]["page_no"], 1);
+
+    let (status, flagged) = app
+        .json(
+            Method::PATCH,
+            &format!("/api/stacks/{stack_id}/pages/{}", asset_ids[0]),
+            Some(&token),
+            json!({"show_in_timeline": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        flagged["chapters"][1]["pages"][0]["asset"]["id"],
+        asset_ids[0]
+    );
+    assert_eq!(flagged["chapters"][1]["pages"][0]["show_in_timeline"], true);
+    assert!(asset_visible(&app.database, &asset_ids[0]));
+
+    let (status, _) = app
+        .json(
+            Method::DELETE,
+            &format!("/api/assets/{}", asset_ids[1]),
+            Some(&token),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, with_trashed_page) = app
+        .get(&format!("/api/stacks/{stack_id}"), Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        with_trashed_page["chapters"][0]["pages"][0]["asset"]["id"],
+        asset_ids[1]
+    );
+    assert_eq!(
+        with_trashed_page["chapters"][0]["pages"][0]["asset"]["status"],
+        "trashed"
+    );
+    assert_eq!(
+        with_trashed_page["chapters"][0]["pages"]
+            .as_array()
+            .expect("pages should be an array")
+            .len(),
+        2
+    );
+
+    let (status, trashed_flagged) = app
+        .json(
+            Method::PATCH,
+            &format!("/api/stacks/{stack_id}/pages/{}", asset_ids[1]),
+            Some(&token),
+            json!({"show_in_timeline": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        trashed_flagged["chapters"][0]["pages"][0]["asset"]["status"],
+        "trashed"
+    );
+    assert!(!asset_visible(&app.database, &asset_ids[1]));
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/stacks/{stack_id}/pages/{}", asset_ids[2]))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("page removal should respond");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(asset_visible(&app.database, &asset_ids[2]));
+
+    let (status, readded) = app
+        .json(
+            Method::POST,
+            &format!("/api/stacks/{stack_id}/pages"),
+            Some(&token),
+            json!({"asset_ids": [asset_ids[2]]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        readded["chapters"][1]["pages"][1]["asset"]["id"],
+        asset_ids[2]
+    );
+    assert_eq!(
+        readded["chapters"][1]["pages"][1]["show_in_timeline"],
+        false
+    );
+    assert!(!asset_visible(&app.database, &asset_ids[2]));
+
+    for query in ["河漫画", "銀河"] {
+        let (status, search) = app
+            .get(
+                &format!("/api/search?q={}", percent_encode(query)),
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(search["stacks"][0]["id"], stack_id);
+        assert_eq!(search["stacks"][0]["title"], "銀河漫画完全版");
+    }
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("/api/stacks/{stack_id}"))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("stack delete should respond");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    for asset_id in asset_ids {
+        let (status, _) = app
+            .get(&format!("/api/assets/{asset_id}"), Some(&token))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+}
+
 async fn upload(
     app: &TestApp,
     token: &str,
@@ -438,6 +677,20 @@ fn percent_encode(value: &str) -> String {
         }
     }
     encoded
+}
+
+fn asset_visible(database: &Database, id: &str) -> bool {
+    database
+        .with_connection(|connection| {
+            connection
+                .query_row(
+                    "SELECT visible_in_timeline FROM assets WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        })
+        .expect("visibility should be readable")
 }
 
 fn one_pixel_png() -> Vec<u8> {

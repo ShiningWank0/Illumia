@@ -81,7 +81,12 @@ impl From<illumia_core::db::Error> for ApiError {
     fn from(error: illumia_core::db::Error) -> Self {
         match error {
             illumia_core::db::Error::AssetNotFound => Self::not_found("asset not found"),
+            illumia_core::db::Error::StackNotFound => Self::not_found("manga stack not found"),
+            illumia_core::db::Error::StackChapterNotFound => {
+                Self::not_found("stack chapter not found")
+            }
             illumia_core::db::Error::InvalidBucketKey
+            | illumia_core::db::Error::InvalidStack(_)
             | illumia_core::db::Error::UnsupportedExtension(_)
             | illumia_core::db::Error::InvalidSetting(_)
             | illumia_core::db::Error::InvalidJobProgress

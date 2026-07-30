@@ -93,6 +93,22 @@ fn app_with_events(
         .route("/trash", get(api::trash))
         .route("/duplicates", get(api::duplicates))
         .route("/trash/{id}", delete(api::purge_now))
+        .route("/stacks", get(api::list_stacks).post(api::create_stack))
+        .route(
+            "/stacks/{id}",
+            get(api::get_stack)
+                .patch(api::patch_stack)
+                .delete(api::delete_stack),
+        )
+        .route(
+            "/stacks/{id}/structure",
+            axum::routing::put(api::replace_stack_structure),
+        )
+        .route("/stacks/{id}/pages", post(api::add_stack_pages))
+        .route(
+            "/stacks/{id}/pages/{asset_id}",
+            axum::routing::patch(api::patch_stack_page).delete(api::remove_stack_page),
+        )
         .route("/search", get(api::search))
         .route("/jobs", get(api::jobs))
         .route("/jobs/{id}/cancel", post(api::cancel_job))

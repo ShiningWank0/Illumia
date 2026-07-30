@@ -8,6 +8,7 @@ pub mod db;
 pub mod jobs;
 mod purge;
 pub mod settings;
+pub mod stacks;
 pub mod thumbnails;
 pub mod timeline;
 

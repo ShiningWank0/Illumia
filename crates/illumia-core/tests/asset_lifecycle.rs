@@ -6,6 +6,7 @@ use illumia_core::{
     assets::{Asset, AssetService, Lifecycle},
     db::{Database, Result},
     settings::Settings,
+    stacks::StackService,
     timeline::{Granularity, TimelineService},
 };
 use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
@@ -16,6 +17,7 @@ struct Fixture {
     database: Database,
     assets: AssetService,
     purge: PurgeService,
+    stacks: StackService,
     timeline: TimelineService,
 }
 
@@ -26,6 +28,7 @@ impl Fixture {
         Ok(Self {
             assets: AssetService::new(database.clone()),
             purge: PurgeService::new(database.clone()),
+            stacks: StackService::new(database.clone()),
             timeline: TimelineService::new(database.clone()),
             database,
             _directory: directory,
@@ -155,12 +158,9 @@ fn i3_stack_references_block_duplicate_and_trashed_purge() -> Result<()> {
         .ingest_at(&duplicate_bytes, "duplicate.png", Some(uploaded), uploaded)?
         .asset;
     let trashed = fixture.ingest(31, "trashed.png", uploaded);
-    let stack = fixture.assets.create_stack("保護スタック")?;
-
     fixture
-        .assets
-        .add_to_stack(&stack, &duplicate.id, 1, false)?;
-    fixture.assets.add_to_stack(&stack, &trashed.id, 2, false)?;
+        .stacks
+        .create("保護スタック", &[duplicate.id.clone(), trashed.id.clone()])?;
 
     // duplicate の昇格漏れを意図的に再現しても SQL の NOT EXISTS が防ぐ。
     fixture.force_expired(&duplicate.id, "duplicate", uploaded - Duration::seconds(1));
@@ -235,8 +235,10 @@ fn i6_restore_recovers_timeline_search_and_stack_visibility() -> Result<()> {
     let fixture = Fixture::new()?;
     let uploaded = instant(2025, 6, 15, 8);
     let asset = fixture.ingest(60, "星空作品.png", uploaded);
-    let stack = fixture.assets.create_stack("作品スタック")?;
-    fixture.assets.add_to_stack(&stack, &asset.id, 1, true)?;
+    let stack = fixture
+        .stacks
+        .create("作品スタック", std::slice::from_ref(&asset.id))?;
+    fixture.stacks.set_page_flag(&stack.id, &asset.id, true)?;
 
     let before_buckets = fixture.timeline.buckets(Granularity::Day)?;
     let before_search = searchable_asset_count(&fixture.database, &asset.id)?;
@@ -313,11 +315,9 @@ fn promoted_duplicate_does_not_violate_primary_hash_unique_index() -> Result<()>
         .assets
         .ingest_at(&bytes, "copy.png", Some(uploaded), uploaded)?
         .asset;
-    let stack = fixture.assets.create_stack("重複昇格")?;
-
     fixture
-        .assets
-        .add_to_stack(&stack, &duplicate.id, 1, false)?;
+        .stacks
+        .create("重複昇格", std::slice::from_ref(&duplicate.id))?;
     let promoted = fixture
         .assets
         .get(&duplicate.id)?

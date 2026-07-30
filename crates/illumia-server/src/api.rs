@@ -25,6 +25,7 @@ use illumia_core::{
     db::Database,
     jobs::{Job, JobQueue, JobState},
     settings::{QualityGate, Settings},
+    stacks::{ChapterInput, MangaStack, StackChapter, StackPage, StackService, StackSummary},
     thumbnails,
     timeline::{BucketItem, Granularity, TimelineService},
     uuid::Uuid,
@@ -170,8 +171,134 @@ pub struct SearchQuery {
 #[derive(Serialize)]
 pub struct SearchResponse {
     assets: Vec<AssetResponse>,
-    stacks: Vec<Value>,
+    stacks: Vec<StackSummaryResponse>,
     clusters: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateStackRequest {
+    title: String,
+    asset_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PatchStackRequest {
+    title: Option<String>,
+    cover_asset_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceStackStructureRequest {
+    chapters: Vec<ChapterRequest>,
+}
+
+#[derive(Deserialize)]
+pub struct ChapterRequest {
+    title: Option<String>,
+    pages: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct AddStackPagesRequest {
+    asset_ids: Vec<String>,
+    chapter_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PatchStackPageRequest {
+    show_in_timeline: bool,
+}
+
+#[derive(Serialize)]
+pub struct StackSummaryResponse {
+    id: String,
+    title: String,
+    cover_asset_id: Option<String>,
+    chapter_count: u32,
+    page_count: u32,
+    created_at: String,
+    updated_at: String,
+}
+
+impl From<StackSummary> for StackSummaryResponse {
+    fn from(stack: StackSummary) -> Self {
+        Self {
+            id: stack.id,
+            title: stack.title,
+            cover_asset_id: stack.cover_asset_id,
+            chapter_count: stack.chapter_count,
+            page_count: stack.page_count,
+            created_at: stack.created_at,
+            updated_at: stack.updated_at,
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct StackResponse {
+    id: String,
+    title: String,
+    cover_asset_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    chapters: Vec<StackChapterResponse>,
+}
+
+impl From<MangaStack> for StackResponse {
+    fn from(stack: MangaStack) -> Self {
+        Self {
+            id: stack.id,
+            title: stack.title,
+            cover_asset_id: stack.cover_asset_id,
+            created_at: stack.created_at,
+            updated_at: stack.updated_at,
+            chapters: stack
+                .chapters
+                .into_iter()
+                .map(StackChapterResponse::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct StackChapterResponse {
+    id: String,
+    chapter_no: u32,
+    title: Option<String>,
+    pages: Vec<StackPageResponse>,
+}
+
+impl From<StackChapter> for StackChapterResponse {
+    fn from(chapter: StackChapter) -> Self {
+        Self {
+            id: chapter.id,
+            chapter_no: chapter.chapter_no,
+            title: chapter.title,
+            pages: chapter
+                .pages
+                .into_iter()
+                .map(StackPageResponse::from)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub struct StackPageResponse {
+    page_no: u32,
+    show_in_timeline: bool,
+    asset: AssetResponse,
+}
+
+impl From<StackPage> for StackPageResponse {
+    fn from(page: StackPage) -> Self {
+        Self {
+            page_no: page.page_no,
+            show_in_timeline: page.show_in_timeline,
+            asset: page.asset.into(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -477,6 +604,112 @@ pub async fn purge_now(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn create_stack(
+    State(state): State<AppState>,
+    Json(request): Json<CreateStackRequest>,
+) -> ApiResult<(StatusCode, Json<StackResponse>)> {
+    let stack = StackService::new(state.database).create(&request.title, &request.asset_ids)?;
+    Ok((StatusCode::CREATED, Json(stack.into())))
+}
+
+pub async fn list_stacks(
+    State(state): State<AppState>,
+) -> ApiResult<Json<Vec<StackSummaryResponse>>> {
+    let stacks = StackService::new(state.database)
+        .list()?
+        .into_iter()
+        .map(StackSummaryResponse::from)
+        .collect();
+    Ok(Json(stacks))
+}
+
+pub async fn get_stack(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<StackResponse>> {
+    let stack = StackService::new(state.database)
+        .get(&id)?
+        .ok_or_else(|| ApiError::not_found("manga stack not found"))?;
+    Ok(Json(stack.into()))
+}
+
+pub async fn patch_stack(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<PatchStackRequest>,
+) -> ApiResult<Json<StackResponse>> {
+    if request.title.is_none() && request.cover_asset_id.is_none() {
+        return Err(ApiError::bad_request(
+            "title or cover_asset_id must be provided",
+        ));
+    }
+    let stack = StackService::new(state.database).update_metadata(
+        &id,
+        request.title.as_deref(),
+        request.cover_asset_id.as_deref(),
+    )?;
+    Ok(Json(stack.into()))
+}
+
+pub async fn delete_stack(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> ApiResult<StatusCode> {
+    StackService::new(state.database).delete_stack(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn replace_stack_structure(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<ReplaceStackStructureRequest>,
+) -> ApiResult<Json<StackResponse>> {
+    let chapters = request
+        .chapters
+        .into_iter()
+        .map(|chapter| ChapterInput {
+            title: chapter.title,
+            pages: chapter.pages,
+        })
+        .collect::<Vec<_>>();
+    let stack = StackService::new(state.database).replace_structure(&id, &chapters)?;
+    Ok(Json(stack.into()))
+}
+
+pub async fn add_stack_pages(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AddStackPagesRequest>,
+) -> ApiResult<Json<StackResponse>> {
+    let stack = StackService::new(state.database).add_pages(
+        &id,
+        &request.asset_ids,
+        request.chapter_id.as_deref(),
+    )?;
+    Ok(Json(stack.into()))
+}
+
+pub async fn remove_stack_page(
+    State(state): State<AppState>,
+    Path((id, asset_id)): Path<(String, String)>,
+) -> ApiResult<StatusCode> {
+    StackService::new(state.database).remove_page(&id, &asset_id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn patch_stack_page(
+    State(state): State<AppState>,
+    Path((id, asset_id)): Path<(String, String)>,
+    Json(request): Json<PatchStackPageRequest>,
+) -> ApiResult<Json<StackResponse>> {
+    let stack = StackService::new(state.database).set_page_flag(
+        &id,
+        &asset_id,
+        request.show_in_timeline,
+    )?;
+    Ok(Json(stack.into()))
+}
+
 pub async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -490,6 +723,11 @@ pub async fn search(
         }));
     }
     let ids = search_asset_ids(&state.database, &query)?;
+    let stacks = StackService::new(state.database.clone())
+        .search(&query)?
+        .into_iter()
+        .map(StackSummaryResponse::from)
+        .collect();
     let service = AssetService::new(state.database);
     let mut assets = Vec::with_capacity(ids.len());
     for id in ids {
@@ -499,7 +737,7 @@ pub async fn search(
     }
     Ok(Json(SearchResponse {
         assets,
-        stacks: Vec::new(),
+        stacks,
         clusters: Vec::new(),
     }))
 }

@@ -30,6 +30,12 @@ pub enum Error {
     DatabasePoisoned,
     #[error("asset not found")]
     AssetNotFound,
+    #[error("manga stack not found")]
+    StackNotFound,
+    #[error("stack chapter not found")]
+    StackChapterNotFound,
+    #[error("invalid manga stack: {0}")]
+    InvalidStack(String),
     #[error("unsupported image extension: {0}")]
     UnsupportedExtension(String),
     #[error("invalid setting value for {0}")]
