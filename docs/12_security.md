@@ -110,8 +110,9 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 
 - runtime は非 root、`cap_drop: ALL`, `no-new-privileges`, read-only root filesystem、
   writable volume の限定、PID/CPU/memory 上限を既定とする。
-- data directory と secret は専用 UID/GID のみ読み書き可能にする。backup も同等に暗号化し、
-  Vault keyfile と DB/blob を一緒に外部公開しない。
+- data directory は Unix では mode `0700`、DB と keyfile は `0600` とし、専用 UID/GID
+  のみ読み書き可能にする。権限を変更できない共有 filesystem は公開運用に使わない。
+  backup も同等に暗号化し、Vault keyfile と DB/blob を一緒に外部公開しない。
 - build context は `.env*`, key, DB, image library、Git metadata を除外する。
 - Cargo/npm/Python/Docker/GitHub Actions の dependency update と脆弱性監査を CI で行う。
   release job の token permission は job 単位の最小権限とし、SBOM/provenance を生成する。

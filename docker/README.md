@@ -8,8 +8,9 @@
 > `echo <PAT> | docker login ghcr.io -u <github-user> --password-stdin` で pull できる。
 
 Illumia のサーバーと Web UI を1つのコンテナで実行します。コンテナは TCP
-`0.0.0.0:2283` で待ち受け、Web UI も同じポートから配信します。永続データはすべて
-コンテナ内の `/data` に保存されます。
+`0.0.0.0:2283` で待ち受けますが、Compose が host へ publish するのは既定で
+`127.0.0.1:2283` だけです。Web UI も同じポートから配信し、永続データはすべて
+コンテナ内の `/data` に保存します。
 
 現時点の Compose 構成では `illumia-server` のみを起動します。設計上の
 `illumia-ml` サイドカーは将来追加予定です。
@@ -19,22 +20,25 @@ Illumia のサーバーと Web UI を1つのコンテナで実行します。コ
 リポジトリのルートで次を実行します。
 
 ```sh
-docker compose -f docker/compose.yaml pull
-docker compose -f docker/compose.yaml up -d
+cp docker/.env.example docker/.env
+chmod 600 docker/.env
+# docker/.env の ILLUMIA_SETUP_TOKEN に `openssl rand -hex 32` の出力を設定する
+docker compose --env-file docker/.env -f docker/compose.yaml pull
+docker compose --env-file docker/.env -f docker/compose.yaml up -d
 ```
 
 公開済みの `ghcr.io/shiningwank0/illumia-server:latest` イメージを使用します。
 状態とログは次のコマンドで確認できます。
 
 ```sh
-docker compose -f docker/compose.yaml ps
-docker compose -f docker/compose.yaml logs -f illumia-server
+docker compose --env-file docker/.env -f docker/compose.yaml ps
+docker compose --env-file docker/.env -f docker/compose.yaml logs -f illumia-server
 ```
 
 停止する場合は次を実行します。named volume は削除されないため、データは保持されます。
 
 ```sh
-docker compose -f docker/compose.yaml down
+docker compose --env-file docker/.env -f docker/compose.yaml down
 ```
 
 `down -v` は永続データの volume も削除するため、データを失ってよい場合を除いて
@@ -42,12 +46,30 @@ docker compose -f docker/compose.yaml down
 
 ## 初回セットアップ
 
-1. コンテナの起動後、ブラウザで `http://<サーバーのIPアドレス>:2283` を開きます。
-2. 初回セットアップ画面で管理用パスワードと、このブラウザを識別する端末名を設定します。
-3. セットアップ後は同じ URL からログインして利用します。
+1. `docker/.env` に十分にランダムな `ILLUMIA_SETUP_TOKEN` を設定して起動します。
+2. 同一hostのブラウザ、SSH port forwarding、または認証済みPangolin経由で
+   `http://127.0.0.1:2283` 相当へアクセスします。
+3. 初回画面でsetup token、Illumiaの共有パスワード、このブラウザを識別する端末名を
+   入力します。Illumia自身にログインIDはなく、端末名は認証要素ではありません。
+4. 完了後は `.env` からsetup tokenを削除してコンテナを再作成します。
 
-外部ネットワークから公開する場合は、直接 2283 番ポートをインターネットへ開放せず、
-認証と TLS を設定したリバースプロキシや VPN の利用を推奨します。
+初回セットアップ前にsetup tokenなしで非loopback listenしようとすると、serverは
+fail closedで終了します。LANから平文HTTPで直接使うためhost bindを広げる運用は推奨しません。
+どうしても行う場合だけComposeのport bindと `ILLUMIA_SECURE_COOKIES=false` を明示的に
+変更し、router/firewallでLAN外を拒否してください。
+
+## Pangolin / Newt で公開する
+
+- Newtをhost上で動かす場合、resourceのtargetを `http://127.0.0.1:2283` にします。
+- Newtもcontainerの場合はIllumiaと専用のprivate Docker networkを共有し、Illumiaの
+  `ports:` を削除してtargetを `http://illumia-server:2283` にします。
+- Pangolin resource authenticationを必ず有効にし、Illumiaとは別の強いpasswordとMFAを
+  使います。日本限定ruleは `country=JP` を **Pass to Auth**、末尾を **Deny** にします。
+  `Allow` はPangolin認証を迂回するため使いません。
+- GeoIPはVPN、国内proxy、国内botを防げません。CrowdSecも別途導入・bouncer・logを設定
+  した場合だけ機能します。Newtを起動しただけで怪しい通信が自動blockされるとは扱いません。
+- routerのport forwarding、UPnP、IPv6 firewallを確認し、外部回線からorigin IPの2283へ
+  直接到達できないことを実測します。外部公開はHTTPSのみとします。
 
 ## データの永続化
 
@@ -66,7 +88,8 @@ volumes:
 
 コンテナは UID/GID `1000:1000` の非 root ユーザー `illumia` で動作します。バインド
 マウントを使う場合は、保存先ディレクトリをこの UID/GID から読み書きできるように
-設定してください。
+設定してください。serverはUnix上でdata rootを `0700`、DB/keyfileを `0600` にします。
+ACLやfilesystemの制約でこの権限を設定できない保存先では起動に失敗します。
 
 ## TrueNAS SCALE の Custom App
 
@@ -75,11 +98,11 @@ volumes:
 追加し、次の値を設定します。
 
 - イメージ: `ghcr.io/shiningwank0/illumia-server:latest`
-- コンテナポート／ホストポート: `2283` / `2283`
+- コンテナポート: `2283`。host portは原則publishせず、必要ならloopbackだけ
 - ホストパス: `/mnt/pool/illumia`
 - コンテナ内パス: `/data`
 - 再起動ポリシー: `unless-stopped`
-- 環境変数: 下表の3項目
+- 環境変数: 下表。初回のみ `ILLUMIA_SETUP_TOKEN` も必須
 
 TrueNAS SCALE の「Install via YAML」を使う場合は、`compose.yaml` を基にしつつ、
 ローカルソースを必要とする `build:` セクションを削除し、`illumia_data:/data` を
@@ -94,8 +117,12 @@ TrueNAS SCALE の「Install via YAML」を使う場合は、`compose.yaml` を�
 | `ILLUMIA_DATA_DIR` | `/data` | DB、画像、Vault などを保存するデータルート。コンテナでは `/data` のまま使用します。 |
 | `ILLUMIA_ADDR` | `0.0.0.0:2283` | HTTP サーバーの listen アドレス。コンテナ外から接続するため `0.0.0.0` を使用します。 |
 | `ILLUMIA_WEB_DIST` | `/app/web` | サーバーが配信する Web SPA のビルド成果物ディレクトリ。 |
+| `ILLUMIA_SETUP_TOKEN` | 空 | 初回セットアップ用の32〜256 byte secret。初回完了後は削除。 |
+| `ILLUMIA_SECURE_COOKIES` | `true` | HTTPS公開時は必ずtrue。平文LAN直結時だけfalse。 |
+| `ILLUMIA_TRUST_PROXY_HEADERS` | `false` | 直接到達経路がなく、proxyが受信headerを除去・再設定すると確認した場合だけtrue。 |
 
-これらは `docker/Dockerfile.server` に設定済みです。通常は上書き不要です。
+先頭3項目は `docker/Dockerfile.server` に設定済みです。secretをCompose YAML、Git、
+shell history、通常logへ直接書かないでください。
 
 ## `docker run` で起動する
 
@@ -106,10 +133,21 @@ docker volume create illumia_data
 docker run -d \
   --name illumia-server \
   --restart unless-stopped \
-  -p 2283:2283 \
+  -p 127.0.0.1:2283:2283 \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,nodev,size=64m \
+  --cap-drop ALL \
+  --security-opt no-new-privileges=true \
+  --pids-limit 256 \
+  --memory 3g \
+  --cpus 4 \
+  --env-file docker/.env \
   -v illumia_data:/data \
   ghcr.io/shiningwank0/illumia-server:latest
 ```
+
+長期運用ではmutableな `latest` ではなく、確認済みrelease tag、可能なら
+`image@sha256:<digest>` を指定し、更新時にdigestを記録してください。
 
 リポジトリ内の Dockerfile は GitHub Actions で本番イメージを作るためのものです。
 ローカルビルドを行う場合は動作確認用途に限定し、ローカル成果物を配布しないでください。
