@@ -7,7 +7,8 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 - 認証:
   - ネイティブクライアントは `Authorization: Bearer <device_token>`。
   - 同一オリジンの Web SPA は `HttpOnly; SameSite=Strict` Cookie。JavaScript から
-    device token を永続ストレージへ保存しない。
+    device token を受け取らず、永続ストレージへも保存しない。setup / login 時は
+    `X-Illumia-Auth-Mode: cookie` を送り、token を response body に含めない。
   - 初回セットアップとログインを除く。ただし非 loopback での初回セットアップには
     `X-Illumia-Setup-Token` が必須 (→ docs/12)。
 - Vault 系は追加で `X-Vault-Session: <vault_session_token>` (→ docs/06)
@@ -21,7 +22,7 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 
 | Method | Path | 内容 |
 |---|---|---|
-| GET  | /api/server/info | バージョン・セットアップ済みか・現在の認証状態・setup token 要否 (未認証可) |
+| GET  | /api/server/info | セットアップ済みか・現在の認証状態・setup token 要否 (未認証可)。正確な version は認証後のみ |
 | POST | /api/auth/setup | 初回のみ。パスワード設定 → token 発行。構成により setup token 必須 |
 | POST | /api/auth/login | `{password, device_name}` → `{token}` |
 | POST | /api/auth/logout | 現在の device token を失効し、認証 Cookie を削除 |
@@ -31,12 +32,16 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 シングルユーザーであり、**ログイン ID / ユーザー名は存在しない**。`device_name` は
 発行済み token を識別する表示ラベルであって認証要素ではない。パスワードは Argon2id
 でハッシュ化して settings に保存し、新規設定時は 12 文字以上を要求する。
-トークンは 256bit ランダム、DB には SHA-256 のみ保存する。認証成功レスポンスは
-ネイティブクライアント向けに token を返すと同時に Web 用 Cookie を設定する。
-認証レスポンス、Vault レスポンス、`/api/server/info` は `Cache-Control: no-store` とする。
+トークンは 256bit ランダム、DB には SHA-256 のみ保存する。発行数は 256 を上限とする。
+認証成功レスポンスは、ネイティブクライアントには token を返す。Web から
+`X-Illumia-Auth-Mode: cookie` が指定された場合は `204` と Cookie だけを返し、
+JavaScript / Network response body に token を露出しない。Cookie の Path は `/api`。
+API response は既定で `Cache-Control: private, no-store` とし、認証済みのサムネイルと
+プレビューだけ `private, max-age=31536000, immutable` を許可する。
 
 ログインと初期セットアップは、送信元ごとの失敗回数制限と Argon2 の同時実行数制限を
 適用する。パスワード・device name・setup token には処理前の長さ上限を設ける。
+保存済み Argon2 PHC の memory / iteration / parallelism / output 長も検証してから計算する。
 
 ## アセット
 

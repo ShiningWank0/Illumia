@@ -8,8 +8,10 @@
 - 対象: スマホ (縦)・iPad・PC の各画面幅にレスポンシブ対応。
   iPhone/iPad は Web (PWA 化は将来検討)。App Store / Play Store には公開しない。
 - Web SPA は server と同一オリジンで配信する。認証は server が設定する `HttpOnly;
-  SameSite=Strict` Cookie を使い、device token を `localStorage` / `sessionStorage` /
-  IndexedDB や URL へ保存しない。ログアウト時は server 側 token も失効する。
+  SameSite=Strict; Path=/api` Cookie を使う。setup / login では
+  `X-Illumia-Auth-Mode: cookie` を指定し、device token を response body として受け取らず、
+  `localStorage` / `sessionStorage` / IndexedDB や URL へも保存しない。ログアウト時は
+  server 側 token も失効する。
 - ネイティブクライアントが受け取る device token は OS の secure storage
   (Android Keystore / macOS Keychain / Windows Credential Manager) にのみ保存する。
   平文設定ファイル・通常ログ・クラッシュレポートへ含めない。

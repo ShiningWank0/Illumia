@@ -47,7 +47,8 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 ### Web とネイティブ
 
 - Web は同一オリジン Cookie 認証とする。Cookie は `HttpOnly`, `SameSite=Strict`,
-  `Path=/`、HTTPS 公開時は `Secure`。JavaScript から device token を保存・参照しない。
+  `Path=/api`、HTTPS 公開時は `Secure`。Web の setup / login response body に device
+  token を返さず、JavaScript から保存・参照しない。
 - Cookie 認証の非 safe method は同一 authority の `Origin` を必須とする。
 - ネイティブは Bearer token を使い、OS secure storage に保存する。
 - token は URL query、WebSocket URL、HTML、通常ログ、error message に含めない。
@@ -79,7 +80,8 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - `Content-Security-Policy` (`default-src 'self'`, `object-src 'none'`,
   `frame-ancestors 'none'`, `base-uri 'none'` 等)、`X-Content-Type-Options: nosniff`,
   `Referrer-Policy: no-referrer`, `Permissions-Policy` を全 response に付ける。
-- 認証/Vault response は `Cache-Control: no-store`。静的 hashed asset だけを長期 cache する。
+- API response は既定で `Cache-Control: private, no-store`。認証済みの派生画像だけ
+  private browser cache を許可し、共有 proxy cache には保存させない。
 - API body・配列・文字列・画像 dimension/decode allocation・検索結果・WS connection/frame に
   固定上限を設ける。上限超過は処理・allocation 前に 400/413/429 で拒否する。
 - user value は SQL bind parameter で渡す。LIKE wildcard は escape し、動的識別子は
@@ -97,6 +99,10 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - browser に production の `console.log` を残さない。server error は内部詳細、SQL、
   filesystem path、header を client に返さず、client も token や Vault 情報を
   telemetry/crash report へ送らない。
+- Web 認証成功 response は token を body に含めない。なお、利用者自身または端末を
+  操作できる者が DevTools を開けば、入力した password / setup token は送信 request として
+  観測できる。これは Web 認証の性質上隠せないため、その権限を持つ攻撃者は脅威モデル外とし、
+  共有端末を使わず、端末ロックとブラウザプロファイル分離で防ぐ。
 - reverse proxy / CrowdSec access log でも query string と sensitive header を除外し、
   retention と閲覧権限を制限する。
 
