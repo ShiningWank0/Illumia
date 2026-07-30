@@ -1,5 +1,12 @@
 # Illumia の Docker 配布
 
+> **配布ポリシー (重要)**: `ghcr.io/shiningwank0/illumia-server` は private リポジトリに
+> 紐づく **private パッケージ**として運用する。GitHub のパッケージ設定で
+> **絶対に Visibility を public に変更しないこと** (変更すると全世界に公開される)。
+> 共有したい相手には、(1) リポジトリの collaborator に招待する、または
+> (2) `read:packages` のみの Fine-grained PAT を発行して渡す。受け取った側は
+> `echo <PAT> | docker login ghcr.io -u <github-user> --password-stdin` で pull できる。
+
 Illumia のサーバーと Web UI を1つのコンテナで実行します。コンテナは TCP
 `0.0.0.0:2283` で待ち受け、Web UI も同じポートから配信します。永続データはすべて
 コンテナ内の `/data` に保存されます。
