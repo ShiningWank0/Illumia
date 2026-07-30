@@ -4,8 +4,16 @@ illumia-server が公開する HTTP API。all-in-one 版では同じサービス
 in-process 呼び出しするため、**ハンドラにロジックを書かないこと** (→ docs/01)。
 
 - ベースパス: `/api`
-- 認証: `Authorization: Bearer <device_token>` (初回セットアップとログインを除く)
+- 認証:
+  - ネイティブクライアントは `Authorization: Bearer <device_token>`。
+  - 同一オリジンの Web SPA は `HttpOnly; SameSite=Strict` Cookie。JavaScript から
+    device token を永続ストレージへ保存しない。
+  - 初回セットアップとログインを除く。ただし非 loopback での初回セットアップには
+    `X-Illumia-Setup-Token` が必須 (→ docs/12)。
 - Vault 系は追加で `X-Vault-Session: <vault_session_token>` (→ docs/06)
+- Cookie 認証で状態を変更するリクエストは、`Origin` の authority が `Host` と一致しない
+  場合、または `Origin` が欠落する場合に拒否する。Bearer 認証のネイティブクライアントは
+  この CSRF 検査の対象外。
 - エラー: `{ "error": { "code": "string", "message": "string" } }`。
   Vault ロック中の vault 系エンドポイントは一律 **404** を返す (存在秘匿)。
 
@@ -13,14 +21,22 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 
 | Method | Path | 内容 |
 |---|---|---|
-| GET  | /api/server/info | バージョン・セットアップ済みか (未認証可) |
-| POST | /api/auth/setup | 初回のみ。パスワード設定 → token 発行 |
+| GET  | /api/server/info | バージョン・セットアップ済みか・現在の認証状態・setup token 要否 (未認証可) |
+| POST | /api/auth/setup | 初回のみ。パスワード設定 → token 発行。構成により setup token 必須 |
 | POST | /api/auth/login | `{password, device_name}` → `{token}` |
+| POST | /api/auth/logout | 現在の device token を失効し、認証 Cookie を削除 |
 | GET  | /api/auth/devices | 発行済みデバイストークン一覧 |
 | DELETE | /api/auth/devices/{id} | トークン失効 |
 
-シングルユーザー。パスワードは Argon2id でハッシュ化して settings に保存。
-トークンは 256bit ランダム、DB には SHA-256 のみ保存。
+シングルユーザーであり、**ログイン ID / ユーザー名は存在しない**。`device_name` は
+発行済み token を識別する表示ラベルであって認証要素ではない。パスワードは Argon2id
+でハッシュ化して settings に保存し、新規設定時は 12 文字以上を要求する。
+トークンは 256bit ランダム、DB には SHA-256 のみ保存する。認証成功レスポンスは
+ネイティブクライアント向けに token を返すと同時に Web 用 Cookie を設定する。
+認証レスポンス、Vault レスポンス、`/api/server/info` は `Cache-Control: no-store` とする。
+
+ログインと初期セットアップは、送信元ごとの失敗回数制限と Argon2 の同時実行数制限を
+適用する。パスワード・device name・setup token には処理前の長さ上限を設ける。
 
 ## アセット
 
@@ -38,6 +54,9 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 - upload レスポンス: `201 {id, status: "created"}` または
   `200 {id, status: "duplicate", duplicate_of}` (重複でも保存される → docs/11)。
 - checksum 不一致は 400。サーバー側で BLAKE3 を再計算して検証する。
+- multipart 全体は 129 MiB、ファイル本体は 128 MiB を上限とする。画像 decoder には
+  対応 format を明示し、幅・高さ各 32768 px、decode allocation 512 MiB を上限とする。
+  拡張子と実データの format が一致しない入力は拒否する。
 
 ## タイムライン (→ docs/04)
 
@@ -80,6 +99,9 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 
 - FTS5 trigram により**日本語の部分一致**が動作すること (「らき☆すた」「主人公」等)。
   2 文字以下のクエリは LIKE フォールバック。
+- `q` は 256 文字を上限とし、LIKE の `%` / `_` / `\` は文字として escape する。
+  全検索結果には固定の件数上限を設ける。値は常に bind parameter とし、SQL 文字列へ
+  連結しない。
 - レスポンス: `{assets: [...], stacks: [...], clusters: [...]}`。
 - 将来のスマートサーチ/OCR/タグ検索は `q` の解釈を拡張する形で同エンドポイントに載せる
   (→ docs/10)。
@@ -107,6 +129,20 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 
 WS メッセージ例: `{"type":"job", "id":..., "state":"running", "progress":0.42}`,
 `{"type":"assets_added", "bucket_keys":["2026-07-30"]}` (クライアントはバケット単位で再取得)。
+
+ブラウザの WS は認証 Cookie、非ブラウザクライアントは WebSocket handshake の
+`Authorization` header で認証する。**device token を URL query に含めてはならない**。
+WS の `Origin`、接続数、frame/message size を検査・制限する。
+
+## 共通の入力・資源制限
+
+- JSON body: 256 KiB。配列入力 (`hashes`, `asset_ids`, `face_ids`, stack pages 等) は
+  endpoint ごとに固定上限を設ける。
+- 文字列入力: endpoint ごとに文字数と byte 数を制限し、NUL/control character を拒否する。
+- 設定値: concurrency は 1〜64 の範囲など、実行時の資源量へ直結する値を server/core の
+  両境界で検証する。
+- CPU・メモリ・DB を長時間占有する処理は同時実行数を制限し、重い処理はジョブキューへ送る。
+- API の 404/405/413/429/5xx も JSON error envelope で返す。
 
 ## Vault (→ docs/06)
 

@@ -133,3 +133,4 @@ Illumia/
 | 09_dev_workflow.md | 開発体制・エージェント運用・CI ポリシー |
 | 10_future_features.md | 将来的な機能追加プラン |
 | 11_dedup_and_trash.md | 重複管理・ゴミ箱・誤削除防止の不変条件 |
+| 12_security.md | 脅威モデル・認証境界・インターネット公開時の必須要件 |

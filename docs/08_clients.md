@@ -7,12 +7,20 @@
 - 表示言語は日本語を第一とする。検索は日本語入力前提 (→ docs/03)。
 - 対象: スマホ (縦)・iPad・PC の各画面幅にレスポンシブ対応。
   iPhone/iPad は Web (PWA 化は将来検討)。App Store / Play Store には公開しない。
+- Web SPA は server と同一オリジンで配信する。認証は server が設定する `HttpOnly;
+  SameSite=Strict` Cookie を使い、device token を `localStorage` / `sessionStorage` /
+  IndexedDB や URL へ保存しない。ログアウト時は server 側 token も失効する。
+- ネイティブクライアントが受け取る device token は OS の secure storage
+  (Android Keystore / macOS Keychain / Windows Credential Manager) にのみ保存する。
+  平文設定ファイル・通常ログ・クラッシュレポートへ含めない。
 
 ## サーバー接続設定 (Web 以外のクライアント)
 
 Immich モバイルアプリを参考にする。
 
 - 初回起動でサーバー URL を入力 → `GET /api/server/info` で疎通確認 → ログイン。
+- 初回セットアップでは、server が `setup_token_required=true` を返した場合だけ
+  管理者が別経路で取得した setup token も入力する。setup token は保存しない。
 - **ネットワーク別エンドポイント**: 1 つのサーバー登録に対して複数 URL を持てる。
   - `external`: 例 `https://illumia.example.com` (既定)
   - `local`: 例 `http://192.168.1.10:2283` (特定ネットワーク内でのみ有効)
