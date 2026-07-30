@@ -1,0 +1,31 @@
+services:
+  illumia-server:
+    image: ghcr.io/shiningwank0/illumia-server:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    ports:
+      - "2283:2283"
+    volumes:
+      - illumia_data:/data
+      # TrueNAS などでホスト上のデータセットを直接使う場合は、上の named volume を
+      # 次のようなバインドマウントに置き換える:
+      # - /mnt/pool/illumia:/data
+    restart: unless-stopped
+    # ホストの規模に合わせて必要な場合だけ有効化する:
+    # cpus: "4"
+    # mem_limit: 4g
+
+  # 将来追加予定のステートレスな ML サイドカー。
+  # docker/Dockerfile.ml が追加され、イメージが公開された後に有効化する。
+  # illumia-ml:
+  #   image: ghcr.io/shiningwank0/illumia-ml:latest
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile.ml
+  #   restart: unless-stopped
+  #   # cpus: "4"
+  #   # mem_limit: 4g
+
+volumes:
+  illumia_data:
