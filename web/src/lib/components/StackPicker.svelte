@@ -1,14 +1,14 @@
 <script lang="ts">
   // スタック選択モーダル。重複ビュー等から「スタックへ追加」に使う。
   import { onMount } from 'svelte';
-  import { getApi, type StackSummary } from '$lib/api';
+  import { getApi, type IllumiaApi, type StackSummary } from '$lib/api';
 
   interface Props {
     onPick: (stackId: string) => void | Promise<void>;
     onClose: () => void;
+    api?: IllumiaApi;
   }
-  const { onPick, onClose }: Props = $props();
-  const api = getApi();
+  const { onPick, onClose, api = getApi() }: Props = $props();
 
   let stacks = $state<StackSummary[]>([]);
   let loading = $state(true);

@@ -6,7 +6,13 @@
   //  - 画面外バケットは DOM から外す。データは LRU キャッシュに残す
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { getApi, type Bucket, type BucketItem, type Granularity } from '$lib/api';
+  import {
+    getApi,
+    type Bucket,
+    type BucketItem,
+    type Granularity,
+    type IllumiaApi
+  } from '$lib/api';
   import { WS_SUPPORTED, connectAssetsWs, type WsHandle } from '$lib/api/ws';
   import { LruCache } from '$lib/timeline/lru';
   import { bucketLabel } from '$lib/timeline/format';
@@ -15,7 +21,29 @@
   import AssetImage from './AssetImage.svelte';
   import Viewer from './Viewer.svelte';
 
-  const api = getApi();
+  interface Props {
+    /** 差し替え可能な API (vault ミラー用)。既定はメインクライアント。 */
+    api?: IllumiaApi;
+    /** 'vault' ならアップロード非表示・移動アクションが「Vault から出す」になる。 */
+    mode?: 'main' | 'vault';
+    /** スタック作成後の遷移先ベース (/stacks or /vault/stacks)。 */
+    stacksBase?: string;
+    /** メイン: 選択を Vault へ移動 (アンロック時のみ)。 */
+    onImportToVault?: (ids: string[]) => Promise<void>;
+    /** メイン: Vault 未アンロック時に押されたときの誘導。 */
+    onVaultLocked?: () => void;
+    /** vault: 選択を Vault から出す。 */
+    onExportFromVault?: (ids: string[]) => Promise<void>;
+  }
+
+  const {
+    api = getApi(),
+    mode = 'main',
+    stacksBase = '/stacks',
+    onImportToVault,
+    onVaultLocked,
+    onExportFromVault
+  }: Props = $props();
 
   /** 見出しの高さ (推定・配置で加算)。 */
   const HEADER_HEIGHT = 44;
@@ -50,7 +78,7 @@
   let errorMsg = $state<string | null>(null);
 
   let scrollEl: HTMLDivElement | undefined;
-  let fileInput: HTMLInputElement | undefined;
+  let fileInput = $state<HTMLInputElement>();
   let wsHandle: WsHandle | undefined;
 
   // アップロード / ドラッグ状態。
@@ -321,11 +349,36 @@
       const stack = await api.createStack(title, selected);
       toasts.success(`「${title}」を作成しました`);
       exitSelection();
-      await goto(`/stacks/${stack.id}`);
+      await goto(`${stacksBase}/${stack.id}`);
     } catch (e) {
       toasts.error(e instanceof Error ? e.message : 'スタック作成に失敗しました');
     } finally {
       creating = false;
+    }
+  }
+
+  let moving = $state(false);
+  async function moveSelection() {
+    if (selected.length === 0) return;
+    // メイン: Vault へ移動 (未アンロックなら誘導)。vault: Vault から出す。
+    if (mode === 'main' && !onImportToVault) {
+      onVaultLocked?.();
+      return;
+    }
+    moving = true;
+    const ids = [...selected];
+    try {
+      if (mode === 'vault') await onExportFromVault?.(ids);
+      else await onImportToVault?.(ids);
+      // 移動済みはこのタイムラインから消えるのでキャッシュを捨てて再取得。
+      cache.clear();
+      exitSelection();
+      await syncBuckets(new Set());
+      toasts.success(mode === 'vault' ? 'Vault から出しました' : 'Vault へ移動しました');
+    } catch (e) {
+      toasts.error(e instanceof Error ? e.message : '移動に失敗しました');
+    } finally {
+      moving = false;
     }
   }
 
@@ -350,6 +403,7 @@
   }
 
   async function handleFiles(files: FileList | File[]) {
+    if (mode === 'vault') return; // vault へのアップロードは import 経由のみ
     const arr = [...files].filter((f) => f.type.startsWith('image/'));
     if (arr.length === 0) return;
     uploading = true;
@@ -502,17 +556,19 @@
     >
       {selecting ? '選択解除' : '選択'}
     </button>
-    <button class="upload" onclick={() => fileInput?.click()} disabled={uploading}>
-      {uploading ? 'アップロード中…' : 'アップロード'}
-    </button>
-    <input
-      bind:this={fileInput}
-      type="file"
-      accept="image/*"
-      multiple
-      hidden
-      onchange={onFilePicked}
-    />
+    {#if mode === 'main'}
+      <button class="upload" onclick={() => fileInput?.click()} disabled={uploading}>
+        {uploading ? 'アップロード中…' : 'アップロード'}
+      </button>
+      <input
+        bind:this={fileInput}
+        type="file"
+        accept="image/*"
+        multiple
+        hidden
+        onchange={onFilePicked}
+      />
+    {/if}
   </div>
 
   <div
@@ -557,7 +613,7 @@
                 onpointerleave={cancelLongPress}
                 aria-label={selecting ? '選択の切替' : '画像を開く'}
               >
-                <AssetImage id={t.id} thumbhash={t.thumbhash} />
+                <AssetImage {api} id={t.id} thumbhash={t.thumbhash} />
                 {#if selecting}
                   <span class="check" class:on={selectedSet.has(t.id)}>
                     {selectedSet.has(t.id) ? '✓' : ''}
@@ -585,6 +641,9 @@
       }}
     >
       漫画スタックを作成
+    </button>
+    <button disabled={selected.length === 0 || moving} onclick={moveSelection}>
+      {mode === 'vault' ? 'Vault から出す' : 'Vault へ移動'}
     </button>
     <button onclick={exitSelection}>キャンセル</button>
   </div>
@@ -621,6 +680,7 @@
 
 {#if viewerOpen}
   <Viewer
+    {api}
     ids={viewerIds}
     index={viewerIndex}
     thumbhashOf={(id) => itemMeta.get(id)?.thumbhash ?? null}

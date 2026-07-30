@@ -98,6 +98,7 @@ fn app_with_events(
             "/vault/assets/{id}",
             get(api::asset_metadata).delete(api::trash_asset),
         )
+        .route("/vault/assets/{id}/restore", post(api::restore_asset))
         .route("/vault/assets/{id}/original", get(api::original))
         .route("/vault/assets/{id}/thumbnail", get(api::thumbnail))
         .route("/vault/assets/{id}/preview", get(api::preview))

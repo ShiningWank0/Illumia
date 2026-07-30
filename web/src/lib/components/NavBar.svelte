@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { session } from '$lib/session.svelte';
+  import { vaultSession } from '$lib/vaultSession.svelte';
 
   const links = [
     { href: '/', label: 'タイムライン' },
@@ -12,6 +13,8 @@
   ];
 
   let query = $state('');
+
+  const vaultIcon = $derived(vaultSession.status === 'unlocked' ? '🔓' : '🔒');
 
   function isActive(href: string, pathname: string): boolean {
     return href === '/' ? pathname === '/' : pathname.startsWith(href);
@@ -35,6 +38,15 @@
       </li>
     {/each}
   </ul>
+  <a
+    class="vault-link"
+    class:unlocked={vaultSession.status === 'unlocked'}
+    class:active={$page.url.pathname.startsWith('/vault')}
+    href="/vault"
+    title={vaultSession.status === 'unlocked' ? 'Vault (アンロック中)' : 'Vault (ロック中)'}
+  >
+    {vaultIcon} Vault
+  </a>
   <form class="search" onsubmit={onSearch}>
     <input type="search" placeholder="検索…" bind:value={query} aria-label="検索" />
   </form>
@@ -74,6 +86,24 @@
   a.active {
     background: #6d5bd0;
     color: #fff;
+  }
+  .vault-link {
+    display: block;
+    padding: 0.4rem 0.8rem;
+    border-radius: 7px;
+    color: #d4d4d8;
+    text-decoration: none;
+    font-size: 0.9rem;
+    border: 1px solid #3f3f46;
+  }
+  .vault-link.unlocked {
+    color: #86efac;
+    border-color: #2f5d43;
+  }
+  .vault-link.active {
+    background: #6d5bd0;
+    color: #fff;
+    border-color: #6d5bd0;
   }
   .search input {
     padding: 0.4rem 0.7rem;

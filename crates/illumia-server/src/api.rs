@@ -742,9 +742,14 @@ pub async fn trash_asset(
 pub async fn restore_asset(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<AssetResponse>> {
-    let asset = AssetService::new(state.database.clone()).restore(&id)?;
-    state.notify_assets_added(&asset.taken_at_local_date);
+    let selected = SelectedDatabase::from_request(&state, access);
+    let asset = selected.result(AssetService::new(selected.database.clone()).restore(&id))?;
+    // vault 側の復元はバケットキー (日付) を WS に流さない (docs/06 ログ抑制)
+    if selected.vault.is_none() {
+        state.notify_assets_added(&asset.taken_at_local_date);
+    }
     Ok(Json(asset.into()))
 }
 

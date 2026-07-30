@@ -37,7 +37,7 @@ export function defaultBaseUrl(): string {
   return '';
 }
 
-interface RequestOptions {
+export interface RequestOptions {
   method?: string;
   body?: BodyInit | null;
   headers?: Record<string, string>;
@@ -45,7 +45,11 @@ interface RequestOptions {
   raw?: boolean;
 }
 
-async function request<T>(base: string, path: string, opts: RequestOptions = {}): Promise<T> {
+export async function request<T>(
+  base: string,
+  path: string,
+  opts: RequestOptions = {}
+): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = { Accept: 'application/json', ...opts.headers };
   if (token) headers.Authorization = `Bearer ${token}`;

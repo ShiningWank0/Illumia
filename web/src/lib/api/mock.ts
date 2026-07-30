@@ -1,12 +1,12 @@
 // 開発用モック。サーバー未完成でも UI を動かせるよう、IllumiaApi と同一
 // インタフェースで決定的な擬似データ (縦長 / 横長 / 正方形を混ぜた数千件) を返す。
-// VITE_USE_MOCK=1 で選択される (index.ts)。認証・ゴミ箱・重複・設定はスタブ。
+// VITE_USE_MOCK=1 で選択される (index.ts)。メイン用と vault 用の両方を提供する。
 
+import type { VaultLifecycle } from './vault';
 import {
   ApiError,
   type AppSettings,
   type Asset,
-  type AuthRequest,
   type Bucket,
   type BucketItem,
   type ChapterInput,
@@ -19,7 +19,10 @@ import {
   type StackDetail,
   type StackSummary,
   type TokenResponse,
-  type UploadResult
+  type UploadResult,
+  type VaultStatusResponse,
+  type VaultTransfer,
+  type VaultUnlockResponse
 } from './types';
 
 /** mulberry32: 決定的な擬似乱数 (seed から再現可能)。 */
@@ -37,58 +40,36 @@ function mulberry32(seed: number): () => number {
 interface MockAsset {
   id: string;
   ratio: number;
-  taken_at: string; // ISO
-  dayKey: string; // YYYY-MM-DD
-  monthKey: string; // YYYY-MM
-  yearKey: string; // YYYY
-  hue: number; // プレースホルダ色
+  taken_at: string;
+  dayKey: string;
+  monthKey: string;
+  yearKey: string;
+  hue: number;
 }
 
-/** アスペクト比の候補 (縦長 / 正方形 / 横長)。 */
-const RATIO_BUCKETS = [
-  0.5,
-  0.66,
-  0.75, // 縦長
-  1.0, // 正方形
-  1.33,
-  1.5,
-  1.78,
-  2.0 // 横長
-];
+const RATIO_BUCKETS = [0.5, 0.66, 0.75, 1.0, 1.33, 1.5, 1.78, 2.0];
 
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : String(n);
 }
 
-/**
- * 決定的にモックアセットを生成する。
- * 直近 base 日から遡って count 件を、taken_at DESC で並べて返す。
- */
-function generateAssets(count: number): MockAsset[] {
-  const rand = mulberry32(0x111a1a); // 固定 seed で再現可能
+/** 決定的にモックアセットを生成する (taken_at DESC)。 */
+function generateAssets(count: number, seed = 0x111a1a, prefix = 'mock'): MockAsset[] {
+  const rand = mulberry32(seed);
   const assets: MockAsset[] = [];
-  // 起点日: 2026-07-30 (docs の currentDate) から過去へ。
   const base = Date.UTC(2026, 6, 30, 12, 0, 0);
   const dayMs = 24 * 60 * 60 * 1000;
-
   let cursor = base;
   for (let i = 0; i < count; i++) {
-    // 同日に複数枚固まるよう、確率的に日付を戻す。
-    if (rand() < 0.4) {
-      // 同じ日に留まる (0〜数時間戻す)
-      cursor -= Math.floor(rand() * 3 * 60 * 60 * 1000);
-    } else {
-      // 1〜4 日戻す
-      cursor -= Math.floor(1 + rand() * 3) * dayMs;
-    }
+    if (rand() < 0.4) cursor -= Math.floor(rand() * 3 * 60 * 60 * 1000);
+    else cursor -= Math.floor(1 + rand() * 3) * dayMs;
     const d = new Date(cursor);
     const y = d.getUTCFullYear();
     const m = d.getUTCMonth() + 1;
     const day = d.getUTCDate();
-    const ratio = RATIO_BUCKETS[Math.floor(rand() * RATIO_BUCKETS.length)];
     assets.push({
-      id: `mock-${String(i).padStart(5, '0')}`,
-      ratio,
+      id: `${prefix}-${String(i).padStart(5, '0')}`,
+      ratio: RATIO_BUCKETS[Math.floor(rand() * RATIO_BUCKETS.length)],
       taken_at: d.toISOString(),
       dayKey: `${y}-${pad2(m)}-${pad2(day)}`,
       monthKey: `${y}-${pad2(m)}`,
@@ -96,7 +77,6 @@ function generateAssets(count: number): MockAsset[] {
       hue: Math.floor(rand() * 360)
     });
   }
-  // 既に cursor を遡りながら生成しているので taken_at DESC 済み。
   return assets;
 }
 
@@ -104,7 +84,6 @@ function keyOf(a: MockAsset, g: Granularity): string {
   return g === 'day' ? a.dayKey : g === 'month' ? a.monthKey : a.yearKey;
 }
 
-/** SVG data URI のプレースホルダ画像を返す (実サムネの代替)。 */
 function svgDataUri(a: MockAsset, size: number): string {
   const w = a.ratio >= 1 ? size : Math.round(size * a.ratio);
   const h = a.ratio >= 1 ? Math.round(size / a.ratio) : size;
@@ -119,15 +98,13 @@ function svgDataUri(a: MockAsset, size: number): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
-/** MockAsset を API の Asset 形へ変換する。 */
 function toAsset(a: MockAsset): Asset {
   const width = 1000;
-  const height = Math.max(1, Math.round(width / a.ratio));
   return {
     id: a.id,
     filename: `${a.id}.png`,
     width,
-    height,
+    height: Math.max(1, Math.round(width / a.ratio)),
     ratio: a.ratio,
     thumbhash: null,
     taken_at: a.taken_at,
@@ -136,94 +113,34 @@ function toAsset(a: MockAsset): Asset {
   };
 }
 
+/** 疑似ネットワーク遅延。 */
+const delay = <T>(value: T): Promise<T> =>
+  new Promise((resolve) => setTimeout(() => resolve(value), 30 + Math.random() * 60));
+
 let mockStackSeq = 1;
 
-/** モック IllumiaApi を生成する。count 件を保持する。 */
-export function createMockClient(count = 3000): IllumiaApi {
-  const assets = generateAssets(count);
+/** タイムライン / 画像 URL 系メソッド (assets 配列に対して閉じる)。 */
+function makeAssetViews(assets: MockAsset[]) {
   const byId = new Map(assets.map((a) => [a.id, a]));
-  const stacks: StackDetail[] = [];
-
-  const findStack = (id: string): StackDetail | undefined => stacks.find((s) => s.id === id);
-
-  const summaryOf = (s: StackDetail): StackSummary => ({
-    id: s.id,
-    title: s.title,
-    cover_asset_id: s.cover_asset_id,
-    chapter_count: s.chapters.length,
-    page_count: s.chapters.reduce((n, c) => n + c.pages.length, 0),
-    created_at: s.created_at,
-    updated_at: s.updated_at
-  });
-
-  const assetFor = (id: string): Asset => {
-    const m = byId.get(id);
-    if (m) return toAsset(m);
-    const now = new Date().toISOString();
-    return {
-      id,
-      filename: `${id}.png`,
-      width: 1000,
-      height: 1000,
-      ratio: 1,
-      thumbhash: null,
-      taken_at: now,
-      created_at: now,
-      status: 'created'
-    };
-  };
-
-  const touch = (s: StackDetail) => {
-    s.updated_at = new Date().toISOString();
-  };
-  const settings: AppSettings = {
-    'trash.retention_days': 30,
-    'dedup.retention_days': 14,
-    'jobs.thumbnail_concurrency': 3,
-    'jobs.ml_concurrency': 1
-  };
-
-  // 疑似ネットワーク遅延 (レイアウト/仮想スクロールの挙動確認用)。
-  const delay = <T>(value: T): Promise<T> =>
-    new Promise((resolve) => setTimeout(() => resolve(value), 30 + Math.random() * 60));
-
   return {
-    // --- 認証 (モックは常にセットアップ済み・任意パスワードでログイン成功) ---
-    async serverInfo(): Promise<ServerInfo> {
-      return delay({ version: 'mock', setup_completed: true });
-    },
-    async setup(_req: AuthRequest): Promise<TokenResponse> {
-      return delay({ token: 'mock-token' });
-    },
-    async login(_req: AuthRequest): Promise<TokenResponse> {
-      return delay({ token: 'mock-token' });
-    },
-
+    byId,
     async getBuckets(g: Granularity): Promise<Bucket[]> {
       const counts = new Map<string, number>();
       for (const a of assets) {
         const k = keyOf(a, g);
         counts.set(k, (counts.get(k) ?? 0) + 1);
       }
-      // taken_at DESC → キー降順。
-      const buckets: Bucket[] = [...counts.entries()]
+      const buckets = [...counts.entries()]
         .map(([key, c]) => ({ key, count: c }))
         .sort((x, y) => (x.key < y.key ? 1 : x.key > y.key ? -1 : 0));
       return delay(buckets);
     },
-
     async getBucketItems(g: Granularity, key: string): Promise<BucketItem[]> {
       const items: BucketItem[] = assets
         .filter((a) => keyOf(a, g) === key)
-        .map((a) => ({
-          id: a.id,
-          ratio: a.ratio,
-          thumbhash: null, // モックはプレースホルダ色で代替 (実 thumbhash ではない)
-          taken_at: a.taken_at
-        }));
+        .map((a) => ({ id: a.id, ratio: a.ratio, thumbhash: null, taken_at: a.taken_at }));
       return delay(items);
     },
-
     thumbnailUrl(id: string): string {
       const a = byId.get(id);
       return a ? svgDataUri(a, 240) : '';
@@ -235,62 +152,54 @@ export function createMockClient(count = 3000): IllumiaApi {
     originalUrl(id: string): string {
       const a = byId.get(id);
       return a ? svgDataUri(a, 1440) : '';
-    },
+    }
+  };
+}
 
-    // --- 操作系スタブ ---
-    async uploadAsset(_file: File): Promise<UploadResult> {
-      return delay({ id: 'mock-upload', status: 'created' });
-    },
-    async trashAsset(_id: string): Promise<void> {
-      return delay(undefined);
-    },
-    async restoreAsset(_id: string): Promise<void> {
-      return delay(undefined);
-    },
-    async getTrash(): Promise<Asset[]> {
-      return delay([]);
-    },
-    async getDuplicates(): Promise<DuplicatePair[]> {
-      return delay([]);
-    },
-    async purgeNow(_id: string): Promise<void> {
-      return delay(undefined);
-    },
-    async getSettings(): Promise<AppSettings> {
-      return delay({ ...settings });
-    },
-    async patchSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
-      Object.assign(settings, patch);
-      return delay({ ...settings });
-    },
+/** スタック CRUD (stacks 配列に対して閉じる)。 */
+function makeStackMethods(stacks: StackDetail[], assetFor: (id: string) => Asset) {
+  const findStack = (id: string) => stacks.find((s) => s.id === id);
+  const summaryOf = (s: StackDetail): StackSummary => ({
+    id: s.id,
+    title: s.title,
+    cover_asset_id: s.cover_asset_id,
+    chapter_count: s.chapters.length,
+    page_count: s.chapters.reduce((n, c) => n + c.pages.length, 0),
+    created_at: s.created_at,
+    updated_at: s.updated_at
+  });
+  const touch = (s: StackDetail) => {
+    s.updated_at = new Date().toISOString();
+  };
 
-    // --- 漫画スタック ---
+  return {
+    summaryOf,
     async listStacks(): Promise<StackSummary[]> {
-      const list = [...stacks]
-        .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
-        .map(summaryOf);
-      return delay(list);
+      return delay(
+        [...stacks].sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1)).map(summaryOf)
+      );
     },
     async createStack(title: string, assetIds: string[]): Promise<StackDetail> {
       const now = new Date().toISOString();
       const id = `mock-stack-${mockStackSeq++}`;
-      const chapter: StackChapter = {
-        id: `${id}-c1`,
-        chapter_no: 1,
-        title: null,
-        pages: assetIds.map((aid, i) => ({
-          page_no: i + 1,
-          show_in_timeline: false,
-          asset: assetFor(aid)
-        }))
-      };
       const stack: StackDetail = {
         id,
         title,
         cover_asset_id: assetIds[0] ?? null,
         created_at: now,
         updated_at: now,
-        chapters: [chapter]
+        chapters: [
+          {
+            id: `${id}-c1`,
+            chapter_no: 1,
+            title: null,
+            pages: assetIds.map((aid, i) => ({
+              page_no: i + 1,
+              show_in_timeline: false,
+              asset: assetFor(aid)
+            }))
+          } satisfies StackChapter
+        ]
       };
       stacks.unshift(stack);
       return delay(structuredClone(stack));
@@ -300,7 +209,10 @@ export function createMockClient(count = 3000): IllumiaApi {
       if (!s) throw new ApiError(404, 'not_found', 'stack not found');
       return delay(structuredClone(s));
     },
-    async patchStack(id, patch): Promise<StackDetail> {
+    async patchStack(
+      id: string,
+      patch: { title?: string; cover_asset_id?: string }
+    ): Promise<StackDetail> {
       const s = findStack(id);
       if (!s) throw new ApiError(404, 'not_found', 'stack not found');
       if (patch.title !== undefined) s.title = patch.title;
@@ -308,7 +220,7 @@ export function createMockClient(count = 3000): IllumiaApi {
       touch(s);
       return delay(structuredClone(s));
     },
-    async deleteStack(id): Promise<void> {
+    async deleteStack(id: string): Promise<void> {
       const i = stacks.findIndex((s) => s.id === id);
       if (i >= 0) stacks.splice(i, 1);
       return delay(undefined);
@@ -316,7 +228,6 @@ export function createMockClient(count = 3000): IllumiaApi {
     async replaceStructure(id: string, chapters: ChapterInput[]): Promise<StackDetail> {
       const s = findStack(id);
       if (!s) throw new ApiError(404, 'not_found', 'stack not found');
-      // 既存フラグを引き継ぐ。
       const flags = new Map<string, boolean>();
       for (const c of s.chapters)
         for (const p of c.pages) flags.set(p.asset.id, p.show_in_timeline);
@@ -345,9 +256,8 @@ export function createMockClient(count = 3000): IllumiaApi {
         : s.chapters[s.chapters.length - 1];
       if (!chapter) throw new ApiError(404, 'not_found', 'chapter not found');
       let no = chapter.pages.length;
-      for (const aid of assetIds) {
+      for (const aid of assetIds)
         chapter.pages.push({ page_no: ++no, show_in_timeline: false, asset: assetFor(aid) });
-      }
       s.cover_asset_id = s.cover_asset_id ?? assetIds[0] ?? null;
       touch(s);
       return delay(structuredClone(s));
@@ -363,25 +273,240 @@ export function createMockClient(count = 3000): IllumiaApi {
     async setPageFlag(id: string, assetId: string, showInTimeline: boolean): Promise<StackDetail> {
       const s = findStack(id);
       if (!s) throw new ApiError(404, 'not_found', 'stack not found');
-      for (const c of s.chapters) {
+      for (const c of s.chapters)
         for (const p of c.pages) if (p.asset.id === assetId) p.show_in_timeline = showInTimeline;
-      }
       touch(s);
       return delay(structuredClone(s));
+    }
+  };
+}
+
+function assetForFrom(byId: Map<string, MockAsset>): (id: string) => Asset {
+  return (id: string) => {
+    const m = byId.get(id);
+    if (m) return toAsset(m);
+    const now = new Date().toISOString();
+    return {
+      id,
+      filename: `${id}.png`,
+      width: 1000,
+      height: 1000,
+      ratio: 1,
+      thumbhash: null,
+      taken_at: now,
+      created_at: now,
+      status: 'created'
+    };
+  };
+}
+
+function searchOver(
+  assets: MockAsset[],
+  stacks: StackDetail[],
+  summaryOf: (s: StackDetail) => StackSummary,
+  q: string
+): SearchResult {
+  const query = q.trim().toLowerCase();
+  if (query === '') return { assets: [], stacks: [], clusters: [] };
+  return {
+    assets: assets
+      .filter((a) => a.id.toLowerCase().includes(query))
+      .slice(0, 50)
+      .map(toAsset),
+    stacks: stacks.filter((s) => s.title.toLowerCase().includes(query)).map(summaryOf),
+    clusters: []
+  };
+}
+
+/** メイン用モック IllumiaApi。 */
+export function createMockClient(count = 3000): IllumiaApi {
+  const assets = generateAssets(count);
+  const views = makeAssetViews(assets);
+  const stacks: StackDetail[] = [];
+  const stackMethods = makeStackMethods(stacks, assetForFrom(views.byId));
+  const settings: AppSettings = {
+    'trash.retention_days': 30,
+    'dedup.retention_days': 14,
+    'jobs.thumbnail_concurrency': 3,
+    'jobs.ml_concurrency': 1
+  };
+
+  return {
+    async serverInfo(): Promise<ServerInfo> {
+      return delay({ version: 'mock', setup_completed: true });
+    },
+    async setup(): Promise<TokenResponse> {
+      return delay({ token: 'mock-token' });
+    },
+    async login(): Promise<TokenResponse> {
+      return delay({ token: 'mock-token' });
     },
 
-    // --- 検索 ---
+    getBuckets: views.getBuckets,
+    getBucketItems: views.getBucketItems,
+    thumbnailUrl: views.thumbnailUrl,
+    previewUrl: views.previewUrl,
+    originalUrl: views.originalUrl,
+
+    async uploadAsset(): Promise<UploadResult> {
+      return delay({ id: 'mock-upload', status: 'created' });
+    },
+    async trashAsset(): Promise<void> {
+      return delay(undefined);
+    },
+    async restoreAsset(): Promise<void> {
+      return delay(undefined);
+    },
+    async getTrash(): Promise<Asset[]> {
+      return delay([]);
+    },
+    async getDuplicates(): Promise<DuplicatePair[]> {
+      return delay([]);
+    },
+    async purgeNow(): Promise<void> {
+      return delay(undefined);
+    },
+    async getSettings(): Promise<AppSettings> {
+      return delay({ ...settings });
+    },
+    async patchSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
+      Object.assign(settings, patch);
+      return delay({ ...settings });
+    },
+
+    listStacks: stackMethods.listStacks,
+    createStack: stackMethods.createStack,
+    getStack: stackMethods.getStack,
+    patchStack: stackMethods.patchStack,
+    deleteStack: stackMethods.deleteStack,
+    replaceStructure: stackMethods.replaceStructure,
+    addStackPages: stackMethods.addStackPages,
+    removeStackPage: stackMethods.removeStackPage,
+    setPageFlag: stackMethods.setPageFlag,
+
     async search(q: string): Promise<SearchResult> {
-      const query = q.trim().toLowerCase();
-      if (query === '') return delay({ assets: [], stacks: [], clusters: [] });
-      const matchedAssets = assets
-        .filter((a) => a.id.toLowerCase().includes(query))
-        .slice(0, 50)
-        .map(toAsset);
-      const matchedStacks = stacks
-        .filter((s) => s.title.toLowerCase().includes(query))
-        .map(summaryOf);
-      return delay({ assets: matchedAssets, stacks: matchedStacks, clusters: [] });
+      return delay(searchOver(assets, stacks, stackMethods.summaryOf, q));
+    }
+  };
+}
+
+// ---- Vault モック ----
+
+interface MockVault {
+  initialized: boolean;
+  assets: MockAsset[];
+  stacks: StackDetail[];
+}
+
+const mockVault: MockVault = { initialized: false, assets: [], stacks: [] };
+
+function seedVault() {
+  if (mockVault.assets.length === 0) {
+    mockVault.assets = generateAssets(180, 0x5eed11, 'vault');
+  }
+}
+
+export const mockVaultLifecycle: VaultLifecycle = {
+  async status(): Promise<VaultStatusResponse> {
+    return delay({ initialized: mockVault.initialized, unlocked: false });
+  },
+  async init(): Promise<{ recovery_key: string }> {
+    mockVault.initialized = true;
+    seedVault();
+    return delay({ recovery_key: 'MOCK-ABCD-EFGH-IJKL-MNOP-QRST' });
+  },
+  async unlock(): Promise<VaultUnlockResponse> {
+    if (!mockVault.initialized) throw new ApiError(404, 'not_found', 'not found');
+    seedVault();
+    const expires = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    return delay({ vault_session: 'mock-vault-session', expires_at: expires });
+  },
+  async lock(): Promise<void> {
+    return delay(undefined);
+  },
+  async importItems(payload: VaultTransfer): Promise<void> {
+    // メインから移動された想定で vault に擬似アセットを追加する。
+    const ids = payload.asset_ids ?? [];
+    const now = new Date();
+    ids.forEach((id, i) => {
+      const d = new Date(now.getTime() - i * 1000);
+      mockVault.assets.unshift({
+        id,
+        ratio: RATIO_BUCKETS[i % RATIO_BUCKETS.length],
+        taken_at: d.toISOString(),
+        dayKey: `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`,
+        monthKey: `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}`,
+        yearKey: String(d.getUTCFullYear()),
+        hue: (i * 47) % 360
+      });
+    });
+    return delay(undefined);
+  },
+  async exportItems(payload: VaultTransfer): Promise<void> {
+    const ids = new Set(payload.asset_ids ?? []);
+    mockVault.assets = mockVault.assets.filter((a) => !ids.has(a.id));
+    return delay(undefined);
+  }
+};
+
+/** Vault 用モック IllumiaApi (ミラー。未対応操作は投げる)。 */
+export function createMockVaultClient(): IllumiaApi {
+  seedVault();
+  const views = makeAssetViews(mockVault.assets);
+  const stackMethods = makeStackMethods(mockVault.stacks, assetForFrom(views.byId));
+  const nope = (name: string): never => {
+    throw new ApiError(0, 'unsupported', `${name} not available in vault`);
+  };
+
+  return {
+    serverInfo: () => nope('serverInfo'),
+    setup: () => nope('setup'),
+    login: () => nope('login'),
+
+    // vault.assets は import で増減するため都度読み直す。
+    async getBuckets(g: Granularity): Promise<Bucket[]> {
+      return makeAssetViews(mockVault.assets).getBuckets(g);
+    },
+    async getBucketItems(g: Granularity, key: string): Promise<BucketItem[]> {
+      return makeAssetViews(mockVault.assets).getBucketItems(g, key);
+    },
+    thumbnailUrl(id: string): string {
+      return makeAssetViews(mockVault.assets).thumbnailUrl(id);
+    },
+    previewUrl(id: string): string {
+      return makeAssetViews(mockVault.assets).previewUrl(id);
+    },
+    originalUrl(id: string): string {
+      return makeAssetViews(mockVault.assets).originalUrl(id);
+    },
+
+    uploadAsset: () => nope('uploadAsset'),
+    async trashAsset(): Promise<void> {
+      return delay(undefined);
+    },
+    restoreAsset: () => nope('restoreAsset'),
+    async getTrash(): Promise<Asset[]> {
+      return delay([]);
+    },
+    async getDuplicates(): Promise<DuplicatePair[]> {
+      return delay([]);
+    },
+    purgeNow: () => nope('purgeNow'),
+    getSettings: () => nope('getSettings'),
+    patchSettings: () => nope('patchSettings'),
+
+    listStacks: stackMethods.listStacks,
+    createStack: stackMethods.createStack,
+    getStack: stackMethods.getStack,
+    patchStack: stackMethods.patchStack,
+    deleteStack: stackMethods.deleteStack,
+    replaceStructure: stackMethods.replaceStructure,
+    addStackPages: stackMethods.addStackPages,
+    removeStackPage: stackMethods.removeStackPage,
+    setPageFlag: stackMethods.setPageFlag,
+
+    async search(q: string): Promise<SearchResult> {
+      return delay(searchOver(mockVault.assets, mockVault.stacks, stackMethods.summaryOf, q));
     }
   };
 }

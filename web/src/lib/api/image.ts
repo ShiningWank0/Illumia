@@ -4,12 +4,30 @@
 // data: URL (モック) はそのまま返す。取得済み object URL は上限付きで再利用する。
 
 import { getToken } from './token';
+import { getVaultToken } from '$lib/vaultSession.svelte';
 import { thumbHashToDataURL } from 'thumbhash';
 import { ApiError } from './types';
 
 // url -> object URL。挿入順で最古を revoke する簡易 LRU。
 const objectUrls = new Map<string, string>();
 const MAX_OBJECT_URLS = 400;
+
+/** vault 配下の URL か (X-Vault-Session を付ける対象)。 */
+function isVaultUrl(url: string): boolean {
+  return url.includes('/api/vault/');
+}
+
+/** 認証ヘッダを組み立てる。vault URL には X-Vault-Session も付与。 */
+function authHeaders(url: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (isVaultUrl(url)) {
+    const vt = getVaultToken();
+    if (vt) headers['X-Vault-Session'] = vt;
+  }
+  return headers;
+}
 
 /**
  * 認証付きで画像を取得し object URL を返す。data:/blob: はそのまま返す。
@@ -26,12 +44,10 @@ export async function authedObjectUrl(url: string): Promise<string> {
     return cached;
   }
 
-  const token = getToken();
-  const res = await fetch(url, {
-    headers: token ? { Authorization: `Bearer ${token}` } : {}
-  });
+  const res = await fetch(url, { headers: authHeaders(url) });
   if (!res.ok) {
-    throw new ApiError(res.status, `http_${res.status}`, `image fetch failed: ${url}`);
+    // vault URL のログにパス (asset id を含む) を残さない。
+    throw new ApiError(res.status, `http_${res.status}`, 'image fetch failed');
   }
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);
@@ -45,6 +61,37 @@ export async function authedObjectUrl(url: string): Promise<string> {
     if (oldest && oldest.startsWith('blob:')) URL.revokeObjectURL(oldest);
   }
   return objectUrl;
+}
+
+/**
+ * vault 画像の object URL をすべて revoke してキャッシュから外す。
+ * ロック時・vault 画面離脱時に呼び、メモリに残さない (docs/06 脅威モデル)。
+ */
+export function revokeVaultObjectUrls(): void {
+  for (const [key, value] of [...objectUrls.entries()]) {
+    if (isVaultUrl(key)) {
+      objectUrls.delete(key);
+      if (value.startsWith('blob:')) URL.revokeObjectURL(value);
+    }
+  }
+}
+
+/**
+ * 原本を認証付きで取得し、ファイルとして保存する (vault でもダウンロード可)。
+ */
+export async function downloadOriginal(url: string, filename: string): Promise<void> {
+  const res = await fetch(url, { headers: authHeaders(url) });
+  if (!res.ok) throw new ApiError(res.status, `http_${res.status}`, 'download failed');
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // 少し待ってから revoke (保存ダイアログが掴むため)。
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
 }
 
 /** 標準 base64 文字列を Uint8Array に復号する (thumbhash 用)。 */

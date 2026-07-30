@@ -2,7 +2,7 @@
   // 認証付き画像 + thumbhash プレースホルダ。
   // プレースホルダ (thumbhash data URL or 色) を背景に敷き、実画像を
   // 認証付き fetch で取得して重ねる。docs/04: thumbhash → 240px サムネの順。
-  import { getApi } from '$lib/api';
+  import { getApi, type IllumiaApi } from '$lib/api';
   import { authedObjectUrl, thumbhashToDataUrl } from '$lib/api/image';
 
   interface Props {
@@ -14,6 +14,8 @@
     fit?: 'cover' | 'contain';
     /** true なら可視域近傍まで読み込みを遅延する (縦読みリーダー等)。 */
     lazy?: boolean;
+    /** 差し替え可能な API (vault ミラー用)。既定はメインクライアント。 */
+    api?: IllumiaApi;
   }
 
   const {
@@ -22,9 +24,9 @@
     thumbhash = null,
     alt = '',
     fit = 'cover',
-    lazy = false
+    lazy = false,
+    api = getApi()
   }: Props = $props();
-  const api = getApi();
 
   const placeholder = $derived(thumbhashToDataUrl(thumbhash));
   const placeholderColor = $derived.by(() => {

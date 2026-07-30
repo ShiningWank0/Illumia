@@ -131,6 +131,26 @@ export interface SearchResult {
   clusters: unknown[];
 }
 
+// ---- Vault (docs/06) ----
+
+/** `GET /api/vault/status`。 */
+export interface VaultStatusResponse {
+  initialized: boolean;
+  unlocked: boolean;
+}
+
+/** `POST /api/vault/unlock` 成功。 */
+export interface VaultUnlockResponse {
+  vault_session: string;
+  expires_at: string;
+}
+
+/** import / export のペイロード (どちらか一方)。 */
+export interface VaultTransfer {
+  asset_ids?: string[];
+  stack_id?: string;
+}
+
 /** WS メッセージ (docs/03)。タイムラインは assets_added を購読する。 */
 export type WsMessage =
   | { type: 'job'; id: string; state: string; progress: number }
