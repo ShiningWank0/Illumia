@@ -1,21 +1,12 @@
-// WebSocket 購読 (/api/ws)。assets_added を受けてバケットを再取得する想定。
-//
-// 【重要 / 未解決】サーバーの /api/ws は require_auth ミドルウェア配下で
-// `Authorization: Bearer` ヘッダ検証を行う (crates/illumia-server: lib.rs の
-// protected ルータ + auth.rs bearer_token)。ブラウザの WebSocket API は
-// ハンドシェイクに任意ヘッダを付けられないため、この方式ではブラウザから接続
-// できない (401)。`?token=` クエリや Sec-WebSocket-Protocol 経由のトークン
-// 受け渡しにサーバー側を対応させる必要がある。
-//
-// それまで WS 配線は無効化する。サーバーが `?token=` に対応したら
-// WS_SUPPORTED を true にし、connectAssetsWs を呼べば動くよう実装してある。
+// WebSocket 購読 (/api/ws)。assets_added を受けてバケットを再取得する。
+// サーバーは `?token=` クエリ認証に対応済み (crates/illumia-server api.rs websocket)。
 
 import { defaultBaseUrl } from './client';
 import { getToken } from './token';
 import type { WsMessage } from './types';
 
-/** サーバーがブラウザから通る WS 認証に対応したら true にする。 */
-export const WS_SUPPORTED = false;
+/** サーバーがブラウザから通る WS 認証 (?token=) に対応済みのため有効。 */
+export const WS_SUPPORTED = true;
 
 export interface WsHandle {
   close(): void;

@@ -116,7 +116,6 @@ fn app_with_events(
             "/settings",
             get(api::get_settings).patch(api::patch_settings),
         )
-        .route("/ws", get(api::websocket))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -125,7 +124,9 @@ fn app_with_events(
     let public = Router::new()
         .route("/server/info", get(auth::server_info))
         .route("/auth/setup", post(auth::setup))
-        .route("/auth/login", post(auth::login));
+        .route("/auth/login", post(auth::login))
+        // 認証はハンドラ内で実施 (?token= クエリ対応のため middleware 外)
+        .route("/ws", get(api::websocket));
 
     let api = protected
         .merge(public)

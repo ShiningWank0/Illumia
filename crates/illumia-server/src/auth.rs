@@ -287,7 +287,7 @@ pub async fn require_auth(
     Ok(next.run(request).await)
 }
 
-fn bearer_token(headers: &axum::http::HeaderMap) -> ApiResult<&str> {
+pub(crate) fn bearer_token(headers: &axum::http::HeaderMap) -> ApiResult<&str> {
     let value = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())

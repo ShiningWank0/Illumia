@@ -784,8 +784,25 @@ pub async fn patch_settings(
     Ok(Json(settings_json(&settings)?))
 }
 
-pub async fn websocket(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| websocket_loop(state, socket))
+#[derive(Deserialize)]
+pub struct WsQuery {
+    token: Option<String>,
+}
+
+/// ブラウザの WebSocket API は任意ヘッダを付与できないため、
+/// `?token=` クエリでも認証を受け付ける (Bearer ヘッダも引き続き可)。
+pub async fn websocket(
+    State(state): State<AppState>,
+    Query(query): Query<WsQuery>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> ApiResult<Response> {
+    let token = match query.token.as_deref() {
+        Some(token) if !token.is_empty() => token.to_owned(),
+        _ => crate::auth::bearer_token(&headers)?.to_owned(),
+    };
+    state.auth.verify_token(&token)?;
+    Ok(upgrade.on_upgrade(move |socket| websocket_loop(state, socket)))
 }
 
 async fn websocket_loop(state: AppState, mut socket: WebSocket) {
