@@ -80,6 +80,57 @@ export interface AppSettings {
   [key: string]: number | string | null;
 }
 
+// ---- 漫画スタック (docs/05) ----
+
+/** スタック一覧の 1 件 (`GET /api/stacks`)。 */
+export interface StackSummary {
+  id: string;
+  title: string;
+  cover_asset_id: string | null;
+  chapter_count: number;
+  page_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** スタック内 1 ページ。 */
+export interface StackPage {
+  page_no: number;
+  show_in_timeline: boolean;
+  asset: Asset;
+}
+
+/** スタックの章 (話)。 */
+export interface StackChapter {
+  id: string;
+  chapter_no: number;
+  title: string | null;
+  pages: StackPage[];
+}
+
+/** スタック詳細 (`GET /api/stacks/{id}`)。 */
+export interface StackDetail {
+  id: string;
+  title: string;
+  cover_asset_id: string | null;
+  created_at: string;
+  updated_at: string;
+  chapters: StackChapter[];
+}
+
+/** structure 一括置換の章入力 (`PUT /api/stacks/{id}/structure`)。 */
+export interface ChapterInput {
+  title: string | null;
+  pages: string[]; // asset_id の順序付き列
+}
+
+/** 横断検索結果 (`GET /api/search`)。 */
+export interface SearchResult {
+  assets: Asset[];
+  stacks: StackSummary[];
+  clusters: unknown[];
+}
+
 /** WS メッセージ (docs/03)。タイムラインは assets_added を購読する。 */
 export type WsMessage =
   | { type: 'job'; id: string; state: string; progress: number }
@@ -136,4 +187,18 @@ export interface IllumiaApi {
   // --- 設定 ---
   getSettings(): Promise<AppSettings>;
   patchSettings(patch: Partial<AppSettings>): Promise<AppSettings>;
+
+  // --- 漫画スタック (docs/05) ---
+  listStacks(): Promise<StackSummary[]>;
+  createStack(title: string, assetIds: string[]): Promise<StackDetail>;
+  getStack(id: string): Promise<StackDetail>;
+  patchStack(id: string, patch: { title?: string; cover_asset_id?: string }): Promise<StackDetail>;
+  deleteStack(id: string): Promise<void>;
+  replaceStructure(id: string, chapters: ChapterInput[]): Promise<StackDetail>;
+  addStackPages(id: string, assetIds: string[], chapterId?: string): Promise<StackDetail>;
+  removeStackPage(id: string, assetId: string): Promise<void>;
+  setPageFlag(id: string, assetId: string, showInTimeline: boolean): Promise<StackDetail>;
+
+  // --- 検索 ---
+  search(q: string): Promise<SearchResult>;
 }

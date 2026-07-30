@@ -14,10 +14,14 @@ import {
   type AuthRequest,
   type Bucket,
   type BucketItem,
+  type ChapterInput,
   type DuplicatePair,
   type Granularity,
   type IllumiaApi,
+  type SearchResult,
   type ServerInfo,
+  type StackDetail,
+  type StackSummary,
   type TokenResponse,
   type UploadResult
 } from './types';
@@ -160,6 +164,66 @@ export function createHttpClient(config: ClientConfig): IllumiaApi {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(patch)
       });
+    },
+
+    // --- 漫画スタック ---
+    listStacks(): Promise<StackSummary[]> {
+      return request<StackSummary[]>(base, '/api/stacks');
+    },
+    createStack(title: string, assetIds: string[]): Promise<StackDetail> {
+      return request<StackDetail>(base, '/api/stacks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, asset_ids: assetIds })
+      });
+    },
+    getStack(id: string): Promise<StackDetail> {
+      return request<StackDetail>(base, `/api/stacks/${enc(id)}`);
+    },
+    patchStack(
+      id: string,
+      patch: { title?: string; cover_asset_id?: string }
+    ): Promise<StackDetail> {
+      return request<StackDetail>(base, `/api/stacks/${enc(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch)
+      });
+    },
+    async deleteStack(id: string): Promise<void> {
+      await request<Response>(base, `/api/stacks/${enc(id)}`, { method: 'DELETE', raw: true });
+    },
+    replaceStructure(id: string, chapters: ChapterInput[]): Promise<StackDetail> {
+      return request<StackDetail>(base, `/api/stacks/${enc(id)}/structure`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chapters })
+      });
+    },
+    addStackPages(id: string, assetIds: string[], chapterId?: string): Promise<StackDetail> {
+      return request<StackDetail>(base, `/api/stacks/${enc(id)}/pages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ asset_ids: assetIds, chapter_id: chapterId ?? null })
+      });
+    },
+    async removeStackPage(id: string, assetId: string): Promise<void> {
+      await request<Response>(base, `/api/stacks/${enc(id)}/pages/${enc(assetId)}`, {
+        method: 'DELETE',
+        raw: true
+      });
+    },
+    setPageFlag(id: string, assetId: string, showInTimeline: boolean): Promise<StackDetail> {
+      return request<StackDetail>(base, `/api/stacks/${enc(id)}/pages/${enc(assetId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ show_in_timeline: showInTimeline })
+      });
+    },
+
+    // --- 検索 ---
+    search(q: string): Promise<SearchResult> {
+      return request<SearchResult>(base, `/api/search?q=${enc(q)}`);
     }
   };
 }

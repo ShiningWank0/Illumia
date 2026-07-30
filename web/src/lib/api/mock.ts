@@ -3,15 +3,21 @@
 // VITE_USE_MOCK=1 で選択される (index.ts)。認証・ゴミ箱・重複・設定はスタブ。
 
 import {
+  ApiError,
   type AppSettings,
   type Asset,
   type AuthRequest,
   type Bucket,
   type BucketItem,
+  type ChapterInput,
   type DuplicatePair,
   type Granularity,
   type IllumiaApi,
+  type SearchResult,
   type ServerInfo,
+  type StackChapter,
+  type StackDetail,
+  type StackSummary,
   type TokenResponse,
   type UploadResult
 } from './types';
@@ -113,10 +119,63 @@ function svgDataUri(a: MockAsset, size: number): string {
   return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
 }
 
+/** MockAsset を API の Asset 形へ変換する。 */
+function toAsset(a: MockAsset): Asset {
+  const width = 1000;
+  const height = Math.max(1, Math.round(width / a.ratio));
+  return {
+    id: a.id,
+    filename: `${a.id}.png`,
+    width,
+    height,
+    ratio: a.ratio,
+    thumbhash: null,
+    taken_at: a.taken_at,
+    created_at: a.taken_at,
+    status: 'created'
+  };
+}
+
+let mockStackSeq = 1;
+
 /** モック IllumiaApi を生成する。count 件を保持する。 */
 export function createMockClient(count = 3000): IllumiaApi {
   const assets = generateAssets(count);
   const byId = new Map(assets.map((a) => [a.id, a]));
+  const stacks: StackDetail[] = [];
+
+  const findStack = (id: string): StackDetail | undefined => stacks.find((s) => s.id === id);
+
+  const summaryOf = (s: StackDetail): StackSummary => ({
+    id: s.id,
+    title: s.title,
+    cover_asset_id: s.cover_asset_id,
+    chapter_count: s.chapters.length,
+    page_count: s.chapters.reduce((n, c) => n + c.pages.length, 0),
+    created_at: s.created_at,
+    updated_at: s.updated_at
+  });
+
+  const assetFor = (id: string): Asset => {
+    const m = byId.get(id);
+    if (m) return toAsset(m);
+    const now = new Date().toISOString();
+    return {
+      id,
+      filename: `${id}.png`,
+      width: 1000,
+      height: 1000,
+      ratio: 1,
+      thumbhash: null,
+      taken_at: now,
+      created_at: now,
+      status: 'created'
+    };
+  };
+
+  const touch = (s: StackDetail) => {
+    s.updated_at = new Date().toISOString();
+  };
   const settings: AppSettings = {
     'trash.retention_days': 30,
     'dedup.retention_days': 14,
@@ -203,6 +262,126 @@ export function createMockClient(count = 3000): IllumiaApi {
     async patchSettings(patch: Partial<AppSettings>): Promise<AppSettings> {
       Object.assign(settings, patch);
       return delay({ ...settings });
+    },
+
+    // --- 漫画スタック ---
+    async listStacks(): Promise<StackSummary[]> {
+      const list = [...stacks]
+        .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+        .map(summaryOf);
+      return delay(list);
+    },
+    async createStack(title: string, assetIds: string[]): Promise<StackDetail> {
+      const now = new Date().toISOString();
+      const id = `mock-stack-${mockStackSeq++}`;
+      const chapter: StackChapter = {
+        id: `${id}-c1`,
+        chapter_no: 1,
+        title: null,
+        pages: assetIds.map((aid, i) => ({
+          page_no: i + 1,
+          show_in_timeline: false,
+          asset: assetFor(aid)
+        }))
+      };
+      const stack: StackDetail = {
+        id,
+        title,
+        cover_asset_id: assetIds[0] ?? null,
+        created_at: now,
+        updated_at: now,
+        chapters: [chapter]
+      };
+      stacks.unshift(stack);
+      return delay(structuredClone(stack));
+    },
+    async getStack(id: string): Promise<StackDetail> {
+      const s = findStack(id);
+      if (!s) throw new ApiError(404, 'not_found', 'stack not found');
+      return delay(structuredClone(s));
+    },
+    async patchStack(id, patch): Promise<StackDetail> {
+      const s = findStack(id);
+      if (!s) throw new ApiError(404, 'not_found', 'stack not found');
+      if (patch.title !== undefined) s.title = patch.title;
+      if (patch.cover_asset_id !== undefined) s.cover_asset_id = patch.cover_asset_id;
+      touch(s);
+      return delay(structuredClone(s));
+    },
+    async deleteStack(id): Promise<void> {
+      const i = stacks.findIndex((s) => s.id === id);
+      if (i >= 0) stacks.splice(i, 1);
+      return delay(undefined);
+    },
+    async replaceStructure(id: string, chapters: ChapterInput[]): Promise<StackDetail> {
+      const s = findStack(id);
+      if (!s) throw new ApiError(404, 'not_found', 'stack not found');
+      // 既存フラグを引き継ぐ。
+      const flags = new Map<string, boolean>();
+      for (const c of s.chapters)
+        for (const p of c.pages) flags.set(p.asset.id, p.show_in_timeline);
+      s.chapters = chapters.map((c, ci) => ({
+        id: `${id}-c${ci + 1}`,
+        chapter_no: ci + 1,
+        title: c.title,
+        pages: c.pages.map((aid, pi) => ({
+          page_no: pi + 1,
+          show_in_timeline: flags.get(aid) ?? false,
+          asset: assetFor(aid)
+        }))
+      }));
+      const allIds = new Set(chapters.flatMap((c) => c.pages));
+      if (!s.cover_asset_id || !allIds.has(s.cover_asset_id)) {
+        s.cover_asset_id = chapters[0]?.pages[0] ?? null;
+      }
+      touch(s);
+      return delay(structuredClone(s));
+    },
+    async addStackPages(id: string, assetIds: string[], chapterId?: string): Promise<StackDetail> {
+      const s = findStack(id);
+      if (!s) throw new ApiError(404, 'not_found', 'stack not found');
+      const chapter = chapterId
+        ? s.chapters.find((c) => c.id === chapterId)
+        : s.chapters[s.chapters.length - 1];
+      if (!chapter) throw new ApiError(404, 'not_found', 'chapter not found');
+      let no = chapter.pages.length;
+      for (const aid of assetIds) {
+        chapter.pages.push({ page_no: ++no, show_in_timeline: false, asset: assetFor(aid) });
+      }
+      s.cover_asset_id = s.cover_asset_id ?? assetIds[0] ?? null;
+      touch(s);
+      return delay(structuredClone(s));
+    },
+    async removeStackPage(id: string, assetId: string): Promise<void> {
+      const s = findStack(id);
+      if (!s) return delay(undefined);
+      for (const c of s.chapters) c.pages = c.pages.filter((p) => p.asset.id !== assetId);
+      for (const c of s.chapters) c.pages.forEach((p, i) => (p.page_no = i + 1));
+      touch(s);
+      return delay(undefined);
+    },
+    async setPageFlag(id: string, assetId: string, showInTimeline: boolean): Promise<StackDetail> {
+      const s = findStack(id);
+      if (!s) throw new ApiError(404, 'not_found', 'stack not found');
+      for (const c of s.chapters) {
+        for (const p of c.pages) if (p.asset.id === assetId) p.show_in_timeline = showInTimeline;
+      }
+      touch(s);
+      return delay(structuredClone(s));
+    },
+
+    // --- 検索 ---
+    async search(q: string): Promise<SearchResult> {
+      const query = q.trim().toLowerCase();
+      if (query === '') return delay({ assets: [], stacks: [], clusters: [] });
+      const matchedAssets = assets
+        .filter((a) => a.id.toLowerCase().includes(query))
+        .slice(0, 50)
+        .map(toAsset);
+      const matchedStacks = stacks
+        .filter((s) => s.title.toLowerCase().includes(query))
+        .map(summaryOf);
+      return delay({ assets: matchedAssets, stacks: matchedStacks, clusters: [] });
     }
   };
 }

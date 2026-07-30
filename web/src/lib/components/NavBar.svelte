@@ -1,16 +1,26 @@
 <script lang="ts">
   import { page } from '$app/stores';
+  import { goto } from '$app/navigation';
   import { session } from '$lib/session.svelte';
 
   const links = [
     { href: '/', label: 'タイムライン' },
+    { href: '/stacks', label: '漫画' },
     { href: '/trash', label: 'ゴミ箱' },
     { href: '/duplicates', label: '重複' },
     { href: '/settings', label: '設定' }
   ];
 
+  let query = $state('');
+
   function isActive(href: string, pathname: string): boolean {
     return href === '/' ? pathname === '/' : pathname.startsWith(href);
+  }
+
+  function onSearch(e: SubmitEvent) {
+    e.preventDefault();
+    const q = query.trim();
+    if (q) goto(`/search?q=${encodeURIComponent(q)}`);
   }
 </script>
 
@@ -25,6 +35,9 @@
       </li>
     {/each}
   </ul>
+  <form class="search" onsubmit={onSearch}>
+    <input type="search" placeholder="検索…" bind:value={query} aria-label="検索" />
+  </form>
   <button class="logout" onclick={() => session.logout()}>ログアウト</button>
 </nav>
 
@@ -61,6 +74,16 @@
   a.active {
     background: #6d5bd0;
     color: #fff;
+  }
+  .search input {
+    padding: 0.4rem 0.7rem;
+    border-radius: 7px;
+    border: 1px solid #3f3f46;
+    background: #101116;
+    color: #f4f4f5;
+    font-size: 0.85rem;
+    width: 12rem;
+    max-width: 30vw;
   }
   .logout {
     border: 1px solid #3f3f46;

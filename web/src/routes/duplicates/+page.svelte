@@ -1,13 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { getApi, type DuplicatePair } from '$lib/api';
+  import { toasts } from '$lib/toast.svelte';
   import AssetImage from '$lib/components/AssetImage.svelte';
+  import StackPicker from '$lib/components/StackPicker.svelte';
 
   const api = getApi();
 
   let pairs = $state<DuplicatePair[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
+  let pickerForAsset = $state<string | null>(null);
 
   async function load() {
     loading = true;
@@ -18,6 +21,21 @@
       error = e instanceof Error ? e.message : '取得に失敗しました';
     } finally {
       loading = false;
+    }
+  }
+
+  async function addToStack(stackId: string) {
+    const assetId = pickerForAsset;
+    if (!assetId) return;
+    try {
+      await api.addStackPages(stackId, [assetId]);
+      // 追加のトランザクションで active へ昇格し purge_after=NULL になる (docs/11 §重複4)。
+      pairs = pairs.filter((p) => p.dup.id !== assetId);
+      toasts.success('スタックへ追加しました。自動削除対象から外れました。');
+    } catch (e) {
+      toasts.error(e instanceof Error ? e.message : '追加に失敗しました');
+    } finally {
+      pickerForAsset = null;
     }
   }
 
@@ -48,7 +66,11 @@
             <span class="tag">重複</span>
             <div class="thumb"><AssetImage id={p.dup.id} thumbhash={p.dup.thumbhash} /></div>
             <span class="name">{p.dup.filename}</span>
-            <a href={api.originalUrl(p.dup.id)} download>ダウンロード</a>
+            <div class="side-actions">
+              <a href={api.originalUrl(p.dup.id)} download>ダウンロード</a>
+              <button class="add" onclick={() => (pickerForAsset = p.dup.id)}>スタックへ追加</button
+              >
+            </div>
           </div>
           <div class="arrow">↔</div>
           <div class="side">
@@ -65,6 +87,10 @@
     </ul>
   {/if}
 </div>
+
+{#if pickerForAsset}
+  <StackPicker onPick={addToStack} onClose={() => (pickerForAsset = null)} />
+{/if}
 
 <style>
   .page {
@@ -134,6 +160,21 @@
   a {
     color: #c4b5fd;
     font-size: 0.85rem;
+  }
+  .side-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    align-items: center;
+  }
+  .add {
+    border: 1px solid #6d5bd0;
+    background: none;
+    color: #c4b5fd;
+    padding: 0.3rem 0.7rem;
+    border-radius: 7px;
+    cursor: pointer;
+    font-size: 0.8rem;
   }
   .arrow {
     color: #71717a;

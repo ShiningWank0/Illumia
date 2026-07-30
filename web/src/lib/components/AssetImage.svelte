@@ -12,9 +12,18 @@
     alt?: string;
     /** object-fit。タイルは cover、ビューアは contain。 */
     fit?: 'cover' | 'contain';
+    /** true なら可視域近傍まで読み込みを遅延する (縦読みリーダー等)。 */
+    lazy?: boolean;
   }
 
-  const { id, variant = 'thumbnail', thumbhash = null, alt = '', fit = 'cover' }: Props = $props();
+  const {
+    id,
+    variant = 'thumbnail',
+    thumbhash = null,
+    alt = '',
+    fit = 'cover',
+    lazy = false
+  }: Props = $props();
   const api = getApi();
 
   const placeholder = $derived(thumbhashToDataUrl(thumbhash));
@@ -24,11 +33,36 @@
     return `hsl(${h} 25% 22%)`;
   });
 
+  const lazyProp = $derived(lazy);
+  let frame: HTMLElement | undefined;
+  let visible = $state(false);
   let src = $state<string | null>(null);
   let failed = $state(false);
 
-  // id / variant が変わるたびに読み込み直す。競合は世代カウンタで無視する。
+  // 非 lazy は即座に可視扱い。
   $effect(() => {
+    if (!lazyProp) visible = true;
+  });
+
+  // lazy 時は IntersectionObserver で可視域近傍に来たら読み込む。
+  $effect(() => {
+    if (!lazyProp || visible || !frame) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting)) {
+          visible = true;
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '400px' }
+    );
+    observer.observe(frame);
+    return () => observer.disconnect();
+  });
+
+  // id / variant が変わるたびに読み込み直す。alive フラグで競合を無視する。
+  $effect(() => {
+    if (!visible) return;
     const url = variant === 'preview' ? api.previewUrl(id) : api.thumbnailUrl(id);
     let alive = true;
     src = null;
@@ -47,6 +81,7 @@
 </script>
 
 <div
+  bind:this={frame}
   class="frame"
   style="background-image: {placeholder
     ? `url(${placeholder})`

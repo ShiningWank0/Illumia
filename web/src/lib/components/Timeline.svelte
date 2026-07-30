@@ -5,6 +5,7 @@
   //  - 可視域 ±2 バケットのみ実データを取得しレイアウト・描画
   //  - 画面外バケットは DOM から外す。データは LRU キャッシュに残す
   import { onMount } from 'svelte';
+  import { goto } from '$app/navigation';
   import { getApi, type Bucket, type BucketItem, type Granularity } from '$lib/api';
   import { WS_SUPPORTED, connectAssetsWs, type WsHandle } from '$lib/api/ws';
   import { LruCache } from '$lib/timeline/lru';
@@ -63,6 +64,14 @@
   let viewerOpen = $state(false);
   let viewerIds = $state<string[]>([]);
   let viewerIndex = $state(0);
+
+  // 複数選択 (スタック作成用)。selected は選択順を保持する。
+  let selecting = $state(false);
+  let selected = $state<string[]>([]);
+  const selectedSet = $derived(new Set(selected));
+  let showCreateDialog = $state(false);
+  let newStackTitle = $state('');
+  let creating = $state(false);
 
   const visibleBuckets = $derived(buckets.slice(renderStart, renderEnd + 1));
   const zoomOrder: Granularity[] = ['year', 'month', 'day'];
@@ -274,6 +283,52 @@
     viewerOpen = true;
   }
 
+  // ---- 複数選択 / スタック作成 ----
+  function toggleSelect(id: string) {
+    selected = selectedSet.has(id) ? selected.filter((x) => x !== id) : [...selected, id];
+  }
+
+  function onTileClick(id: string) {
+    if (selecting) toggleSelect(id);
+    else openViewer(id);
+  }
+
+  // 長押しで選択モードに入る (マウス/タッチ共通の pointer events)。
+  let longPressTimer: ReturnType<typeof setTimeout> | undefined;
+  function onTilePointerDown(id: string) {
+    if (selecting) return;
+    longPressTimer = setTimeout(() => {
+      selecting = true;
+      toggleSelect(id);
+    }, 450);
+  }
+  function cancelLongPress() {
+    if (longPressTimer) clearTimeout(longPressTimer);
+    longPressTimer = undefined;
+  }
+
+  function exitSelection() {
+    selecting = false;
+    selected = [];
+    showCreateDialog = false;
+  }
+
+  async function createStackFromSelection() {
+    const title = newStackTitle.trim();
+    if (title === '' || selected.length === 0) return;
+    creating = true;
+    try {
+      const stack = await api.createStack(title, selected);
+      toasts.success(`「${title}」を作成しました`);
+      exitSelection();
+      await goto(`/stacks/${stack.id}`);
+    } catch (e) {
+      toasts.error(e instanceof Error ? e.message : 'スタック作成に失敗しました');
+    } finally {
+      creating = false;
+    }
+  }
+
   // ---- アップロード ----
   function pad2(n: number): string {
     return n < 10 ? `0${n}` : String(n);
@@ -440,6 +495,13 @@
       {/each}
     </div>
     <div class="hint">Ctrl+ホイール / ピンチでズーム</div>
+    <button
+      class="select-toggle"
+      class:active={selecting}
+      onclick={() => (selecting ? exitSelection() : (selecting = true))}
+    >
+      {selecting ? '選択解除' : '選択'}
+    </button>
     <button class="upload" onclick={() => fileInput?.click()} disabled={uploading}>
       {uploading ? 'アップロード中…' : 'アップロード'}
     </button>
@@ -487,11 +549,20 @@
             {#each b.tiles as t (t.id)}
               <button
                 class="tile"
+                class:selected={selectedSet.has(t.id)}
                 style="left:{t.x}px; top:{t.y}px; width:{t.width}px; height:{t.height}px"
-                onclick={() => openViewer(t.id)}
-                aria-label="画像を開く"
+                onclick={() => onTileClick(t.id)}
+                onpointerdown={() => onTilePointerDown(t.id)}
+                onpointerup={cancelLongPress}
+                onpointerleave={cancelLongPress}
+                aria-label={selecting ? '選択の切替' : '画像を開く'}
               >
                 <AssetImage id={t.id} thumbhash={t.thumbhash} />
+                {#if selecting}
+                  <span class="check" class:on={selectedSet.has(t.id)}>
+                    {selectedSet.has(t.id) ? '✓' : ''}
+                  </span>
+                {/if}
               </button>
             {/each}
           </div>
@@ -500,6 +571,53 @@
     </div>
   </div>
 </div>
+
+{#if selecting}
+  <div class="select-bar">
+    <span>{selected.length} 枚選択中</span>
+    <div class="spacer-x"></div>
+    <button
+      class="primary"
+      disabled={selected.length === 0}
+      onclick={() => {
+        newStackTitle = '';
+        showCreateDialog = true;
+      }}
+    >
+      漫画スタックを作成
+    </button>
+    <button onclick={exitSelection}>キャンセル</button>
+  </div>
+{/if}
+
+{#if showCreateDialog}
+  <div class="overlay">
+    <button class="backdrop" aria-label="閉じる" onclick={() => (showCreateDialog = false)}
+    ></button>
+    <div class="dialog" role="dialog" aria-modal="true">
+      <h2>漫画スタックを作成</h2>
+      <p class="muted">{selected.length} 枚を選択順にページとして登録します。</p>
+      <!-- svelte-ignore a11y_autofocus -->
+      <input
+        type="text"
+        placeholder="作品タイトル"
+        autofocus
+        bind:value={newStackTitle}
+        onkeydown={(e) => e.key === 'Enter' && createStackFromSelection()}
+      />
+      <div class="dialog-actions">
+        <button onclick={() => (showCreateDialog = false)}>閉じる</button>
+        <button
+          class="primary"
+          disabled={creating || newStackTitle.trim() === ''}
+          onclick={createStackFromSelection}
+        >
+          {creating ? '作成中…' : '作成'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if viewerOpen}
   <Viewer
@@ -529,7 +647,8 @@
   .toolbar .hint {
     flex: 1;
   }
-  .upload {
+  .upload,
+  .select-toggle {
     border: none;
     border-radius: 8px;
     background: #6d5bd0;
@@ -537,6 +656,12 @@
     padding: 6px 14px;
     cursor: pointer;
     font-size: 0.9rem;
+  }
+  .select-toggle {
+    background: #3f3f46;
+  }
+  .select-toggle.active {
+    background: #b3341f;
   }
   .upload:disabled {
     opacity: 0.6;
@@ -639,5 +764,117 @@
     cursor: pointer;
     display: block;
     background: #1c1c22;
+  }
+  .tile.selected {
+    outline: 3px solid #6d5bd0;
+    outline-offset: -3px;
+  }
+  .check {
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.5);
+    border: 2px solid #fff;
+    color: #fff;
+    font-size: 14px;
+    line-height: 18px;
+    text-align: center;
+  }
+  .check.on {
+    background: #6d5bd0;
+    border-color: #6d5bd0;
+  }
+  .select-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: #16161c;
+    border-top: 1px solid #26262e;
+  }
+  .select-bar .spacer-x {
+    flex: 1;
+  }
+  .select-bar button {
+    border: 1px solid #3f3f46;
+    background: none;
+    color: #f4f4f5;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .select-bar button.primary,
+  .dialog button.primary {
+    background: #6d5bd0;
+    border-color: #6d5bd0;
+    color: #fff;
+  }
+  .select-bar button:disabled,
+  .dialog button:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  .overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 120;
+    display: grid;
+    place-items: center;
+  }
+  .backdrop {
+    position: absolute;
+    inset: 0;
+    border: none;
+    background: rgba(8, 8, 12, 0.7);
+    cursor: pointer;
+  }
+  .dialog {
+    position: relative;
+    width: min(90vw, 380px);
+    background: #16161c;
+    border: 1px solid #26262e;
+    border-radius: 12px;
+    padding: 1.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+  .dialog h2 {
+    margin: 0;
+    font-size: 1.1rem;
+  }
+  .dialog .muted {
+    margin: 0;
+    color: #a1a1aa;
+    font-size: 0.85rem;
+  }
+  .dialog input {
+    padding: 0.6rem 0.7rem;
+    border-radius: 8px;
+    border: 1px solid #3f3f46;
+    background: #101116;
+    color: #f4f4f5;
+    font-size: 1rem;
+  }
+  .dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+  }
+  .dialog-actions button {
+    border: 1px solid #3f3f46;
+    background: none;
+    color: #f4f4f5;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    cursor: pointer;
   }
 </style>
