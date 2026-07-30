@@ -26,6 +26,7 @@ jobs:
       desktop: ${{ steps.check.outputs.desktop }}
       android: ${{ steps.check.outputs.android }}
       version: ${{ steps.check.outputs.version }}
+      owner_lc: ${{ steps.check.outputs.owner_lc }}
     steps:
       - uses: actions/checkout@v4
       - id: check
@@ -35,6 +36,8 @@ jobs:
           [ -f docker/Dockerfile.ml ] && out docker_ml true || out docker_ml false
           [ -f crates/illumia-desktop/Cargo.toml ] && out desktop true || out desktop false
           [ -f apps/android/src-tauri/tauri.conf.json ] && out android true || out android false
+          # Docker のリポジトリ名は小文字必須 (owner に大文字が含まれるため変換)
+          out owner_lc "${GITHUB_REPOSITORY_OWNER,,}"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             out version "${GITHUB_REF#refs/tags/}"
           else
@@ -71,8 +74,8 @@ jobs:
           file: ${{ matrix.dockerfile }}
           push: true
           tags: |
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.preflight.outputs.version }}
-            ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}:latest
+            ${{ env.REGISTRY }}/${{ needs.preflight.outputs.owner_lc }}/${{ matrix.image }}:${{ needs.preflight.outputs.version }}
+            ${{ env.REGISTRY }}/${{ needs.preflight.outputs.owner_lc }}/${{ matrix.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
