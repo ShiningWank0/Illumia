@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = ["crates/illumia-core", "crates/illumia-server"]
+# crates/illumia-desktop は M6 で追加 (→ docs/01_architecture.md)
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+repository = "https://github.com/ShiningWank0/Illumia"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

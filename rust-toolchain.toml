@@ -1,0 +1,4 @@
+# ツールチェーン固定 (→ docs/09)。更新時はこのファイルと CI を同時に検証すること。
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
