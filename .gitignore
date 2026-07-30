@@ -1,0 +1,32 @@
+# Rust
+/target/
+crates/**/target/
+
+# Node
+node_modules/
+web/build/
+web/.svelte-kit/
+
+# Python (uv)
+.venv/
+__pycache__/
+*.pyc
+
+# アプリデータ・ローカル実行の生成物
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# OS / エディタ
+.DS_Store
+Thumbs.db
+
+# Tauri / Android
+apps/android/src-tauri/target/
+apps/android/src-tauri/gen/android/app/build/
+*.keystore
+!*.example.keystore
+
+# ビルド成果物 (本番ビルドは GitHub Actions のみ → docs/09)
+/dist/
