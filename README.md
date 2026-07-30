@@ -1,5 +1,6 @@
 # Illumia
 
+**Illumia** = **Illu**stration + **M**ed**ia**。
 アニメ・2次元イラスト特化のセルフホスト画像閲覧アプリ。
 Immich を基軸に、イラスト閲覧・漫画スタック・キャラクター認識
 ([anime_character_recognize](https://github.com/ShiningWank0/anime_character_recognize))
