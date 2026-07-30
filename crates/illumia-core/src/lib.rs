@@ -5,8 +5,10 @@
 
 pub mod assets;
 pub mod db;
+pub mod jobs;
 mod purge;
 pub mod settings;
+pub mod thumbnails;
 pub mod timeline;
 
 pub use purge::PurgeService;

@@ -20,6 +20,12 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("image error: {0}")]
     Image(#[from] image::ImageError),
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("image processing error: {0}")]
+    ImageProcessing(String),
+    #[error("WebP encoding error: {0}")]
+    WebpEncoding(String),
     #[error("database mutex is poisoned")]
     DatabasePoisoned,
     #[error("asset not found")]
@@ -32,6 +38,14 @@ pub enum Error {
     InvalidBucketKey,
     #[error("invalid asset-owned path")]
     InvalidAssetPath,
+    #[error("invalid job state: {0}")]
+    InvalidJobState(String),
+    #[error("job progress must be between 0 and 1")]
+    InvalidJobProgress,
+    #[error("job runner is already started")]
+    JobRunnerAlreadyStarted,
+    #[error("a job worker thread panicked")]
+    JobWorkerPanicked,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
