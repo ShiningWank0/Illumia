@@ -116,6 +116,7 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - build context は `.env*`, key, DB, image library、Git metadata を除外する。
 - Cargo/npm/Python/Docker/GitHub Actions の dependency update と脆弱性監査を CI で行う。
   release job の token permission は job 単位の最小権限とし、SBOM/provenance を生成する。
+- Docker base imageとGitHub Actionはdigest / commit SHAへ固定し、Dependabotで追従する。
 - production artifact は GitHub Actions の固定 workflow だけで作り、review 済み commit と
   image digest を deployment 時に記録する。
 

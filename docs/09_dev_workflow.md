@@ -68,7 +68,13 @@
 - `ci.yml`: push / PR で実行。paths-filter により変更のあったコンポーネントのみ
   lint + test を走らせる (docs のみの変更でも全体は green になる)。
   集約ジョブ `ci-ok` をブランチ保護の必須チェックにする。
+- Rust は `cargo audit`、Web は `npm audit` を品質ゲートに含める。Dockerに影響する変更は
+  BuildKitで実imageをbuildし、TrivyでHIGH/CRITICALをscanする。
 - `release.yml`: タグ `v*` / 手動 (workflow_dispatch) で本番ビルド。
   コンポーネント未実装の間は preflight 判定で該当ジョブを自動スキップする。
   成果物: Docker イメージ (ghcr: server / ml)、egui バイナリ (macOS universal / Windows)、
   Android APK (署名は GitHub Secrets)。
+- third-party Action はmutable tagではなくcommit SHAへ固定し、末尾commentに対応versionを
+  残す。DependabotでCargo/npm/pip/Docker/GitHub Actionsを週次更新する。
+- release workflowのwrite権限はpackage push / release作成jobだけに付与する。
+  containerにはSBOMとprovenanceを添付し、手動dev buildで `latest` を上書きしない。
