@@ -1,5 +1,5 @@
 // 実サーバー向け実装。docs/03 の REST を叩く。
-// Bearer トークンを付与し、エラー封筒を ApiError に変換する。
+// HttpOnly Cookie 認証を使い、エラー封筒を ApiError に変換する。
 // 画像 (thumbnail/preview/original) は認証必須のため URL のみ返し、
 // 実取得は image.ts の authedObjectUrl が Bearer 付き fetch で行う。
 
@@ -21,7 +21,6 @@ import {
   type ServerInfo,
   type StackDetail,
   type StackSummary,
-  type TokenResponse,
   type UploadResult
 } from './types';
 
@@ -50,10 +49,21 @@ export async function request<T>(
   opts: RequestOptions = {}
 ): Promise<T> {
   const headers: Record<string, string> = { Accept: 'application/json', ...opts.headers };
+  const target = `${base}${path}`;
+  if (typeof location !== 'undefined') {
+    const resolved = new URL(target, location.origin);
+    if (resolved.origin !== location.origin) {
+      throw new ApiError(
+        0,
+        'cross_origin_configuration',
+        'the Web client requires a same-origin API'
+      );
+    }
+  }
 
   let res: Response;
   try {
-    res = await fetch(`${base}${path}`, {
+    res = await fetch(target, {
       method: opts.method ?? 'GET',
       headers,
       body: opts.body ?? null,
@@ -92,19 +102,25 @@ export function createHttpClient(config: ClientConfig): IllumiaApi {
     serverInfo(): Promise<ServerInfo> {
       return request<ServerInfo>(base, '/api/server/info');
     },
-    setup(req: AuthRequest, setupToken?: string): Promise<TokenResponse> {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    setup(req: AuthRequest, setupToken?: string): Promise<void> {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'X-Illumia-Auth-Mode': 'cookie'
+      };
       if (setupToken) headers['X-Illumia-Setup-Token'] = setupToken;
-      return request<TokenResponse>(base, '/api/auth/setup', {
+      return request<void>(base, '/api/auth/setup', {
         method: 'POST',
         headers,
         body: JSON.stringify(req)
       });
     },
-    login(req: AuthRequest): Promise<TokenResponse> {
-      return request<TokenResponse>(base, '/api/auth/login', {
+    login(req: AuthRequest): Promise<void> {
+      return request<void>(base, '/api/auth/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Illumia-Auth-Mode': 'cookie'
+        },
         body: JSON.stringify(req)
       });
     },

@@ -114,6 +114,7 @@ async fn complete_m1_api_flow() {
     let (status, info) = app.get("/api/server/info", None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(info["setup_completed"], false);
+    assert!(info["version"].is_null());
 
     let (status, setup) = app
         .json(
@@ -207,7 +208,7 @@ async fn complete_m1_api_flow() {
         assert_eq!(response.headers()[header::CONTENT_TYPE], "image/webp");
         assert_eq!(
             response.headers()[header::CACHE_CONTROL],
-            "public,max-age=31536000,immutable"
+            "private,max-age=31536000,immutable"
         );
         assert!(
             !response

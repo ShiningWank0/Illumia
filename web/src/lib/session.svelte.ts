@@ -24,7 +24,7 @@ class Session {
     this.error = null;
     try {
       const info = await getApi().serverInfo();
-      this.version = info.version;
+      this.version = info.version ?? '';
       this.setupTokenRequired = info.setup_token_required;
       if (!info.setup_completed) {
         this.status = 'needs-setup';

@@ -82,6 +82,25 @@ impl Drop for TestApp {
 #[tokio::test]
 async fn browser_cookie_auth_is_same_origin_and_revocable() {
     let app = TestApp::new(None);
+    let unauthenticated_info = app
+        .request(
+            Request::builder()
+                .uri("/api/server/info")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+    let unauthenticated_info_json: Value = serde_json::from_slice(
+        &unauthenticated_info
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes(),
+    )
+    .expect("server info JSON");
+    assert!(unauthenticated_info_json["version"].is_null());
+
     let response = app
         .json(
             Method::POST,
@@ -96,7 +115,7 @@ async fn browser_cookie_auth_is_same_origin_and_revocable() {
             .headers()
             .get(header::CACHE_CONTROL)
             .and_then(|value| value.to_str().ok()),
-        Some("no-store")
+        Some("private, no-store")
     );
     let set_cookie = response
         .headers()
@@ -106,6 +125,7 @@ async fn browser_cookie_auth_is_same_origin_and_revocable() {
         .to_owned();
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite=Strict"));
+    assert!(set_cookie.contains("Path=/api"));
     let cookie = set_cookie
         .split(';')
         .next()
@@ -119,6 +139,26 @@ async fn browser_cookie_auth_is_same_origin_and_revocable() {
         .to_bytes();
     let json: Value = serde_json::from_slice(&bytes).expect("token response JSON");
     let token = json["token"].as_str().expect("native token").to_owned();
+
+    let cookie_only = app
+        .json(
+            Method::POST,
+            "/api/auth/login",
+            json!({"password": "security password", "device_name": "web response"}),
+            &[("x-illumia-auth-mode", "cookie")],
+        )
+        .await;
+    assert_eq!(cookie_only.status(), StatusCode::NO_CONTENT);
+    assert!(cookie_only.headers().get(header::SET_COOKIE).is_some());
+    assert!(
+        cookie_only
+            .into_body()
+            .collect()
+            .await
+            .expect("cookie-only body")
+            .to_bytes()
+            .is_empty()
+    );
 
     let info = app
         .request(
@@ -145,6 +185,7 @@ async fn browser_cookie_auth_is_same_origin_and_revocable() {
         serde_json::from_slice(&info.into_body().collect().await.expect("body").to_bytes())
             .expect("server info JSON");
     assert_eq!(info_json["authenticated"], true);
+    assert_eq!(info_json["version"], illumia_core::VERSION);
 
     let missing_origin = app
         .json(
@@ -183,6 +224,13 @@ async fn browser_cookie_auth_is_same_origin_and_revocable() {
         )
         .await;
     assert_eq!(same_origin.status(), StatusCode::OK);
+    assert_eq!(
+        same_origin
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-store")
+    );
 
     let query_token = app
         .request(
@@ -225,6 +273,47 @@ async fn browser_cookie_auth_is_same_origin_and_revocable() {
         )
         .await;
     assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn tampered_password_hash_cost_is_rejected_before_argon2() {
+    let app = TestApp::new(None);
+    let setup = app
+        .json(
+            Method::POST,
+            "/api/auth/setup",
+            json!({"password": "security password", "device_name": "browser"}),
+            &[],
+        )
+        .await;
+    assert_eq!(setup.status(), StatusCode::OK);
+
+    let database = Database::open(&app.path).expect("test database should reopen");
+    database
+        .with_connection(|connection| {
+            let hash: String = connection.query_row(
+                "SELECT value FROM settings WHERE key = 'auth.password_hash'",
+                [],
+                |row| row.get(0),
+            )?;
+            let tampered = hash.replace("m=19456", "m=4000000");
+            connection.execute(
+                "UPDATE settings SET value = ?1 WHERE key = 'auth.password_hash'",
+                [tampered],
+            )?;
+            Ok(())
+        })
+        .expect("password hash should be tampered for the test");
+
+    let login = app
+        .json(
+            Method::POST,
+            "/api/auth/login",
+            json!({"password": "security password", "device_name": "browser"}),
+            &[],
+        )
+        .await;
+    assert_eq!(login.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
 
 #[tokio::test]

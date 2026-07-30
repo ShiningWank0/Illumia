@@ -22,7 +22,6 @@ import {
   type ServerInfo,
   type StackDetail,
   type StackSummary,
-  type TokenResponse,
   type UploadResult,
   type VaultStatusResponse,
   type VaultTransfer,
@@ -126,10 +125,10 @@ export function createHttpVaultClient(): IllumiaApi {
     serverInfo(): Promise<ServerInfo> {
       return unsupported('serverInfo');
     },
-    setup(): Promise<TokenResponse> {
+    setup(): Promise<void> {
       return unsupported('setup');
     },
-    login(): Promise<TokenResponse> {
+    login(): Promise<void> {
       return unsupported('login');
     },
     logout(): Promise<void> {

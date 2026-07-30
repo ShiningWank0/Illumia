@@ -18,7 +18,6 @@ import {
   type StackChapter,
   type StackDetail,
   type StackSummary,
-  type TokenResponse,
   type UploadResult,
   type VaultStatusResponse,
   type VaultTransfer,
@@ -340,11 +339,11 @@ export function createMockClient(count = 3000): IllumiaApi {
         setup_token_required: false
       });
     },
-    async setup(): Promise<TokenResponse> {
-      return delay({ token: 'mock-token' });
+    async setup(): Promise<void> {
+      return delay(undefined);
     },
-    async login(): Promise<TokenResponse> {
-      return delay({ token: 'mock-token' });
+    async login(): Promise<void> {
+      return delay(undefined);
     },
     async logout(): Promise<void> {
       return delay(undefined);

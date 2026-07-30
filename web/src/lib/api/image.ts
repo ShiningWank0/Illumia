@@ -11,9 +11,18 @@ import { ApiError } from './types';
 const objectUrls = new Map<string, string>();
 const MAX_OBJECT_URLS = 400;
 
+function validatedAppUrl(url: string): URL {
+  const base = typeof location === 'undefined' ? 'http://illumia.invalid' : location.origin;
+  const parsed = new URL(url, base);
+  if (typeof location !== 'undefined' && parsed.origin !== location.origin) {
+    throw new ApiError(0, 'cross_origin_url', 'cross-origin image URLs are not allowed');
+  }
+  return parsed;
+}
+
 /** vault 配下の URL か (X-Vault-Session を付ける対象)。 */
 function isVaultUrl(url: string): boolean {
-  return url.includes('/api/vault/');
+  return validatedAppUrl(url).pathname.startsWith('/api/vault/');
 }
 
 /** 認証ヘッダを組み立てる。vault URL には X-Vault-Session も付与。 */
@@ -41,7 +50,8 @@ export async function authedObjectUrl(url: string): Promise<string> {
     return cached;
   }
 
-  const res = await fetch(url, { headers: authHeaders(url), credentials: 'same-origin' });
+  const target = validatedAppUrl(url);
+  const res = await fetch(target, { headers: authHeaders(url), credentials: 'same-origin' });
   if (!res.ok) {
     // vault URL のログにパス (asset id を含む) を残さない。
     throw new ApiError(res.status, `http_${res.status}`, 'image fetch failed');
@@ -77,7 +87,8 @@ export function revokeVaultObjectUrls(): void {
  * 原本を認証付きで取得し、ファイルとして保存する (vault でもダウンロード可)。
  */
 export async function downloadOriginal(url: string, filename: string): Promise<void> {
-  const res = await fetch(url, { headers: authHeaders(url), credentials: 'same-origin' });
+  const target = validatedAppUrl(url);
+  const res = await fetch(target, { headers: authHeaders(url), credentials: 'same-origin' });
   if (!res.ok) throw new ApiError(res.status, `http_${res.status}`, 'download failed');
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);

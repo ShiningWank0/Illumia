@@ -5,7 +5,7 @@ export type Granularity = 'day' | 'month' | 'year';
 
 /** `GET /api/server/info` (未認証可)。 */
 export interface ServerInfo {
-  version: string;
+  version: string | null;
   setup_completed: boolean;
   authenticated: boolean;
   setup_token_required: boolean;
@@ -17,7 +17,7 @@ export interface AuthRequest {
   device_name: string;
 }
 
-/** setup / login レスポンス。 */
+/** ネイティブクライアント向け setup / login レスポンス。Web は受け取らない。 */
 export interface TokenResponse {
   token: string;
 }
@@ -183,8 +183,8 @@ export class ApiError extends Error {
 export interface IllumiaApi {
   // --- メタ / 認証 ---
   serverInfo(): Promise<ServerInfo>;
-  setup(req: AuthRequest, setupToken?: string): Promise<TokenResponse>;
-  login(req: AuthRequest): Promise<TokenResponse>;
+  setup(req: AuthRequest, setupToken?: string): Promise<void>;
+  login(req: AuthRequest): Promise<void>;
   logout(): Promise<void>;
 
   // --- タイムライン ---

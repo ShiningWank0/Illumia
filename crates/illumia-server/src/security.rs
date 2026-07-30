@@ -44,6 +44,7 @@ const CSP: &str = "default-src 'self'; base-uri 'none'; object-src 'none'; \
     font-src 'self'; manifest-src 'self'";
 const PERMISSIONS_POLICY: &str =
     "camera=(), microphone=(), geolocation=(), payment=(), usb=(), browsing-topics=()";
+const API_CACHE_CONTROL: &str = "private, no-store";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuthTransport {
@@ -120,7 +121,7 @@ impl Security {
             ""
         };
         HeaderValue::from_str(&format!(
-            "{SESSION_COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; \
+            "{SESSION_COOKIE}={token}; Path=/api; HttpOnly; SameSite=Strict; \
              Max-Age=2592000{secure}"
         ))
         .expect("hex token produces a valid Set-Cookie header")
@@ -133,7 +134,7 @@ impl Security {
             ""
         };
         HeaderValue::from_str(&format!(
-            "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; \
+            "{SESSION_COOKIE}=; Path=/api; HttpOnly; SameSite=Strict; \
              Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT{secure}"
         ))
         .expect("static Set-Cookie header is valid")
@@ -283,9 +284,7 @@ pub async fn limit_auth_attempts(
 }
 
 pub async fn add_security_headers(request: Request, next: Next) -> Response {
-    let sensitive = request.uri().path() == "/api/server/info"
-        || request.uri().path().starts_with("/api/auth/")
-        || request.uri().path().starts_with("/api/vault/");
+    let api_response = request.uri().path() == "/api" || request.uri().path().starts_with("/api/");
     let mut response = next.run(request).await;
     let headers = response.headers_mut();
     headers
@@ -303,8 +302,19 @@ pub async fn add_security_headers(request: Request, next: Next) -> Response {
     headers
         .entry("permissions-policy")
         .or_insert(HeaderValue::from_static(PERMISSIONS_POLICY));
-    if sensitive {
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers
+        .entry("strict-transport-security")
+        .or_insert(HeaderValue::from_static("max-age=31536000"));
+    headers
+        .entry("cross-origin-opener-policy")
+        .or_insert(HeaderValue::from_static("same-origin"));
+    headers
+        .entry("cross-origin-resource-policy")
+        .or_insert(HeaderValue::from_static("same-origin"));
+    if api_response {
+        headers
+            .entry(CACHE_CONTROL)
+            .or_insert(HeaderValue::from_static(API_CACHE_CONTROL));
     }
     response
 }

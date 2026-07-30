@@ -45,7 +45,7 @@ use crate::{
     vault::VaultAccess,
 };
 
-const IMMUTABLE_CACHE: &str = "public,max-age=31536000,immutable";
+const IMMUTABLE_CACHE: &str = "private,max-age=31536000,immutable";
 const NO_STORE: &str = "no-store";
 const MAX_EXISTS_HASHES: usize = 4096;
 const MIN_NEW_VAULT_PASSWORD_CHARS: usize = 12;

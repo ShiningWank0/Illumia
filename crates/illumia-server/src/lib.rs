@@ -257,7 +257,13 @@ fn app_with_events(
                     "/api/vault/*".to_owned()
                 } else {
                     request.extensions().get::<MatchedPath>().map_or_else(
-                        || request.uri().path().to_owned(),
+                        || {
+                            if request.uri().path().starts_with("/api") {
+                                "/api/<unmatched>".to_owned()
+                            } else {
+                                "/<static>".to_owned()
+                            }
+                        },
                         |path| path.as_str().to_owned(),
                     )
                 };
