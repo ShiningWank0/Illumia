@@ -7,6 +7,8 @@ export type Granularity = 'day' | 'month' | 'year';
 export interface ServerInfo {
   version: string;
   setup_completed: boolean;
+  authenticated: boolean;
+  setup_token_required: boolean;
 }
 
 /** setup / login リクエスト body。 */
@@ -181,8 +183,9 @@ export class ApiError extends Error {
 export interface IllumiaApi {
   // --- メタ / 認証 ---
   serverInfo(): Promise<ServerInfo>;
-  setup(req: AuthRequest): Promise<TokenResponse>;
+  setup(req: AuthRequest, setupToken?: string): Promise<TokenResponse>;
   login(req: AuthRequest): Promise<TokenResponse>;
+  logout(): Promise<void>;
 
   // --- タイムライン ---
   getBuckets(granularity: Granularity): Promise<Bucket[]>;

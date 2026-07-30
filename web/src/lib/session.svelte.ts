@@ -1,7 +1,7 @@
 // 認証セッションのグローバル状態。ルートレイアウトの認可ゲートで使う。
-// GET /api/server/info の setup_completed とトークン有無で状態を決める。
+// GET /api/server/info の setup_completed / authenticated で状態を決める。
 
-import { getApi, getToken, setToken } from '$lib/api';
+import { getApi } from '$lib/api';
 import { ApiError } from '$lib/api/types';
 
 export type SessionStatus = 'loading' | 'needs-setup' | 'needs-login' | 'authed' | 'error';
@@ -16,6 +16,7 @@ class Session {
   status = $state<SessionStatus>('loading');
   version = $state('');
   error = $state<string | null>(null);
+  setupTokenRequired = $state(false);
 
   /** 起動時: サーバー状態とトークン有無から初期状態を決める。 */
   async init(): Promise<void> {
@@ -24,10 +25,11 @@ class Session {
     try {
       const info = await getApi().serverInfo();
       this.version = info.version;
+      this.setupTokenRequired = info.setup_token_required;
       if (!info.setup_completed) {
         this.status = 'needs-setup';
       } else {
-        this.status = getToken() ? 'authed' : 'needs-login';
+        this.status = info.authenticated ? 'authed' : 'needs-login';
       }
     } catch (e) {
       this.status = 'error';
@@ -35,22 +37,23 @@ class Session {
     }
   }
 
-  async setup(password: string, deviceName: string): Promise<void> {
-    const { token } = await getApi().setup({ password, device_name: deviceName });
-    setToken(token);
+  async setup(password: string, deviceName: string, setupToken?: string): Promise<void> {
+    await getApi().setup({ password, device_name: deviceName }, setupToken);
     this.status = 'authed';
   }
 
   async login(password: string, deviceName: string): Promise<void> {
-    const { token } = await getApi().login({ password, device_name: deviceName });
-    setToken(token);
+    await getApi().login({ password, device_name: deviceName });
     this.status = 'authed';
   }
 
-  /** トークンを破棄してログイン画面へ (401 検出時にも使う)。 */
-  logout(): void {
-    setToken(null);
-    this.status = 'needs-login';
+  /** Server 側 token を失効してログイン画面へ。 */
+  async logout(): Promise<void> {
+    try {
+      await getApi().logout();
+    } finally {
+      this.status = 'needs-login';
+    }
   }
 }
 

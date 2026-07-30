@@ -993,6 +993,7 @@ dependencies = [
  "illumia-core",
  "serde",
  "serde_json",
+ "subtle",
  "tokio",
  "tower",
  "tower-http",

@@ -1,11 +1,9 @@
-// WebSocket 購読 (/api/ws)。assets_added を受けてバケットを再取得する。
-// サーバーは `?token=` クエリ認証に対応済み (crates/illumia-server api.rs websocket)。
+// WebSocket 購読 (/api/ws)。HttpOnly 認証 Cookie は browser が自動送信する。
 
 import { defaultBaseUrl } from './client';
-import { getToken } from './token';
 import type { WsMessage } from './types';
 
-/** サーバーがブラウザから通る WS 認証 (?token=) に対応済みのため有効。 */
+/** サーバーが同一オリジン Cookie 認証に対応済みのため有効。 */
 export const WS_SUPPORTED = true;
 
 export interface WsHandle {
@@ -14,15 +12,12 @@ export interface WsHandle {
 
 /**
  * /api/ws に接続し assets_added を購読する。
- * サーバーが `?token=` に対応する前提の実装 (現状 WS_SUPPORTED=false)。
  */
 export function connectAssetsWs(onAssetsAdded: (bucketKeys: string[]) => void): WsHandle {
   const base = defaultBaseUrl();
   const httpOrigin = base || (typeof location !== 'undefined' ? location.origin : '');
   const wsUrl = httpOrigin.replace(/^http/, 'ws');
-  const token = getToken() ?? '';
-  // 将来のサーバー対応を見越し token をクエリに載せる。
-  const socket = new WebSocket(`${wsUrl}/api/ws?token=${encodeURIComponent(token)}`);
+  const socket = new WebSocket(`${wsUrl}/api/ws`);
 
   socket.addEventListener('message', (ev) => {
     try {

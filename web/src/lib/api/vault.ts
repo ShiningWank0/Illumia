@@ -132,6 +132,9 @@ export function createHttpVaultClient(): IllumiaApi {
     login(): Promise<TokenResponse> {
       return unsupported('login');
     },
+    logout(): Promise<void> {
+      return unsupported('logout');
+    },
 
     getBuckets(g: Granularity): Promise<Bucket[]> {
       return vreq<Bucket[]>(`/api/vault/timeline/buckets?granularity=${g}`);

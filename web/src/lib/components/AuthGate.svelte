@@ -4,6 +4,7 @@
 
   let password = $state('');
   let deviceName = $state('');
+  let setupToken = $state('');
   let submitting = $state(false);
   let formError = $state<string | null>(null);
 
@@ -21,9 +22,10 @@
     formError = null;
     submitting = true;
     try {
-      if (mode === 'setup') await session.setup(password, deviceName);
+      if (mode === 'setup') await session.setup(password, deviceName, setupToken || undefined);
       else await session.login(password, deviceName);
       password = '';
+      setupToken = '';
     } catch (err) {
       formError = err instanceof Error ? err.message : 'failed';
     } finally {
@@ -41,11 +43,31 @@
 
     <label>
       パスワード
-      <input type="password" bind:value={password} required autocomplete="current-password" />
+      <input
+        type="password"
+        bind:value={password}
+        required
+        minlength={mode === 'setup' ? 12 : undefined}
+        maxlength="1024"
+        autocomplete={mode === 'setup' ? 'new-password' : 'current-password'}
+      />
     </label>
+    {#if mode === 'setup' && session.setupTokenRequired}
+      <label>
+        初期セットアップトークン
+        <input
+          type="password"
+          bind:value={setupToken}
+          required
+          minlength="32"
+          maxlength="256"
+          autocomplete="off"
+        />
+      </label>
+    {/if}
     <label>
       デバイス名
-      <input type="text" bind:value={deviceName} required />
+      <input type="text" bind:value={deviceName} required maxlength="128" />
     </label>
 
     {#if formError}<p class="err">{formError}</p>{/if}

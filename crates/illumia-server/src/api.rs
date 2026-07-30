@@ -1050,25 +1050,23 @@ pub async fn patch_settings(
     Ok(Json(settings_json(&settings)?))
 }
 
-#[derive(Deserialize)]
-pub struct WsQuery {
-    token: Option<String>,
-}
+const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024;
 
-/// ブラウザの WebSocket API は任意ヘッダを付与できないため、
-/// `?token=` クエリでも認証を受け付ける (Bearer ヘッダも引き続き可)。
+/// Browser clients authenticate with the HttpOnly session cookie. Native
+/// clients may use the Authorization header. Credentials are never accepted
+/// from the URL, where proxies and request logs could retain them.
 pub async fn websocket(
     State(state): State<AppState>,
-    Query(query): Query<WsQuery>,
-    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    let token = match query.token.as_deref() {
-        Some(token) if !token.is_empty() => token.to_owned(),
-        _ => crate::auth::bearer_token(&headers)?.to_owned(),
-    };
-    state.auth.verify_token(&token)?;
-    Ok(upgrade.on_upgrade(move |socket| websocket_loop(state, socket)))
+    let permit = state.security.try_websocket_slot()?;
+    Ok(upgrade
+        .max_frame_size(MAX_WEBSOCKET_MESSAGE_BYTES)
+        .max_message_size(MAX_WEBSOCKET_MESSAGE_BYTES)
+        .on_upgrade(move |socket| async move {
+            let _permit = permit;
+            websocket_loop(state, socket).await;
+        }))
 }
 
 async fn websocket_loop(state: AppState, mut socket: WebSocket) {

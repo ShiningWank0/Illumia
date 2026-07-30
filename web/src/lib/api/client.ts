@@ -5,7 +5,6 @@
 
 import { blake3 } from 'hash-wasm';
 
-import { getToken } from './token';
 import {
   ApiError,
   type ApiErrorBody,
@@ -50,16 +49,15 @@ export async function request<T>(
   path: string,
   opts: RequestOptions = {}
 ): Promise<T> {
-  const token = getToken();
   const headers: Record<string, string> = { Accept: 'application/json', ...opts.headers };
-  if (token) headers.Authorization = `Bearer ${token}`;
 
   let res: Response;
   try {
     res = await fetch(`${base}${path}`, {
       method: opts.method ?? 'GET',
       headers,
-      body: opts.body ?? null
+      body: opts.body ?? null,
+      credentials: 'same-origin'
     });
   } catch (e) {
     throw new ApiError(0, 'network_error', e instanceof Error ? e.message : 'network error');
@@ -94,10 +92,12 @@ export function createHttpClient(config: ClientConfig): IllumiaApi {
     serverInfo(): Promise<ServerInfo> {
       return request<ServerInfo>(base, '/api/server/info');
     },
-    setup(req: AuthRequest): Promise<TokenResponse> {
+    setup(req: AuthRequest, setupToken?: string): Promise<TokenResponse> {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (setupToken) headers['X-Illumia-Setup-Token'] = setupToken;
       return request<TokenResponse>(base, '/api/auth/setup', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(req)
       });
     },
@@ -107,6 +107,9 @@ export function createHttpClient(config: ClientConfig): IllumiaApi {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(req)
       });
+    },
+    async logout(): Promise<void> {
+      await request<Response>(base, '/api/auth/logout', { method: 'POST', raw: true });
     },
 
     getBuckets(granularity: Granularity): Promise<Bucket[]> {

@@ -4,14 +4,17 @@ mod api;
 mod auth;
 mod config;
 mod error;
+mod security;
+#[cfg(test)]
+mod security_tests;
 mod vault;
 
-use std::{path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Request},
+    extract::{DefaultBodyLimit, MatchedPath, Request},
     http::{StatusCode, header::CONTENT_TYPE},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -26,7 +29,6 @@ use illumia_core::{
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tower_http::{
-    cors::CorsLayer,
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
@@ -35,19 +37,34 @@ pub use config::Config;
 pub use illumia_core::VERSION;
 
 const EVENT_BUFFER: usize = 128;
+const JSON_BODY_LIMIT: usize = 256 * 1024;
+const UPLOAD_BODY_LIMIT: usize = 129 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct AppState {
     database: Database,
     auth: auth::AuthService,
     events: broadcast::Sender<Value>,
+    security: security::Security,
     vault: vault::VaultSessionManager,
 }
 
 impl AppState {
-    fn new(database: Database, events: broadcast::Sender<Value>, vault_ttl: Duration) -> Self {
+    fn new(
+        database: Database,
+        events: broadcast::Sender<Value>,
+        vault_ttl: Duration,
+        setup_token_hash: Option<[u8; 32]>,
+        secure_cookies: bool,
+        trust_proxy_headers: bool,
+    ) -> Self {
         Self {
             auth: auth::AuthService::new(database.clone()),
+            security: security::Security::new(
+                setup_token_hash,
+                secure_cookies,
+                trust_proxy_headers,
+            ),
             vault: vault::VaultSessionManager::new(database.data_root(), vault_ttl),
             database,
             events,
@@ -79,7 +96,7 @@ pub fn app_with_vault_ttl(
     vault_ttl: Duration,
 ) -> Router {
     let (events, _) = broadcast::channel(EVENT_BUFFER);
-    app_with_events(database, web_dist, events, vault_ttl)
+    app_with_events(database, web_dist, events, vault_ttl, None, false, false)
 }
 
 fn app_with_events(
@@ -87,8 +104,18 @@ fn app_with_events(
     web_dist: Option<PathBuf>,
     events: broadcast::Sender<Value>,
     vault_ttl: Duration,
+    setup_token_hash: Option<[u8; 32]>,
+    secure_cookies: bool,
+    trust_proxy_headers: bool,
 ) -> Router {
-    let state = AppState::new(database, events, vault_ttl);
+    let state = AppState::new(
+        database,
+        events,
+        vault_ttl,
+        setup_token_hash,
+        secure_cookies,
+        trust_proxy_headers,
+    );
 
     let vault_session = Router::new()
         .route("/vault/lock", post(api::vault_lock))
@@ -133,9 +160,13 @@ fn app_with_events(
         ));
 
     let protected = Router::new()
+        .route("/auth/logout", post(auth::logout))
         .route("/auth/devices", get(auth::devices))
         .route("/auth/devices/{id}", delete(auth::revoke_device))
-        .route("/assets", post(api::upload_asset))
+        .route(
+            "/assets",
+            post(api::upload_asset).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
         .route("/assets/exists", post(api::assets_exist))
         .route(
             "/assets/{id}",
@@ -182,12 +213,21 @@ fn app_with_events(
             auth::require_auth,
         ));
 
-    let public = Router::new()
-        .route("/server/info", get(auth::server_info))
+    let public_auth = Router::new()
         .route("/auth/setup", post(auth::setup))
         .route("/auth/login", post(auth::login))
-        // 認証はハンドラ内で実施 (?token= クエリ対応のため middleware 外)
-        .route("/ws", get(api::websocket));
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            security::limit_auth_attempts,
+        ));
+    let websocket = Router::new().route("/ws", get(api::websocket)).route_layer(
+        middleware::from_fn_with_state(state.clone(), auth::require_websocket_auth),
+    );
+    let public = Router::new()
+        .route("/server/info", get(auth::server_info))
+        .merge(public_auth)
+        // WebSocket upgrade 前に header/Cookie の双方を middleware で検証する。
+        .merge(websocket);
 
     let api = protected
         .merge(public)
@@ -203,14 +243,16 @@ fn app_with_events(
     }
 
     router
-        .layer(DefaultBodyLimit::disable())
-        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request| {
                 let uri = if request.uri().path().starts_with("/api/vault/") {
                     "/api/vault/*".to_owned()
                 } else {
-                    request.uri().to_string()
+                    request.extensions().get::<MatchedPath>().map_or_else(
+                        || request.uri().path().to_owned(),
+                        |path| path.as_str().to_owned(),
+                    )
                 };
                 tracing::info_span!(
                     "request",
@@ -220,20 +262,43 @@ fn app_with_events(
                 )
             }),
         )
+        .layer(middleware::from_fn(security::add_security_headers))
         .layer(middleware::from_fn(normalize_error_response))
 }
 
 /// Opens storage, starts background services, binds the configured listener,
 /// and performs graceful shutdown.
 pub async fn run(config: Config) -> Result<()> {
-    let database = Database::open(&config.data_dir).context("open Illumia database")?;
+    let Config {
+        data_dir,
+        addr,
+        web_dist,
+        setup_token_hash,
+        secure_cookies,
+        trust_proxy_headers,
+    } = config;
+    let database = Database::open(&data_dir).context("open Illumia database")?;
+    let setup_completed = auth::AuthService::new(database.clone())
+        .setup_completed()
+        .map_err(|_| anyhow::anyhow!("check initial setup state"))?;
+    if !addr.ip().is_loopback() && !setup_completed && setup_token_hash.is_none() {
+        bail!(
+            "ILLUMIA_SETUP_TOKEN is required before an uninitialized server may listen \
+             on a non-loopback address"
+        );
+    }
+    if !addr.ip().is_loopback() && !secure_cookies {
+        tracing::warn!(
+            "secure cookies are disabled on a non-loopback listener; do not expose this over HTTP"
+        );
+    }
     let purge = PurgeService::new(database.clone());
     purge
         .resume_purging()
         .context("resume interrupted purges")?;
-    let listener = tokio::net::TcpListener::bind(config.addr)
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
-        .with_context(|| format!("bind {}", config.addr))?;
+        .with_context(|| format!("bind {addr}"))?;
 
     let (events, _) = broadcast::channel(EVENT_BUFFER);
     let mut runner = JobRunner::new(database.clone());
@@ -254,16 +319,20 @@ pub async fn run(config: Config) -> Result<()> {
     runner.start().context("start job runner")?;
 
     let purge_task = tokio::spawn(run_purge_loop(purge));
-    tracing::info!(address = %config.addr, "Illumia server listening");
+    tracing::info!(address = %addr, "Illumia server listening");
 
+    let router = app_with_events(
+        database,
+        web_dist,
+        events,
+        Duration::from_secs(15 * 60),
+        setup_token_hash,
+        secure_cookies,
+        trust_proxy_headers,
+    );
     let serve_result = axum::serve(
         listener,
-        app_with_events(
-            database,
-            config.web_dist,
-            events,
-            Duration::from_secs(15 * 60),
-        ),
+        router.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await;

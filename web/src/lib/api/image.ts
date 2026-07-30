@@ -1,9 +1,8 @@
 // 画像取得ヘルパ。
 // thumbnail/preview/original は Bearer 認証必須で、ブラウザの <img src> は
-// Authorization ヘッダを付けられないため、fetch で取得して object URL 化する。
+// Cookie 認証付き fetch で取得して object URL 化する。
 // data: URL (モック) はそのまま返す。取得済み object URL は上限付きで再利用する。
 
-import { getToken } from './token';
 import { getVaultToken } from '$lib/vaultSession.svelte';
 import { thumbHashToDataURL } from 'thumbhash';
 import { ApiError } from './types';
@@ -20,8 +19,6 @@ function isVaultUrl(url: string): boolean {
 /** 認証ヘッダを組み立てる。vault URL には X-Vault-Session も付与。 */
 function authHeaders(url: string): Record<string, string> {
   const headers: Record<string, string> = {};
-  const token = getToken();
-  if (token) headers.Authorization = `Bearer ${token}`;
   if (isVaultUrl(url)) {
     const vt = getVaultToken();
     if (vt) headers['X-Vault-Session'] = vt;
@@ -44,7 +41,7 @@ export async function authedObjectUrl(url: string): Promise<string> {
     return cached;
   }
 
-  const res = await fetch(url, { headers: authHeaders(url) });
+  const res = await fetch(url, { headers: authHeaders(url), credentials: 'same-origin' });
   if (!res.ok) {
     // vault URL のログにパス (asset id を含む) を残さない。
     throw new ApiError(res.status, `http_${res.status}`, 'image fetch failed');
@@ -80,7 +77,7 @@ export function revokeVaultObjectUrls(): void {
  * 原本を認証付きで取得し、ファイルとして保存する (vault でもダウンロード可)。
  */
 export async function downloadOriginal(url: string, filename: string): Promise<void> {
-  const res = await fetch(url, { headers: authHeaders(url) });
+  const res = await fetch(url, { headers: authHeaders(url), credentials: 'same-origin' });
   if (!res.ok) throw new ApiError(res.status, `http_${res.status}`, 'download failed');
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);

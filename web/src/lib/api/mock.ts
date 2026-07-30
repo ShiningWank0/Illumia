@@ -333,13 +333,21 @@ export function createMockClient(count = 3000): IllumiaApi {
 
   return {
     async serverInfo(): Promise<ServerInfo> {
-      return delay({ version: 'mock', setup_completed: true });
+      return delay({
+        version: 'mock',
+        setup_completed: true,
+        authenticated: true,
+        setup_token_required: false
+      });
     },
     async setup(): Promise<TokenResponse> {
       return delay({ token: 'mock-token' });
     },
     async login(): Promise<TokenResponse> {
       return delay({ token: 'mock-token' });
+    },
+    async logout(): Promise<void> {
+      return delay(undefined);
     },
 
     getBuckets: views.getBuckets,
@@ -466,6 +474,7 @@ export function createMockVaultClient(): IllumiaApi {
     serverInfo: () => nope('serverInfo'),
     setup: () => nope('setup'),
     login: () => nope('login'),
+    logout: () => nope('logout'),
 
     // vault.assets は import で増減するため都度読み直す。
     async getBuckets(g: Granularity): Promise<Bucket[]> {

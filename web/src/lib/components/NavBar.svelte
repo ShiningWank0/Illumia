@@ -50,7 +50,7 @@
   <form class="search" onsubmit={onSearch}>
     <input type="search" placeholder="検索…" bind:value={query} aria-label="検索" />
   </form>
-  <button class="logout" onclick={() => session.logout()}>ログアウト</button>
+  <button class="logout" onclick={() => void session.logout()}>ログアウト</button>
 </nav>
 
 <style>

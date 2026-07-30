@@ -8,7 +8,6 @@ import { createMockClient } from './mock';
 import type { IllumiaApi } from './types';
 
 export * from './types';
-export { getToken, setToken } from './token';
 export { defaultBaseUrl } from './client';
 
 /** モックモードか。VITE_USE_MOCK=1 で有効。 */
