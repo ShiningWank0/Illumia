@@ -3,6 +3,14 @@
 //! フレームワーク非依存。サービス層 trait 群をここで定義し、
 //! illumia-server (HTTP) と illumia-desktop (in-process) の両方から使う。
 
+pub mod assets;
+pub mod db;
+mod purge;
+pub mod settings;
+pub mod timeline;
+
+pub use purge::PurgeService;
+
 /// アプリケーションのバージョン (workspace で一元管理)。
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
