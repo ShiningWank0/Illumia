@@ -141,3 +141,47 @@ fn tampered_vault_kdf_and_oversized_transfers_fail_before_expensive_work() -> Re
     ));
     Ok(())
 }
+
+#[cfg(unix)]
+#[test]
+fn data_root_databases_and_keyfile_are_owner_only() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new()?;
+    let data_root = directory.path().join("data");
+    let database = Database::open(&data_root)?;
+    assert_eq!(
+        fs::metadata(&data_root)?.permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        fs::metadata(data_root.join("illumia.db"))?
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    init_with_kdf(
+        &data_root,
+        "filesystem security password",
+        KdfParams::for_tests(),
+    )?;
+    let vault = VaultHandle::open(
+        &data_root,
+        unlock(&data_root, "filesystem security password")?,
+    )?;
+    drop(vault);
+    assert_eq!(
+        fs::metadata(data_root.join("vault"))?.permissions().mode() & 0o777,
+        0o700
+    );
+    for path in [
+        data_root.join("vault").join("vault.db"),
+        data_root.join("vault").join("vault.keyfile"),
+    ] {
+        assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
+    }
+    drop(database);
+    Ok(())
+}

@@ -5,7 +5,9 @@ FROM node:22-slim AS web
 WORKDIR /app/web
 
 COPY web/package.json web/package-lock.json ./
-RUN npm ci
+# dependency lifecycle script は既定で実行せず、build に必要な esbuild の検証だけを明示する。
+RUN npm ci --ignore-scripts \
+    && node node_modules/esbuild/install.js
 
 COPY web/ ./
 RUN npm run build
@@ -35,26 +37,37 @@ RUN --mount=type=cache,id=illumia-cargo-registry,target=/usr/local/cargo/registr
 
 FROM debian:bookworm-slim AS runtime
 
+ARG SOURCE_COMMIT=unknown
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 1000 illumia \
     && useradd --uid 1000 --gid 1000 --create-home --shell /usr/sbin/nologin illumia \
     && mkdir -p /app/web /data \
-    && chown -R illumia:illumia /app /data
+    && chown -R illumia:illumia /app /data \
+    && chmod 0755 /app /app/web \
+    && chmod 0700 /data
 
 COPY --from=rust --chown=illumia:illumia /out/illumia-server /app/illumia-server
 COPY --from=web --chown=illumia:illumia /app/web/build/ /app/web/
 
 ENV ILLUMIA_DATA_DIR=/data \
     ILLUMIA_ADDR=0.0.0.0:2283 \
-    ILLUMIA_WEB_DIST=/app/web
+    ILLUMIA_WEB_DIST=/app/web \
+    ILLUMIA_SECURE_COOKIES=true
+
+LABEL org.opencontainers.image.source="https://github.com/ShiningWank0/Illumia" \
+      org.opencontainers.image.revision="${SOURCE_COMMIT}" \
+      org.opencontainers.image.licenses="MIT"
 
 VOLUME ["/data"]
 EXPOSE 2283
 
-USER illumia
+USER 1000:1000
 
-HEALTHCHECK CMD bash -c '</dev/tcp/127.0.0.1/2283' || exit 1
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD bash -c '</dev/tcp/127.0.0.1/2283' || exit 1
 
+STOPSIGNAL SIGTERM
 ENTRYPOINT ["/app/illumia-server"]

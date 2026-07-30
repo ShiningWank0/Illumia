@@ -16,5 +16,19 @@ ml/.venv/
 ml/**/__pycache__/
 ml/**/*.pyc
 
+**/.env
+**/.env.*
+!docker/.env.example
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite
+**/*.sqlite3
+**/*.pem
+**/*.p12
+**/*.pfx
+**/*.key
+**/*.keystore
+
 .DS_Store
 *.log

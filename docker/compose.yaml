@@ -1,20 +1,33 @@
 services:
   illumia-server:
-    image: ghcr.io/shiningwank0/illumia-server:latest
+    image: ${ILLUMIA_IMAGE:-ghcr.io/shiningwank0/illumia-server:latest}
     build:
       context: ..
       dockerfile: docker/Dockerfile.server
     ports:
-      - "2283:2283"
+      - "127.0.0.1:2283:2283"
+    environment:
+      ILLUMIA_SETUP_TOKEN: ${ILLUMIA_SETUP_TOKEN:-}
+      ILLUMIA_SECURE_COOKIES: ${ILLUMIA_SECURE_COOKIES:-true}
+      ILLUMIA_TRUST_PROXY_HEADERS: ${ILLUMIA_TRUST_PROXY_HEADERS:-false}
     volumes:
       - illumia_data:/data
       # TrueNAS などでホスト上のデータセットを直接使う場合は、上の named volume を
       # 次のようなバインドマウントに置き換える:
       # - /mnt/pool/illumia:/data
     restart: unless-stopped
-    # ホストの規模に合わせて必要な場合だけ有効化する:
-    # cpus: "4"
-    # mem_limit: 4g
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: "4"
+    mem_limit: 3g
+    stop_grace_period: 30s
 
   # 将来追加予定のステートレスな ML サイドカー。
   # docker/Dockerfile.ml が追加され、イメージが公開された後に有効化する。

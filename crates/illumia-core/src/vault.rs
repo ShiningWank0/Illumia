@@ -24,7 +24,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     assets::{Asset, AssetService, Lifecycle},
-    db::{Database, Error, Result},
+    db::{Database, Error, Result, create_private_dir_all, set_private_file_permissions},
     images, thumbnails,
 };
 
@@ -1238,7 +1238,8 @@ pub fn init_with_kdf(
     if keyfile_path.exists() {
         return Err(Error::VaultAlreadyInitialized);
     }
-    fs::create_dir_all(vault_dir.join("blobs"))?;
+    create_private_dir_all(&vault_dir)?;
+    create_private_dir_all(&vault_dir.join("blobs"))?;
 
     let master_key = Zeroizing::new(random_array::<KEY_LEN>()?);
     let recovery_key = Zeroizing::new(random_array::<KEY_LEN>()?);
@@ -1358,6 +1359,9 @@ fn derive_password_key(
 
 fn read_keyfile(data_root: &Path) -> Result<KeyFile> {
     let path = data_root.join("vault").join("vault.keyfile");
+    if path.exists() {
+        set_private_file_permissions(&path)?;
+    }
     match fs::metadata(&path) {
         Ok(metadata) if metadata.len() > MAX_KEYFILE_BYTES => {
             return Err(Error::InvalidVaultKeyFile);
@@ -1399,6 +1403,7 @@ fn write_keyfile(path: &Path, keyfile: &KeyFile, create_new: bool) -> Result<()>
                     error.into()
                 }
             })?;
+        set_private_file_permissions(path)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
         return Ok(());
@@ -1406,6 +1411,7 @@ fn write_keyfile(path: &Path, keyfile: &KeyFile, create_new: bool) -> Result<()>
 
     let temporary = path.with_extension(format!("tmp-{}", Uuid::now_v7()));
     fs::write(&temporary, &bytes)?;
+    set_private_file_permissions(&temporary)?;
     if let Err(error) = fs::rename(&temporary, path) {
         #[cfg(windows)]
         if path.exists() {
@@ -1423,6 +1429,7 @@ fn write_keyfile(path: &Path, keyfile: &KeyFile, create_new: bool) -> Result<()>
         let _ = remove_if_exists(&temporary);
         return Err(error.into());
     }
+    set_private_file_permissions(path)?;
     Ok(())
 }
 

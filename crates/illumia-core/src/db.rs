@@ -104,8 +104,10 @@ impl Database {
     /// `<data_root>/illumia.db` を開き、未適用 migration を適用する。
     pub fn open(data_root: impl AsRef<Path>) -> Result<Self> {
         let data_root = data_root.as_ref();
-        fs::create_dir_all(data_root)?;
-        let mut connection = Connection::open(data_root.join("illumia.db"))?;
+        create_private_dir_all(data_root)?;
+        let database_path = data_root.join("illumia.db");
+        let mut connection = Connection::open(&database_path)?;
+        set_private_file_permissions(&database_path)?;
         configure(&connection)?;
         migrate(&mut connection)?;
 
@@ -122,8 +124,11 @@ impl Database {
     /// `vault: no-log` — 呼び出し元は鍵・パス・asset id をログへ出さないこと。
     pub(crate) fn open_vault(data_root: &Path, sqlcipher_key: &[u8; 32]) -> Result<Self> {
         let vault_dir = data_root.join("vault");
-        fs::create_dir_all(vault_dir.join("blobs"))?;
-        let mut connection = Connection::open(vault_dir.join("vault.db"))?;
+        create_private_dir_all(&vault_dir)?;
+        create_private_dir_all(&vault_dir.join("blobs"))?;
+        let database_path = vault_dir.join("vault.db");
+        let mut connection = Connection::open(&database_path)?;
+        set_private_file_permissions(&database_path)?;
         let key = Zeroizing::new(hex::encode(sqlcipher_key));
         let key_pragma = Zeroizing::new(format!(
             "PRAGMA key = \"x'{}'\";
@@ -182,6 +187,32 @@ impl Database {
             Ok(())
         })
     }
+}
+
+pub(crate) fn create_private_dir_all(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700).create(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(path)?;
+    Ok(())
+}
+
+pub(crate) fn set_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn configure(connection: &Connection) -> Result<()> {
