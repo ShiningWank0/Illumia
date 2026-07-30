@@ -34,8 +34,5 @@ apps/android/src-tauri/gen/android/app/build/
 # claude code の権限設定はローカルのみで十分
 .claude/settings.local.json
 
-
-
 # Added by cargo
-
 /target
