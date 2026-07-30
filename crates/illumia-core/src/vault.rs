@@ -25,7 +25,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use crate::{
     assets::{Asset, AssetService, Lifecycle},
     db::{Database, Error, Result},
-    thumbnails,
+    images, thumbnails,
 };
 
 const KEYFILE_VERSION: u32 = 1;
@@ -37,6 +37,14 @@ const MAGIC: &[u8; 5] = b"ILMV1";
 const NONCE_PREFIX_LEN: usize = 16;
 const BLOB_HEADER_LEN: usize = MAGIC.len() + NONCE_PREFIX_LEN + 4;
 const CHUNK_SIZE: usize = 1024 * 1024;
+const MAX_KEYFILE_BYTES: u64 = 64 * 1024;
+const MAX_ENCRYPTED_BLOB_BYTES: u64 = images::MAX_ASSET_BYTES as u64 + 1024 * 1024;
+pub const MAX_VAULT_TRANSFER_ASSETS: usize = 100;
+const MAX_VAULT_TRANSFER_BYTES: usize = 512 * 1024 * 1024;
+const MAX_VAULT_PASSWORD_BYTES: usize = 1024;
+const MAX_KDF_MEMORY_KIB: u32 = 256 * 1024;
+const MAX_KDF_ITERATIONS: u32 = 10;
+const MAX_KDF_PARALLELISM: u32 = 16;
 
 /// Argon2id の keyfile 記録パラメータ。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -172,7 +180,11 @@ impl VaultHandle {
         })?;
         let aad = blob_key_aad(blob_id, &kind, asset_id.as_deref());
         let file_key = Zeroizing::new(unwrap_bytes(&self.key.master_key, &wrapped_key, &aad)?);
-        let encrypted = fs::read(self.blob_path(blob_id)?)?;
+        let path = self.blob_path(blob_id)?;
+        if fs::metadata(&path)?.len() > MAX_ENCRYPTED_BLOB_BYTES {
+            return Err(Error::InvalidVaultBlob);
+        }
+        let encrypted = fs::read(path)?;
         decrypt_blob(blob_id, &file_key, &encrypted)
     }
 
@@ -180,11 +192,15 @@ impl VaultHandle {
     ///
     /// `vault: no-log`
     pub fn generate_thumbnails(&self, asset_id: &str) -> Result<()> {
+        let extension = AssetService::new(self.db.clone())
+            .get(asset_id)?
+            .ok_or(Error::AssetNotFound)?
+            .ext;
         let original_blob = self
             .blob_id_for(asset_id, BlobKind::Original)?
             .ok_or(Error::VaultBlobNotFound)?;
         let source = Zeroizing::new(self.read_blob(&original_blob)?);
-        let variants = thumbnails::generate_variants_in_memory(&source)?;
+        let variants = thumbnails::generate_variants_in_memory(&source, &extension)?;
 
         if self.blob_id_for(asset_id, BlobKind::Thumbnail)?.is_none() {
             self.write_blob_for(&variants.thumbnail, BlobKind::Thumbnail, Some(asset_id))?;
@@ -221,6 +237,9 @@ impl VaultHandle {
         kind: BlobKind,
         asset_id: Option<&str>,
     ) -> Result<String> {
+        if bytes.len() > images::MAX_ASSET_BYTES {
+            return Err(Error::InvalidVaultBlob);
+        }
         let blob_id = Uuid::now_v7().to_string();
         let file_key = Zeroizing::new(random_array()?);
         let encrypted = encrypt_blob(&blob_id, &file_key, bytes)?;
@@ -452,7 +471,7 @@ pub fn export_stack(vault: &VaultHandle, main_db: &Database, stack_id: &str) -> 
 }
 
 fn validate_transfer_ids(asset_ids: &[String]) -> Result<()> {
-    if asset_ids.is_empty() {
+    if asset_ids.is_empty() || asset_ids.len() > MAX_VAULT_TRANSFER_ASSETS {
         return Err(Error::EmptyVaultTransfer);
     }
     let mut unique = HashSet::with_capacity(asset_ids.len());
@@ -468,8 +487,10 @@ fn validate_transfer_ids(asset_ids: &[String]) -> Result<()> {
 fn prepare_main_assets(database: &Database, asset_ids: &[String]) -> Result<Vec<PreparedAsset>> {
     let service = AssetService::new(database.clone());
     let mut output = Vec::with_capacity(asset_ids.len());
+    let mut total_bytes = 0_usize;
     for asset_id in asset_ids {
         let asset = service.get(asset_id)?.ok_or(Error::AssetNotFound)?;
+        reserve_transfer_bytes(&mut total_bytes, asset.size)?;
         let source_path = database
             .data_root()
             .join(checked_relative_path(&asset.library_path)?);
@@ -502,8 +523,10 @@ fn prepare_main_assets(database: &Database, asset_ids: &[String]) -> Result<Vec<
 fn prepare_vault_assets(vault: &VaultHandle, asset_ids: &[String]) -> Result<Vec<PreparedAsset>> {
     let service = AssetService::new(vault.db.clone());
     let mut output = Vec::with_capacity(asset_ids.len());
+    let mut total_bytes = 0_usize;
     for asset_id in asset_ids {
         let asset = service.get(asset_id)?.ok_or(Error::AssetNotFound)?;
+        reserve_transfer_bytes(&mut total_bytes, asset.size)?;
         let original_id = vault
             .blob_id_for(asset_id, BlobKind::Original)?
             .ok_or(Error::IncompleteVaultTransfer)?;
@@ -1314,6 +1337,10 @@ fn derive_password_key(
     salt: &[u8],
     parameters: KdfParams,
 ) -> Result<[u8; KEY_LEN]> {
+    if password.len() > MAX_VAULT_PASSWORD_BYTES {
+        return Err(Error::VaultAuthenticationFailed);
+    }
+    validate_kdf(parameters)?;
     let parameters = Params::new(
         parameters.memory_kib,
         parameters.iterations,
@@ -1331,6 +1358,16 @@ fn derive_password_key(
 
 fn read_keyfile(data_root: &Path) -> Result<KeyFile> {
     let path = data_root.join("vault").join("vault.keyfile");
+    match fs::metadata(&path) {
+        Ok(metadata) if metadata.len() > MAX_KEYFILE_BYTES => {
+            return Err(Error::InvalidVaultKeyFile);
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(Error::VaultNotInitialized);
+        }
+        Err(error) => return Err(error.into()),
+    }
     let bytes = fs::read(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             Error::VaultNotInitialized
@@ -1343,6 +1380,7 @@ fn read_keyfile(data_root: &Path) -> Result<KeyFile> {
     if keyfile.version != KEYFILE_VERSION {
         return Err(Error::InvalidVaultKeyFile);
     }
+    validate_kdf(keyfile.kdf).map_err(|_| Error::InvalidVaultKeyFile)?;
     Ok(keyfile)
 }
 
@@ -1468,6 +1506,9 @@ fn aead_decrypt(
 }
 
 fn encrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
+    if plaintext.len() > images::MAX_ASSET_BYTES {
+        return Err(Error::InvalidVaultBlob);
+    }
     let nonce_prefix: [u8; NONCE_PREFIX_LEN] = random_array()?;
     let mut header = Vec::with_capacity(BLOB_HEADER_LEN);
     header.extend_from_slice(MAGIC);
@@ -1502,7 +1543,11 @@ fn encrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<
 }
 
 fn decrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], encrypted: &[u8]) -> Result<Vec<u8>> {
-    if encrypted.len() < BLOB_HEADER_LEN || &encrypted[..MAGIC.len()] != MAGIC {
+    if encrypted.len() < BLOB_HEADER_LEN
+        || u64::try_from(encrypted.len()).map_err(|_| Error::InvalidVaultBlob)?
+            > MAX_ENCRYPTED_BLOB_BYTES
+        || &encrypted[..MAGIC.len()] != MAGIC
+    {
         return Err(Error::InvalidVaultBlob);
     }
     let header = &encrypted[..BLOB_HEADER_LEN];
@@ -1560,6 +1605,30 @@ fn decrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], encrypted: &[u8]) -> Result<
         }
         index = index.checked_add(1).ok_or(Error::InvalidVaultBlob)?;
     }
+}
+
+fn validate_kdf(parameters: KdfParams) -> Result<()> {
+    if !(64..=MAX_KDF_MEMORY_KIB).contains(&parameters.memory_kib)
+        || !(1..=MAX_KDF_ITERATIONS).contains(&parameters.iterations)
+        || !(1..=MAX_KDF_PARALLELISM).contains(&parameters.parallelism)
+    {
+        return Err(Error::InvalidKdfParameters);
+    }
+    Ok(())
+}
+
+fn reserve_transfer_bytes(total: &mut usize, size: i64) -> Result<()> {
+    let size = usize::try_from(size).map_err(|_| Error::IncompleteVaultTransfer)?;
+    if size > images::MAX_ASSET_BYTES {
+        return Err(Error::IncompleteVaultTransfer);
+    }
+    *total = total
+        .checked_add(size)
+        .ok_or(Error::IncompleteVaultTransfer)?;
+    if *total > MAX_VAULT_TRANSFER_BYTES {
+        return Err(Error::IncompleteVaultTransfer);
+    }
+    Ok(())
 }
 
 fn chunk_nonce(prefix: &[u8; NONCE_PREFIX_LEN], index: usize) -> Result<[u8; NONCE_LEN]> {

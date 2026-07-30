@@ -251,6 +251,19 @@ async fn setup_token_body_limit_rate_limit_and_cors_are_enforced() {
         )
         .await;
     assert_eq!(valid.status(), StatusCode::OK);
+    let valid_json: Value = serde_json::from_slice(
+        &valid
+            .into_body()
+            .collect()
+            .await
+            .expect("setup body")
+            .to_bytes(),
+    )
+    .expect("setup JSON");
+    let token = valid_json["token"]
+        .as_str()
+        .expect("setup token response")
+        .to_owned();
 
     let oversized = app
         .request(
@@ -263,6 +276,77 @@ async fn setup_token_body_limit_rate_limit_and_cors_are_enforced() {
         )
         .await;
     assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let oversized_setting = app
+        .json(
+            Method::PATCH,
+            "/api/settings",
+            json!({"jobs.thumbnail_concurrency": 65}),
+            &[(header::AUTHORIZATION.as_str(), &format!("Bearer {token}"))],
+        )
+        .await;
+    assert_eq!(oversized_setting.status(), StatusCode::BAD_REQUEST);
+
+    let too_many_hashes = app
+        .json(
+            Method::POST,
+            "/api/assets/exists",
+            json!({"hashes": vec![""; 4097]}),
+            &[(header::AUTHORIZATION.as_str(), &format!("Bearer {token}"))],
+        )
+        .await;
+    assert_eq!(too_many_hashes.status(), StatusCode::BAD_REQUEST);
+
+    let long_search = app
+        .request(
+            Request::builder()
+                .uri(format!("/api/search?q={}", "a".repeat(257)))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+    assert_eq!(long_search.status(), StatusCode::BAD_REQUEST);
+
+    let short_vault_password = app
+        .json(
+            Method::POST,
+            "/api/vault/init",
+            json!({"password": "short"}),
+            &[(header::AUTHORIZATION.as_str(), &format!("Bearer {token}"))],
+        )
+        .await;
+    assert_eq!(short_vault_password.status(), StatusCode::BAD_REQUEST);
+
+    // The upload route has a deliberate 129 MiB override; a 300 KiB invalid
+    // image must reach image validation instead of inheriting the 256 KiB JSON
+    // limit.
+    let boundary = "illumia-security-boundary";
+    let file = vec![0_u8; JSON_BODY_LIMIT + 32 * 1024];
+    let checksum = illumia_core::blake3::hash(&file).to_hex().to_string();
+    let mut multipart = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+         filename=\"invalid.png\"\r\nContent-Type: image/png\r\n\r\n"
+    )
+    .into_bytes();
+    multipart.extend_from_slice(&file);
+    multipart.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    let invalid_image = app
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/assets")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .header("x-illumia-checksum", checksum)
+                .body(Body::from(multipart))
+                .expect("request"),
+        )
+        .await;
+    assert_eq!(invalid_image.status(), StatusCode::BAD_REQUEST);
 
     let preflight = app
         .request(

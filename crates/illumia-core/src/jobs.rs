@@ -172,7 +172,8 @@ impl JobQueue {
                     id, kind, payload, state, priority, progress, error,
                     created_at, started_at, finished_at
                  FROM jobs
-                 ORDER BY created_at DESC, id DESC",
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 5000",
             )?;
             let jobs = statement
                 .query_map([], job_from_row)?
@@ -384,6 +385,10 @@ fn default_concurrency() -> usize {
         .unwrap_or(1)
         .saturating_sub(1)
         .max(1)
+        .min(
+            usize::try_from(crate::settings::MAX_JOB_CONCURRENCY)
+                .expect("u32 job concurrency limit fits usize"),
+        )
 }
 
 #[cfg(target_os = "linux")]

@@ -159,6 +159,14 @@ fn app_with_events(
             vault::require_session,
         ));
 
+    let vault_auth = Router::new()
+        .route("/vault/init", post(api::vault_init))
+        .route("/vault/unlock", post(api::vault_unlock))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            security::limit_auth_attempts,
+        ));
+
     let protected = Router::new()
         .route("/auth/logout", post(auth::logout))
         .route("/auth/devices", get(auth::devices))
@@ -204,9 +212,8 @@ fn app_with_events(
             "/settings",
             get(api::get_settings).patch(api::patch_settings),
         )
-        .route("/vault/init", post(api::vault_init))
-        .route("/vault/unlock", post(api::vault_unlock))
         .route("/vault/status", get(api::vault_status))
+        .merge(vault_auth)
         .merge(vault_session)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

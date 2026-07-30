@@ -91,7 +91,8 @@ impl TimelineService {
                  FROM assets
                  WHERE visible_in_timeline = 1
                    AND substr(taken_at_local_date, 1, ?1) = ?2
-                 ORDER BY taken_at DESC",
+                 ORDER BY taken_at DESC
+                 LIMIT 50000",
             )?;
             let items = statement
                 .query_map(params![length, key], |row| {

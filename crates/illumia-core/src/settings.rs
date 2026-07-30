@@ -16,6 +16,11 @@ const MIN_CLUSTER_SIZE: &str = "ml.min_cluster_size";
 const QUALITY_GATE: &str = "ml.quality_gate";
 
 pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 30;
+pub const MAX_RETENTION_DAYS: u32 = 36_500;
+pub const MIN_JOB_CONCURRENCY: u32 = 1;
+pub const MAX_JOB_CONCURRENCY: u32 = 64;
+pub const MIN_CLUSTER_SIZE_VALUE: u32 = 2;
+pub const MAX_CLUSTER_SIZE_VALUE: u32 = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QualityGate {
@@ -56,58 +61,121 @@ impl Settings {
     }
 
     pub fn trash_retention_days(&self) -> Result<u32> {
-        self.get_u32(TRASH_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)
+        bounded_u32(
+            TRASH_RETENTION_DAYS,
+            self.get_u32(TRASH_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)?,
+            0,
+            MAX_RETENTION_DAYS,
+        )
     }
 
     pub fn set_trash_retention_days(&self, value: u32) -> Result<()> {
+        bounded_u32(TRASH_RETENTION_DAYS, value, 0, MAX_RETENTION_DAYS)?;
         self.set_u32(TRASH_RETENTION_DAYS, value)
     }
 
     pub fn dedup_retention_days(&self) -> Result<u32> {
-        self.get_u32(DEDUP_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)
+        bounded_u32(
+            DEDUP_RETENTION_DAYS,
+            self.get_u32(DEDUP_RETENTION_DAYS, DEFAULT_RETENTION_DAYS)?,
+            0,
+            MAX_RETENTION_DAYS,
+        )
     }
 
     pub fn set_dedup_retention_days(&self, value: u32) -> Result<()> {
+        bounded_u32(DEDUP_RETENTION_DAYS, value, 0, MAX_RETENTION_DAYS)?;
         self.set_u32(DEDUP_RETENTION_DAYS, value)
     }
 
     pub fn thumbnail_concurrency(&self) -> Result<Option<u32>> {
-        self.get_optional(THUMBNAIL_CONCURRENCY)
+        self.get_optional(THUMBNAIL_CONCURRENCY)?
+            .map(|value| {
+                bounded_u32(
+                    THUMBNAIL_CONCURRENCY,
+                    value,
+                    MIN_JOB_CONCURRENCY,
+                    MAX_JOB_CONCURRENCY,
+                )
+            })
+            .transpose()
     }
 
     pub fn set_thumbnail_concurrency(&self, value: u32) -> Result<()> {
+        bounded_u32(
+            THUMBNAIL_CONCURRENCY,
+            value,
+            MIN_JOB_CONCURRENCY,
+            MAX_JOB_CONCURRENCY,
+        )?;
         self.set_u32(THUMBNAIL_CONCURRENCY, value)
     }
 
     pub fn ml_concurrency(&self) -> Result<Option<u32>> {
-        self.get_optional(ML_CONCURRENCY)
+        self.get_optional(ML_CONCURRENCY)?
+            .map(|value| {
+                bounded_u32(
+                    ML_CONCURRENCY,
+                    value,
+                    MIN_JOB_CONCURRENCY,
+                    MAX_JOB_CONCURRENCY,
+                )
+            })
+            .transpose()
     }
 
     pub fn set_ml_concurrency(&self, value: u32) -> Result<()> {
+        bounded_u32(
+            ML_CONCURRENCY,
+            value,
+            MIN_JOB_CONCURRENCY,
+            MAX_JOB_CONCURRENCY,
+        )?;
         self.set_u32(ML_CONCURRENCY, value)
     }
 
     pub fn tau_high_override(&self) -> Result<Option<f64>> {
-        self.get_optional(TAU_HIGH_OVERRIDE)
+        self.get_optional(TAU_HIGH_OVERRIDE)?
+            .map(|value| bounded_ratio(TAU_HIGH_OVERRIDE, value))
+            .transpose()
     }
 
     pub fn set_tau_high_override(&self, value: f64) -> Result<()> {
+        bounded_ratio(TAU_HIGH_OVERRIDE, value)?;
         self.set(TAU_HIGH_OVERRIDE, &value.to_string())
     }
 
     pub fn tau_low_override(&self) -> Result<Option<f64>> {
-        self.get_optional(TAU_LOW_OVERRIDE)
+        self.get_optional(TAU_LOW_OVERRIDE)?
+            .map(|value| bounded_ratio(TAU_LOW_OVERRIDE, value))
+            .transpose()
     }
 
     pub fn set_tau_low_override(&self, value: f64) -> Result<()> {
+        bounded_ratio(TAU_LOW_OVERRIDE, value)?;
         self.set(TAU_LOW_OVERRIDE, &value.to_string())
     }
 
     pub fn min_cluster_size(&self) -> Result<Option<u32>> {
-        self.get_optional(MIN_CLUSTER_SIZE)
+        self.get_optional(MIN_CLUSTER_SIZE)?
+            .map(|value| {
+                bounded_u32(
+                    MIN_CLUSTER_SIZE,
+                    value,
+                    MIN_CLUSTER_SIZE_VALUE,
+                    MAX_CLUSTER_SIZE_VALUE,
+                )
+            })
+            .transpose()
     }
 
     pub fn set_min_cluster_size(&self, value: u32) -> Result<()> {
+        bounded_u32(
+            MIN_CLUSTER_SIZE,
+            value,
+            MIN_CLUSTER_SIZE_VALUE,
+            MAX_CLUSTER_SIZE_VALUE,
+        )?;
         self.set_u32(MIN_CLUSTER_SIZE, value)
     }
 
@@ -177,6 +245,7 @@ pub(crate) fn retention_days(
     raw.map(|value| value.parse().map_err(|_| Error::InvalidSetting(key)))
         .transpose()
         .map(|value| value.unwrap_or(DEFAULT_RETENTION_DAYS))
+        .and_then(|value| bounded_u32(key, value, 0, MAX_RETENTION_DAYS))
 }
 
 pub(crate) fn trash_retention_days(transaction: &rusqlite::Transaction<'_>) -> Result<u32> {
@@ -185,4 +254,20 @@ pub(crate) fn trash_retention_days(transaction: &rusqlite::Transaction<'_>) -> R
 
 pub(crate) fn dedup_retention_days(transaction: &rusqlite::Transaction<'_>) -> Result<u32> {
     retention_days(transaction, DEDUP_RETENTION_DAYS)
+}
+
+fn bounded_u32(key: &'static str, value: u32, minimum: u32, maximum: u32) -> Result<u32> {
+    if (minimum..=maximum).contains(&value) {
+        Ok(value)
+    } else {
+        Err(Error::InvalidSetting(key))
+    }
+}
+
+fn bounded_ratio(key: &'static str, value: f64) -> Result<f64> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(Error::InvalidSetting(key))
+    }
 }

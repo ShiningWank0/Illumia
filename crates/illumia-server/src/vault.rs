@@ -4,7 +4,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -35,6 +38,7 @@ struct SessionManagerInner {
     data_root: PathBuf,
     ttl: Duration,
     session: Mutex<Option<VaultSession>>,
+    next_generation: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -42,6 +46,7 @@ struct VaultSession {
     token_hash: [u8; 32],
     handle: VaultHandle,
     expires_at: Instant,
+    generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +68,7 @@ impl VaultSessionManager {
                 data_root: data_root.as_ref().to_path_buf(),
                 ttl,
                 session: Mutex::new(None),
+                next_generation: AtomicU64::new(1),
             }),
         }
     }
@@ -103,7 +109,7 @@ impl VaultSessionManager {
     pub(crate) fn authenticate(&self, token: &str) -> Option<VaultAccess> {
         let candidate = token_hash(token)?;
         let now = Instant::now();
-        let access = {
+        {
             let mut session = self.session();
             let current = session.as_mut()?;
             if current.expires_at <= now {
@@ -114,13 +120,11 @@ impl VaultSessionManager {
                 return None;
             }
             current.expires_at = now + self.inner.ttl;
-            VaultAccess {
+            Some(VaultAccess {
                 handle: current.handle.clone(),
                 token_hash: current.token_hash,
-            }
-        };
-        self.arm_expiry();
-        Some(access)
+            })
+        }
     }
 
     /// Removes the active session only when it is still the authenticated one.
@@ -152,6 +156,7 @@ impl VaultSessionManager {
         let token = hex::encode(token_bytes);
         let token_hash = Sha256::digest(token.as_bytes()).into();
         let expires_at_instant = Instant::now() + self.inner.ttl;
+        let generation = self.inner.next_generation.fetch_add(1, Ordering::Relaxed);
         let expires_at = (Utc::now()
             + illumia_core::chrono::Duration::from_std(self.inner.ttl)
                 .unwrap_or_else(|_| illumia_core::chrono::Duration::minutes(15)))
@@ -160,22 +165,37 @@ impl VaultSessionManager {
             token_hash,
             handle,
             expires_at: expires_at_instant,
+            generation,
         });
-        self.arm_expiry();
+        self.arm_expiry(generation);
         IssuedSession { token, expires_at }
     }
 
-    fn arm_expiry(&self) {
+    fn arm_expiry(&self, generation: u64) {
         let manager = self.clone();
-        let ttl = self.inner.ttl;
         tokio::spawn(async move {
-            tokio::time::sleep(ttl).await;
-            let mut session = manager.session();
-            if session
-                .as_ref()
-                .is_some_and(|current| current.expires_at <= Instant::now())
-            {
-                session.take();
+            loop {
+                let remaining = {
+                    let session = manager.session();
+                    let Some(current) = session
+                        .as_ref()
+                        .filter(|current| current.generation == generation)
+                    else {
+                        return;
+                    };
+                    current.expires_at.saturating_duration_since(Instant::now())
+                };
+                if !remaining.is_zero() {
+                    tokio::time::sleep(remaining).await;
+                    continue;
+                }
+                let mut session = manager.session();
+                if session.as_ref().is_some_and(|current| {
+                    current.generation == generation && current.expires_at <= Instant::now()
+                }) {
+                    session.take();
+                }
+                return;
             }
         });
     }

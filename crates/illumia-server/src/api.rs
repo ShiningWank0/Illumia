@@ -24,7 +24,11 @@ use illumia_core::{
     chrono::{DateTime, Utc},
     db::Database,
     jobs::{Job, JobQueue, JobState},
-    settings::{QualityGate, Settings},
+    search::SearchService,
+    settings::{
+        MAX_CLUSTER_SIZE_VALUE, MAX_JOB_CONCURRENCY, MAX_RETENTION_DAYS, MIN_CLUSTER_SIZE_VALUE,
+        MIN_JOB_CONCURRENCY, QualityGate, Settings,
+    },
     stacks::{ChapterInput, MangaStack, StackChapter, StackPage, StackService, StackSummary},
     thumbnails,
     timeline::{BucketItem, Granularity, TimelineService},
@@ -43,6 +47,10 @@ use crate::{
 
 const IMMUTABLE_CACHE: &str = "public,max-age=31536000,immutable";
 const NO_STORE: &str = "no-store";
+const MAX_EXISTS_HASHES: usize = 4096;
+const MIN_NEW_VAULT_PASSWORD_CHARS: usize = 12;
+const MAX_VAULT_PASSWORD_BYTES: usize = 1024;
+const RECOVERY_KEY_CHARS: usize = 52;
 
 #[derive(Serialize)]
 pub struct AssetResponse {
@@ -423,9 +431,14 @@ pub async fn vault_init(
     State(state): State<AppState>,
     Json(request): Json<VaultInitRequest>,
 ) -> ApiResult<(StatusCode, Json<VaultInitResponse>)> {
-    if request.password.is_empty() {
-        return Err(ApiError::bad_request("password must not be empty"));
+    if request.password.chars().count() < MIN_NEW_VAULT_PASSWORD_CHARS
+        || request.password.len() > MAX_VAULT_PASSWORD_BYTES
+    {
+        return Err(ApiError::bad_request(
+            "vault password must contain 12 to 1024 characters",
+        ));
     }
+    let _permit = state.security.try_argon2_slot()?;
     let data_root = state.database.data_root().to_path_buf();
     let recovery_key =
         tokio::task::spawn_blocking(move || core_vault::init(data_root, &request.password))
@@ -445,14 +458,19 @@ pub async fn vault_unlock(
     State(state): State<AppState>,
     Json(request): Json<VaultUnlockRequest>,
 ) -> ApiResult<Json<VaultUnlockResponse>> {
+    let _permit = state.security.try_argon2_slot()?;
     let manager = state.vault.clone();
     let issued = match (request.password, request.recovery_key) {
-        (Some(password), None) if !password.is_empty() => {
+        (Some(password), None)
+            if !password.is_empty() && password.len() <= MAX_VAULT_PASSWORD_BYTES =>
+        {
             tokio::task::spawn_blocking(move || manager.unlock_with_password(&password))
                 .await
                 .map_err(|_| ApiError::internal_silent())?
         }
-        (None, Some(recovery_key)) if !recovery_key.is_empty() => {
+        (None, Some(recovery_key))
+            if recovery_key.len() == RECOVERY_KEY_CHARS && recovery_key.is_ascii() =>
+        {
             tokio::task::spawn_blocking(move || manager.unlock_with_recovery(&recovery_key))
                 .await
                 .map_err(|_| ApiError::internal_silent())?
@@ -497,6 +515,8 @@ pub async fn vault_import(
     Extension(access): Extension<VaultAccess>,
     Json(request): Json<VaultTransferRequest>,
 ) -> ApiResult<StatusCode> {
+    validate_vault_transfer_request(&request)?;
+    let _permit = state.security.try_ingest_slot()?;
     let main = state.database;
     let vault = access.handle;
     tokio::task::spawn_blocking(move || -> illumia_core::db::Result<()> {
@@ -530,6 +550,8 @@ pub async fn vault_export(
     Extension(access): Extension<VaultAccess>,
     Json(request): Json<VaultTransferRequest>,
 ) -> ApiResult<StatusCode> {
+    validate_vault_transfer_request(&request)?;
+    let _permit = state.security.try_ingest_slot()?;
     let main = state.database;
     let vault = access.handle;
     tokio::task::spawn_blocking(move || match (request.asset_ids, request.stack_id) {
@@ -548,6 +570,7 @@ pub async fn upload_asset(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> ApiResult<Response> {
+    let _permit = state.security.try_ingest_slot()?;
     let expected_hash = headers
         .get("X-Illumia-Checksum")
         .and_then(|value| value.to_str().ok())
@@ -584,11 +607,19 @@ pub async fn upload_asset(
             .file_name()
             .map(ToOwned::to_owned)
             .ok_or_else(|| ApiError::bad_request("file field requires a filename"))?;
+        illumia_core::images::normalized_extension(&filename).map_err(ApiError::from)?;
         let bytes = field
             .bytes()
             .await
             .map_err(|error| ApiError::bad_request(format!("invalid file field: {error}")))?;
-        upload = Some((filename, bytes.to_vec()));
+        if bytes.len() > illumia_core::images::MAX_ASSET_BYTES {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "image exceeds the 128 MiB limit",
+            ));
+        }
+        upload = Some((filename, bytes));
     }
     let (filename, bytes) =
         upload.ok_or_else(|| ApiError::bad_request("multipart file field is required"))?;
@@ -629,6 +660,9 @@ pub async fn assets_exist(
     State(state): State<AppState>,
     Json(request): Json<ExistsRequest>,
 ) -> ApiResult<Json<ExistsResponse>> {
+    if request.hashes.len() > MAX_EXISTS_HASHES {
+        return Err(ApiError::bad_request("too many hashes"));
+    }
     let mut decoded = Vec::with_capacity(request.hashes.len());
     for hash in request.hashes {
         let normalized = hash.to_ascii_lowercase();
@@ -981,6 +1015,11 @@ pub async fn search(
 ) -> ApiResult<Json<SearchResponse>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let query = query.q.trim().to_owned();
+    if query.len() > illumia_core::stacks::MAX_SEARCH_BYTES
+        || query.chars().count() > illumia_core::stacks::MAX_SEARCH_CHARS
+    {
+        return Err(ApiError::bad_request("search query is too long"));
+    }
     if query.is_empty() {
         return Ok(Json(SearchResponse {
             assets: Vec::new(),
@@ -988,19 +1027,13 @@ pub async fn search(
             clusters: Vec::new(),
         }));
     }
-    let ids = selected.result(search_asset_ids(&selected.database, &query))?;
-    let stacks = selected
-        .result(StackService::new(selected.database.clone()).search(&query))?
+    let result = selected.result(SearchService::new(selected.database.clone()).search(&query))?;
+    let stacks = result
+        .stacks
         .into_iter()
         .map(StackSummaryResponse::from)
         .collect();
-    let service = AssetService::new(selected.database.clone());
-    let mut assets = Vec::with_capacity(ids.len());
-    for id in ids {
-        if let Some(asset) = selected.result(service.get(&id))? {
-            assets.push(asset.into());
-        }
-    }
+    let assets = result.assets.into_iter().map(AssetResponse::from).collect();
     Ok(Json(SearchResponse {
         assets,
         stacks,
@@ -1044,8 +1077,9 @@ pub async fn patch_settings(
     let patch = patch
         .as_object()
         .ok_or_else(|| ApiError::bad_request("settings patch must be an object"))?;
-    let changes = validate_settings_patch(patch)?;
     let settings = Settings::new(state.database);
+    let changes = validate_settings_patch(patch)?;
+    validate_setting_relationships(&settings, &changes)?;
     apply_settings_patch(&settings, changes)?;
     Ok(Json(settings_json(&settings)?))
 }
@@ -1192,40 +1226,6 @@ async fn serve_file(path: PathBuf, request: Request) -> ApiResult<Response> {
     Ok(response.map(Body::new))
 }
 
-fn search_asset_ids(database: &Database, query: &str) -> illumia_core::db::Result<Vec<String>> {
-    database.with_connection(|connection| {
-        let sql = if query.chars().count() < 3 {
-            "SELECT a.id
-                 FROM search_fts f
-                 JOIN assets a ON a.id = f.entity_id
-                 WHERE f.entity_type = 'asset'
-                   AND f.text LIKE '%' || ?1 || '%'
-                   AND a.lifecycle = 'active'
-                   AND a.visible_in_timeline = 1
-                 ORDER BY a.taken_at DESC"
-        } else {
-            "SELECT a.id
-                 FROM search_fts f
-                 JOIN assets a ON a.id = f.entity_id
-                 WHERE search_fts MATCH ?1
-                   AND f.entity_type = 'asset'
-                   AND a.lifecycle = 'active'
-                   AND a.visible_in_timeline = 1
-                 ORDER BY a.taken_at DESC"
-        };
-        let parameter = if query.chars().count() < 3 {
-            query.to_owned()
-        } else {
-            format!("\"{}\"", query.replace('"', "\"\""))
-        };
-        let mut statement = connection.prepare(sql)?;
-        let ids = statement
-            .query_map([parameter], |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(ids)
-    })
-}
-
 /// `vault: no-log`
 fn vault_blob_id(
     database: &Database,
@@ -1277,10 +1277,38 @@ fn vault_core_error(error: illumia_core::db::Error) -> ApiError {
             ApiError::bad_request("invalid timeline bucket key")
         }
         illumia_core::db::Error::InvalidStack(_) => ApiError::bad_request("invalid manga stack"),
+        illumia_core::db::Error::InvalidSearch => ApiError::bad_request("invalid search query"),
         illumia_core::db::Error::EmptyVaultTransfer => {
             ApiError::bad_request("provide exactly one of asset_ids or stack_id")
         }
+        illumia_core::db::Error::IncompleteVaultTransfer
+        | illumia_core::db::Error::InvalidAssetPath => {
+            ApiError::bad_request("vault transfer input exceeds limits or is invalid")
+        }
         _ => ApiError::internal_silent(),
+    }
+}
+
+fn validate_vault_transfer_request(request: &VaultTransferRequest) -> ApiResult<()> {
+    match (&request.asset_ids, &request.stack_id) {
+        (Some(asset_ids), None)
+            if !asset_ids.is_empty()
+                && asset_ids.len() <= core_vault::MAX_VAULT_TRANSFER_ASSETS =>
+        {
+            for asset_id in asset_ids {
+                Uuid::parse_str(asset_id)
+                    .map_err(|_| ApiError::bad_request("invalid vault transfer input"))?;
+            }
+            Ok(())
+        }
+        (None, Some(stack_id)) => {
+            Uuid::parse_str(stack_id)
+                .map_err(|_| ApiError::bad_request("invalid vault transfer input"))?;
+            Ok(())
+        }
+        _ => Err(ApiError::bad_request(
+            "provide exactly one bounded asset_ids list or stack_id",
+        )),
     }
 }
 
@@ -1310,7 +1338,6 @@ fn content_type_for_extension(extension: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
         "gif" => "image/gif",
-        "avif" => "image/avif",
         _ => "application/octet-stream",
     }
 }
@@ -1330,15 +1357,35 @@ fn validate_settings_patch(patch: &Map<String, Value>) -> ApiResult<Vec<SettingC
     patch
         .iter()
         .map(|(key, value)| match key.as_str() {
-            "trash.retention_days" => Ok(SettingChange::TrashRetention(value_u32(key, value)?)),
-            "dedup.retention_days" => Ok(SettingChange::DedupRetention(value_u32(key, value)?)),
-            "jobs.thumbnail_concurrency" => {
-                Ok(SettingChange::ThumbnailConcurrency(value_u32(key, value)?))
-            }
-            "jobs.ml_concurrency" => Ok(SettingChange::MlConcurrency(value_u32(key, value)?)),
-            "ml.tau_high_override" => Ok(SettingChange::TauHigh(value_f64(key, value)?)),
-            "ml.tau_low_override" => Ok(SettingChange::TauLow(value_f64(key, value)?)),
-            "ml.min_cluster_size" => Ok(SettingChange::MinClusterSize(value_u32(key, value)?)),
+            "trash.retention_days" => Ok(SettingChange::TrashRetention(value_u32_range(
+                key,
+                value,
+                0,
+                MAX_RETENTION_DAYS,
+            )?)),
+            "dedup.retention_days" => Ok(SettingChange::DedupRetention(value_u32_range(
+                key,
+                value,
+                0,
+                MAX_RETENTION_DAYS,
+            )?)),
+            "jobs.thumbnail_concurrency" => Ok(SettingChange::ThumbnailConcurrency(
+                value_u32_range(key, value, MIN_JOB_CONCURRENCY, MAX_JOB_CONCURRENCY)?,
+            )),
+            "jobs.ml_concurrency" => Ok(SettingChange::MlConcurrency(value_u32_range(
+                key,
+                value,
+                MIN_JOB_CONCURRENCY,
+                MAX_JOB_CONCURRENCY,
+            )?)),
+            "ml.tau_high_override" => Ok(SettingChange::TauHigh(value_f64_ratio(key, value)?)),
+            "ml.tau_low_override" => Ok(SettingChange::TauLow(value_f64_ratio(key, value)?)),
+            "ml.min_cluster_size" => Ok(SettingChange::MinClusterSize(value_u32_range(
+                key,
+                value,
+                MIN_CLUSTER_SIZE_VALUE,
+                MAX_CLUSTER_SIZE_VALUE,
+            )?)),
             "ml.quality_gate" => match value.as_str() {
                 Some("review_only") => Ok(SettingChange::QualityGate(QualityGate::ReviewOnly)),
                 Some("strict") => Ok(SettingChange::QualityGate(QualityGate::Strict)),
@@ -1351,6 +1398,24 @@ fn validate_settings_patch(patch: &Map<String, Value>) -> ApiResult<Vec<SettingC
             ))),
         })
         .collect()
+}
+
+fn validate_setting_relationships(settings: &Settings, changes: &[SettingChange]) -> ApiResult<()> {
+    let mut high = settings.tau_high_override()?;
+    let mut low = settings.tau_low_override()?;
+    for change in changes {
+        match change {
+            SettingChange::TauHigh(value) => high = Some(*value),
+            SettingChange::TauLow(value) => low = Some(*value),
+            _ => {}
+        }
+    }
+    if matches!((low, high), (Some(low), Some(high)) if low > high) {
+        return Err(ApiError::bad_request(
+            "ml.tau_low_override must not exceed ml.tau_high_override",
+        ));
+    }
+    Ok(())
 }
 
 fn apply_settings_patch(settings: &Settings, changes: Vec<SettingChange>) -> ApiResult<()> {
@@ -1395,11 +1460,29 @@ fn value_u32(key: &str, value: &Value) -> ApiResult<u32> {
         .ok_or_else(|| ApiError::bad_request(format!("{key} must be a non-negative integer")))
 }
 
-fn value_f64(key: &str, value: &Value) -> ApiResult<f64> {
-    value
+fn value_u32_range(key: &str, value: &Value, minimum: u32, maximum: u32) -> ApiResult<u32> {
+    let value = value_u32(key, value)?;
+    if (minimum..=maximum).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request(format!(
+            "{key} must be between {minimum} and {maximum}"
+        )))
+    }
+}
+
+fn value_f64_ratio(key: &str, value: &Value) -> ApiResult<f64> {
+    let value = value
         .as_f64()
         .filter(|number| number.is_finite())
-        .ok_or_else(|| ApiError::bad_request(format!("{key} must be a finite number")))
+        .ok_or_else(|| ApiError::bad_request(format!("{key} must be a finite number")))?;
+    if (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ApiError::bad_request(format!(
+            "{key} must be between 0 and 1"
+        )))
+    }
 }
 
 fn decode_hash(encoded: &str) -> ApiResult<Vec<u8>> {

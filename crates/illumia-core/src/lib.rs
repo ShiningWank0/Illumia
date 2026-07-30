@@ -5,8 +5,10 @@
 
 pub mod assets;
 pub mod db;
+pub mod images;
 pub mod jobs;
 mod purge;
+pub mod search;
 pub mod settings;
 pub mod stacks;
 pub mod thumbnails;

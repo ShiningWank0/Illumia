@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::{
     db::{Database, Error, Result},
+    images,
     jobs::{Job, JobQueue},
 };
 
@@ -80,7 +81,7 @@ pub fn generate_thumbnails(database: &Database, asset_id: &str) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
-    let decoded = image::load_from_memory(&source_bytes)?;
+    let decoded = images::decode(&source_bytes, &asset.ext)?;
     let (source_width, source_height) = decoded.dimensions();
     let rgba = decoded.to_rgba8().into_raw();
 
@@ -131,8 +132,11 @@ pub fn generate_thumbnails(database: &Database, asset_id: &str) -> Result<()> {
 }
 
 /// Vault 向けに平文ファイルを作らず、全派生画像をメモリ内で生成する。
-pub(crate) fn generate_variants_in_memory(source_bytes: &[u8]) -> Result<InMemoryVariants> {
-    let decoded = image::load_from_memory(source_bytes)?;
+pub(crate) fn generate_variants_in_memory(
+    source_bytes: &[u8],
+    extension: &str,
+) -> Result<InMemoryVariants> {
+    let decoded = images::decode(source_bytes, extension)?;
     let (source_width, source_height) = decoded.dimensions();
     let rgba = decoded.to_rgba8().into_raw();
     Ok(InMemoryVariants {
@@ -145,6 +149,7 @@ pub(crate) fn generate_variants_in_memory(source_bytes: &[u8]) -> Result<InMemor
 #[derive(Debug)]
 struct ThumbnailAsset {
     library_path: PathBuf,
+    ext: String,
     has_thumbhash: bool,
 }
 
@@ -152,19 +157,20 @@ fn thumbnail_asset(database: &Database, asset_id: &str) -> Result<Option<Thumbna
     database.with_connection(|connection| {
         let record = connection
             .query_row(
-                "SELECT library_path, thumbhash IS NOT NULL, lifecycle
+                "SELECT library_path, ext, thumbhash IS NOT NULL, lifecycle
                  FROM assets WHERE id = ?1",
                 [asset_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, bool>(1)?,
-                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((library_path, has_thumbhash, lifecycle)) = record else {
+        let Some((library_path, ext, has_thumbhash, lifecycle)) = record else {
             return Ok(None);
         };
         if lifecycle == "purging" {
@@ -172,6 +178,7 @@ fn thumbnail_asset(database: &Database, asset_id: &str) -> Result<Option<Thumbna
         }
         Ok(Some(ThumbnailAsset {
             library_path: checked_relative_path(&library_path)?,
+            ext,
             has_thumbhash,
         }))
     })

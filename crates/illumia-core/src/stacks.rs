@@ -11,6 +11,14 @@ use crate::{
     db::{Database, Error, Result},
 };
 
+pub const MAX_STACK_TITLE_CHARS: usize = 512;
+pub const MAX_STACK_TITLE_BYTES: usize = 2048;
+pub const MAX_STACK_CHAPTERS: usize = 1000;
+pub const MAX_STACK_PAGES: usize = 10_000;
+pub const MAX_STACK_SEARCH_RESULTS: usize = 200;
+pub const MAX_SEARCH_CHARS: usize = 256;
+pub const MAX_SEARCH_BYTES: usize = 1024;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StackSummary {
     pub id: String,
@@ -66,6 +74,7 @@ impl StackService {
 
     pub fn create(&self, title: &str, asset_ids: &[String]) -> Result<MangaStack> {
         validate_title(title)?;
+        validate_page_count(asset_ids.len())?;
         validate_unique_asset_ids(asset_ids)?;
         let stack_id = Uuid::now_v7().to_string();
         let chapter_id = Uuid::now_v7().to_string();
@@ -107,7 +116,8 @@ impl StackService {
                         (SELECT count(*) FROM stack_pages p WHERE p.stack_id = s.id),
                         s.created_at, s.updated_at
                  FROM manga_stacks s
-                 ORDER BY s.updated_at DESC, s.id DESC",
+                 ORDER BY s.updated_at DESC, s.id DESC
+                 LIMIT 1000",
             )?;
             let stacks = statement
                 .query_map([], |row| {
@@ -131,10 +141,11 @@ impl StackService {
         if query.is_empty() {
             return Ok(Vec::new());
         }
+        validate_search_query(query)?;
         self.database.with_connection(|connection| {
             let short_query = query.chars().count() < 3;
             let predicate = if short_query {
-                "f.text LIKE '%' || ?1 || '%'"
+                "f.text LIKE '%' || ?1 || '%' ESCAPE '\\'"
             } else {
                 "search_fts MATCH ?1"
             };
@@ -146,10 +157,11 @@ impl StackService {
                  FROM search_fts f
                  JOIN manga_stacks s ON s.id = f.entity_id
                  WHERE f.entity_type = 'stack' AND {predicate}
-                 ORDER BY s.updated_at DESC, s.id DESC"
+                 ORDER BY s.updated_at DESC, s.id DESC
+                 LIMIT {MAX_STACK_SEARCH_RESULTS}"
             );
             let parameter = if short_query {
-                query.to_owned()
+                escape_like(query)
             } else {
                 format!("\"{}\"", query.replace('"', "\"\""))
             };
@@ -240,10 +252,19 @@ impl StackService {
                 "a stack must contain at least one chapter".to_owned(),
             ));
         }
+        if chapters.len() > MAX_STACK_CHAPTERS {
+            return Err(Error::InvalidStack("too many chapters".to_owned()));
+        }
+        for chapter in chapters {
+            if let Some(title) = chapter.title.as_deref() {
+                validate_optional_title(title)?;
+            }
+        }
         let new_asset_ids = chapters
             .iter()
             .flat_map(|chapter| chapter.pages.iter().cloned())
             .collect::<Vec<_>>();
+        validate_page_count(new_asset_ids.len())?;
         validate_unique_asset_ids(&new_asset_ids)?;
 
         self.update_stack(id, |transaction, now| {
@@ -301,9 +322,21 @@ impl StackService {
                 "at least one asset is required".to_owned(),
             ));
         }
+        validate_page_count(asset_ids.len())?;
         validate_unique_asset_ids(asset_ids)?;
         self.update_stack(id, |transaction, now| {
             ensure_stack_exists(transaction, id)?;
+            let existing_pages: i64 = transaction.query_row(
+                "SELECT count(*) FROM stack_pages WHERE stack_id = ?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            let existing_pages = usize::try_from(existing_pages)
+                .map_err(|_| Error::InvalidStack("invalid page count".to_owned()))?;
+            let total_pages = existing_pages
+                .checked_add(asset_ids.len())
+                .ok_or_else(|| Error::InvalidStack("too many pages in a stack".to_owned()))?;
+            validate_page_count(total_pages)?;
             validate_assets(transaction, asset_ids)?;
             let target_chapter = match chapter_id {
                 Some(chapter_id) => {
@@ -516,9 +549,35 @@ fn get_with_connection(connection: &rusqlite::Connection, id: &str) -> Result<Op
 
 fn validate_title(title: &str) -> Result<()> {
     if title.trim().is_empty() {
-        Err(Error::InvalidStack("title must not be empty".to_owned()))
+        return Err(Error::InvalidStack("title must not be empty".to_owned()));
+    }
+    validate_title_metadata(title)
+}
+
+fn validate_optional_title(title: &str) -> Result<()> {
+    if title.is_empty() {
+        Ok(())
+    } else {
+        validate_title_metadata(title)
+    }
+}
+
+fn validate_title_metadata(title: &str) -> Result<()> {
+    if title.len() > MAX_STACK_TITLE_BYTES
+        || title.chars().count() > MAX_STACK_TITLE_CHARS
+        || title.chars().any(char::is_control)
+    {
+        Err(Error::InvalidStack("stack title is invalid".to_owned()))
     } else {
         Ok(())
+    }
+}
+
+fn validate_page_count(count: usize) -> Result<()> {
+    if count <= MAX_STACK_PAGES {
+        Ok(())
+    } else {
+        Err(Error::InvalidStack("too many pages in a stack".to_owned()))
     }
 }
 
@@ -531,6 +590,21 @@ fn validate_unique_asset_ids(asset_ids: &[String]) -> Result<()> {
             "an asset can appear only once in a stack".to_owned(),
         ))
     }
+}
+
+fn validate_search_query(query: &str) -> Result<()> {
+    if query.len() > MAX_SEARCH_BYTES || query.chars().count() > MAX_SEARCH_CHARS {
+        Err(Error::InvalidSearch)
+    } else {
+        Ok(())
+    }
+}
+
+fn escape_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn validate_assets(transaction: &Transaction<'_>, asset_ids: &[String]) -> Result<()> {

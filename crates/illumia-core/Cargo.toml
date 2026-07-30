@@ -13,7 +13,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 fast_image_resize = "6.1.0"
 hex = "0.4.3"
 hkdf = "0.13.0"
-image = "0.25.10"
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 rand = "0.10.2"
 rusqlite = { version = "0.40.1", features = ["bundled-sqlcipher-vendored-openssl"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -23,7 +23,7 @@ thiserror = "2.0.19"
 thumbhash = "0.1.0"
 tracing = "0.1.44"
 uuid = { version = "1.24.0", features = ["v7", "serde"] }
-webp = "0.3.1"
+webp = { version = "0.3.1", default-features = false }
 zeroize = { version = "1.9.0", features = ["derive"] }
 
 [lints]

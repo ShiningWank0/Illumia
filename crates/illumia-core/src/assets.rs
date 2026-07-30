@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     db::{Database, Error, Result},
-    settings,
+    images, settings,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,8 +101,8 @@ impl AssetService {
         taken_at: Option<DateTime<Utc>>,
         uploaded_at: DateTime<Utc>,
     ) -> Result<IngestResult> {
-        let ext = normalized_extension(original_name)?;
-        let image = image::load_from_memory(bytes)?;
+        let ext = images::normalized_extension(original_name)?;
+        let image = images::decode(bytes, &ext)?;
         let (width, height) = image.dimensions();
         let hash = blake3::hash(bytes);
         let id = Uuid::now_v7().to_string();
@@ -313,7 +313,8 @@ impl AssetService {
                purge_after, library_path
              FROM assets
              WHERE lifecycle = 'trashed'
-             ORDER BY trashed_at DESC",
+             ORDER BY trashed_at DESC
+             LIMIT 10000",
         )
     }
 
@@ -333,7 +334,8 @@ impl AssetService {
                  JOIN assets o ON o.id = d.duplicate_of
                  WHERE d.lifecycle = 'duplicate'
                    AND o.lifecycle != 'purging'
-                 ORDER BY d.uploaded_at DESC",
+                 ORDER BY d.uploaded_at DESC
+                 LIMIT 10000",
             )?;
             let pairs = statement
                 .query_map([], |row| {
@@ -402,19 +404,6 @@ pub(crate) fn asset_from_row(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite
         purge_after: row.get(offset + 17)?,
         library_path: row.get(offset + 18)?,
     })
-}
-
-fn normalized_extension(original_name: &str) -> Result<String> {
-    let extension = Path::new(original_name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match extension.as_str() {
-        "jpeg" => Ok("jpg".to_owned()),
-        "jpg" | "png" | "webp" | "avif" | "gif" => Ok(extension),
-        _ => Err(Error::UnsupportedExtension(extension)),
-    }
 }
 
 fn library_path(id: &str, ext: &str, year: String, month: String) -> PathBuf {

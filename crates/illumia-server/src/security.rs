@@ -30,6 +30,7 @@ const AUTH_FAILURE_LIMIT: usize = 5;
 const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_AUTH_SOURCES: usize = 4096;
 const MAX_ARGON2_CONCURRENCY: usize = 2;
+const MAX_INGEST_CONCURRENCY: usize = 2;
 const MAX_WEBSOCKETS: usize = 32;
 const MIN_SETUP_TOKEN_BYTES: usize = 32;
 const MAX_SETUP_TOKEN_BYTES: usize = 256;
@@ -68,6 +69,7 @@ struct SecurityInner {
     trust_proxy_headers: bool,
     auth_failures: Mutex<HashMap<String, VecDeque<Instant>>>,
     argon2_slots: Arc<Semaphore>,
+    ingest_slots: Arc<Semaphore>,
     websocket_slots: Arc<Semaphore>,
 }
 
@@ -84,6 +86,7 @@ impl Security {
                 trust_proxy_headers,
                 auth_failures: Mutex::new(HashMap::new()),
                 argon2_slots: Arc::new(Semaphore::new(MAX_ARGON2_CONCURRENCY)),
+                ingest_slots: Arc::new(Semaphore::new(MAX_INGEST_CONCURRENCY)),
                 websocket_slots: Arc::new(Semaphore::new(MAX_WEBSOCKETS)),
             }),
         }
@@ -190,6 +193,14 @@ impl Security {
             .clone()
             .try_acquire_owned()
             .map_err(|_| ApiError::too_many_requests("too many websocket connections"))
+    }
+
+    pub fn try_ingest_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.inner
+            .ingest_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::too_many_requests("too many concurrent image uploads"))
     }
 
     fn source_key(&self, request: &Request) -> String {

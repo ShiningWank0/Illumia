@@ -28,6 +28,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("image processing error: {0}")]
     ImageProcessing(String),
+    #[error("invalid image input: {0}")]
+    InvalidImage(String),
     #[error("WebP encoding error: {0}")]
     WebpEncoding(String),
     #[error("database mutex is poisoned")]
@@ -40,6 +42,8 @@ pub enum Error {
     StackChapterNotFound,
     #[error("invalid manga stack: {0}")]
     InvalidStack(String),
+    #[error("invalid search query")]
+    InvalidSearch,
     #[error("unsupported image extension: {0}")]
     UnsupportedExtension(String),
     #[error("invalid setting value for {0}")]

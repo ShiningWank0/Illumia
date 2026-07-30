@@ -102,6 +102,8 @@ impl From<illumia_core::db::Error> for ApiError {
             }
             illumia_core::db::Error::InvalidBucketKey
             | illumia_core::db::Error::InvalidStack(_)
+            | illumia_core::db::Error::InvalidSearch
+            | illumia_core::db::Error::InvalidImage(_)
             | illumia_core::db::Error::UnsupportedExtension(_)
             | illumia_core::db::Error::InvalidSetting(_)
             | illumia_core::db::Error::InvalidJobProgress
