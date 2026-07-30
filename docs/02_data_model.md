@@ -19,7 +19,7 @@ CREATE TABLE assets (
   id                TEXT PRIMARY KEY,              -- UUIDv7
   hash              BLOB NOT NULL,                 -- BLAKE3 32B
   original_name     TEXT NOT NULL,
-  ext               TEXT NOT NULL,                 -- 小文字拡張子 (jpg/png/webp/avif/gif)
+  ext               TEXT NOT NULL,                 -- 小文字拡張子 (jpg/png/webp/gif)
   size              INTEGER NOT NULL,
   width             INTEGER NOT NULL,
   height            INTEGER NOT NULL,

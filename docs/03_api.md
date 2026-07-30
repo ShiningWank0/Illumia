@@ -57,6 +57,9 @@ in-process 呼び出しするため、**ハンドラにロジックを書かな�
 - multipart 全体は 129 MiB、ファイル本体は 128 MiB を上限とする。画像 decoder には
   対応 format を明示し、幅・高さ各 32768 px、decode allocation 512 MiB を上限とする。
   拡張子と実データの format が一致しない入力は拒否する。
+- v1 の入力 format は JPEG / PNG / WebP / GIF のみ。AVIF は既存実装が decoder を
+  持たず、native decoder の supply-chain / cross-build 条件も別途評価が必要なため、
+  対応を明示的に追加するまでは 400 で拒否する。
 
 ## タイムライン (→ docs/04)
 

@@ -49,6 +49,7 @@ v1 (M1〜M6) 完了後に着手する機能。**全ての検索系機能は日�
 
 ## その他の候補 (優先度低)
 
+- AVIF 入力。libdav1d 等の decoder、全 build target、fuzz/資源上限を確認してから明示的に追加
 - Android 共有インテント (「Illumia へ送る」でアップロード)
 - PWA 化 (iPhone/iPad のホーム画面アプリ体験向上)
 - マルチユーザー (認証層は auth_tokens の拡張で対応可能な設計にしてある)
