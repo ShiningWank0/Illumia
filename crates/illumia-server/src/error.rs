@@ -54,6 +54,13 @@ impl ApiError {
 
     pub fn internal(error: impl std::fmt::Display) -> Self {
         tracing::error!(error = %error, "request failed");
+        Self::internal_silent()
+    }
+
+    /// Produces a generic 500 without recording vault-sensitive error context.
+    ///
+    /// `vault: no-log`
+    pub fn internal_silent() -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",

@@ -1,0 +1,542 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use axum::{
+    Router,
+    body::Body,
+    http::{HeaderMap, Method, Request, StatusCode, header},
+};
+use http_body_util::BodyExt;
+use illumia_core::{
+    assets::AssetService,
+    db::Database,
+    uuid::Uuid,
+    vault::{KdfParams, init_with_kdf},
+};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+struct TestDirectory {
+    path: PathBuf,
+}
+
+impl TestDirectory {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("illumia-vault-api-{}", Uuid::now_v7()));
+        fs::create_dir_all(&path).expect("test data directory should be created");
+        Self { path }
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct TestResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    bytes: Vec<u8>,
+}
+
+impl TestResponse {
+    fn json(&self) -> Value {
+        serde_json::from_slice(&self.bytes).expect("response should be JSON")
+    }
+}
+
+struct TestApp {
+    _directory: TestDirectory,
+    database: Database,
+    router: Router,
+}
+
+impl TestApp {
+    fn new(ttl: Duration) -> Self {
+        let directory = TestDirectory::new();
+        let database = Database::open(&directory.path).expect("test database should open");
+        let router = illumia_server::app_with_vault_ttl(database.clone(), None, ttl);
+        Self {
+            _directory: directory,
+            database,
+            router,
+        }
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        uri: &str,
+        auth_token: Option<&str>,
+        vault_session: Option<&str>,
+        body: Option<Value>,
+    ) -> TestResponse {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = auth_token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        if let Some(session) = vault_session {
+            builder = builder.header("X-Vault-Session", session);
+        }
+        let body = if let Some(value) = body {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            Body::from(value.to_string())
+        } else {
+            Body::empty()
+        };
+        let response = self
+            .router
+            .clone()
+            .oneshot(builder.body(body).expect("request should build"))
+            .await
+            .expect("router should respond");
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes()
+            .to_vec();
+        TestResponse {
+            status,
+            headers,
+            bytes,
+        }
+    }
+
+    async fn setup(&self) -> String {
+        let response = self
+            .request(
+                Method::POST,
+                "/api/auth/setup",
+                None,
+                None,
+                Some(json!({
+                    "password": "server password",
+                    "device_name": "vault integration"
+                })),
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        response.json()["token"]
+            .as_str()
+            .expect("setup token")
+            .to_owned()
+    }
+
+    fn root(&self) -> &Path {
+        self.database.data_root()
+    }
+}
+
+#[tokio::test]
+async fn vault_api_full_transfer_and_visibility_flow() {
+    let app = TestApp::new(Duration::from_secs(15 * 60));
+    let auth = app.setup().await;
+
+    let status = app
+        .request(Method::GET, "/api/vault/status", Some(&auth), None, None)
+        .await;
+    assert_eq!(status.status, StatusCode::OK);
+    assert_eq!(
+        status.json(),
+        json!({"initialized": false, "unlocked": false})
+    );
+
+    let hidden_before_init = app
+        .request(
+            Method::GET,
+            "/api/vault/timeline/buckets?granularity=day",
+            Some(&auth),
+            Some(&"0".repeat(64)),
+            None,
+        )
+        .await;
+    assert_eq!(hidden_before_init.status, StatusCode::NOT_FOUND);
+
+    let initialized = app
+        .request(
+            Method::POST,
+            "/api/vault/init",
+            Some(&auth),
+            None,
+            Some(json!({"password": "vault password"})),
+        )
+        .await;
+    assert_eq!(initialized.status, StatusCode::CREATED);
+    let recovery_key = initialized.json()["recovery_key"]
+        .as_str()
+        .expect("recovery key")
+        .to_owned();
+
+    let initialized_again = app
+        .request(
+            Method::POST,
+            "/api/vault/init",
+            Some(&auth),
+            None,
+            Some(json!({"password": "another password"})),
+        )
+        .await;
+    assert_eq!(initialized_again.status, StatusCode::CONFLICT);
+
+    let wrong_password = app
+        .request(
+            Method::POST,
+            "/api/vault/unlock",
+            Some(&auth),
+            None,
+            Some(json!({"password": "wrong"})),
+        )
+        .await;
+    assert_eq!(wrong_password.status, StatusCode::UNAUTHORIZED);
+
+    let unlocked = app
+        .request(
+            Method::POST,
+            "/api/vault/unlock",
+            Some(&auth),
+            None,
+            Some(json!({"password": "vault password"})),
+        )
+        .await;
+    assert_eq!(unlocked.status, StatusCode::OK);
+    let unlocked_json = unlocked.json();
+    let session = unlocked_json["vault_session"]
+        .as_str()
+        .expect("vault session")
+        .to_owned();
+    assert_eq!(session.len(), 64);
+    assert!(unlocked_json["expires_at"].is_string());
+
+    let without_session = app
+        .request(
+            Method::GET,
+            "/api/vault/timeline/buckets?granularity=day",
+            Some(&auth),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(without_session.status, StatusCode::NOT_FOUND);
+
+    let original_bytes = one_pixel_png();
+    let asset = AssetService::new(app.database.clone())
+        .ingest(&original_bytes, "秘密画像.png", None)
+        .expect("main asset should ingest")
+        .asset;
+    let original_path = app.root().join(&asset.library_path);
+    assert!(original_path.is_file());
+
+    let imported = app
+        .request(
+            Method::POST,
+            "/api/vault/import",
+            Some(&auth),
+            Some(&session),
+            Some(json!({"asset_ids": [asset.id]})),
+        )
+        .await;
+    assert_eq!(imported.status, StatusCode::NO_CONTENT);
+    assert!(
+        AssetService::new(app.database.clone())
+            .get(&asset.id)
+            .expect("main database should read")
+            .is_none()
+    );
+    assert!(!original_path.exists());
+    assert_plaintext_trace_absent(&app.database, &asset.id, "秘密画像");
+
+    let buckets = app
+        .request(
+            Method::GET,
+            "/api/vault/timeline/buckets?granularity=day",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(buckets.status, StatusCode::OK);
+    let buckets_json = buckets.json();
+    assert_eq!(buckets_json.as_array().expect("bucket array").len(), 1);
+    let bucket_key = buckets_json[0]["key"].as_str().expect("bucket key");
+
+    let bucket = app
+        .request(
+            Method::GET,
+            &format!("/api/vault/timeline/buckets/{bucket_key}?granularity=day"),
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(bucket.status, StatusCode::OK);
+    assert_eq!(bucket.json()[0]["id"], asset.id);
+
+    let search = app
+        .request(
+            Method::GET,
+            "/api/vault/search?q=%E7%A7%98%E5%AF%86",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(search.status, StatusCode::OK);
+    assert_eq!(search.json()["assets"][0]["id"], asset.id);
+
+    for variant in ["thumbnail", "preview"] {
+        let response = app
+            .request(
+                Method::GET,
+                &format!("/api/vault/assets/{}/{variant}", asset.id),
+                Some(&auth),
+                Some(&session),
+                None,
+            )
+            .await;
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.headers[header::CONTENT_TYPE], "image/webp");
+        assert_eq!(response.headers[header::CACHE_CONTROL], "no-store");
+        assert!(!response.bytes.is_empty());
+    }
+
+    let original = app
+        .request(
+            Method::GET,
+            &format!("/api/vault/assets/{}/original", asset.id),
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(original.status, StatusCode::OK);
+    assert_eq!(original.headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(original.bytes, original_bytes);
+
+    let locked = app
+        .request(
+            Method::POST,
+            "/api/vault/lock",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(locked.status, StatusCode::NO_CONTENT);
+    let hidden_after_lock = app
+        .request(
+            Method::GET,
+            "/api/vault/search?q=secret",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(hidden_after_lock.status, StatusCode::NOT_FOUND);
+
+    let recovered = app
+        .request(
+            Method::POST,
+            "/api/vault/unlock",
+            Some(&auth),
+            None,
+            Some(json!({"recovery_key": recovery_key})),
+        )
+        .await;
+    assert_eq!(recovered.status, StatusCode::OK);
+    let recovered_session = recovered.json()["vault_session"]
+        .as_str()
+        .expect("recovery session")
+        .to_owned();
+    assert_ne!(recovered_session, session);
+
+    let exported = app
+        .request(
+            Method::POST,
+            "/api/vault/export",
+            Some(&auth),
+            Some(&recovered_session),
+            Some(json!({"asset_ids": [asset.id]})),
+        )
+        .await;
+    assert_eq!(exported.status, StatusCode::NO_CONTENT);
+    let restored = AssetService::new(app.database.clone())
+        .get(&asset.id)
+        .expect("main database should read")
+        .expect("exported asset should return to main");
+    assert_eq!(
+        fs::read(app.root().join(restored.library_path)).expect("exported original should read"),
+        original_bytes
+    );
+    let vault_search = app
+        .request(
+            Method::GET,
+            "/api/vault/search?q=%E7%A7%98%E5%AF%86",
+            Some(&auth),
+            Some(&recovered_session),
+            None,
+        )
+        .await;
+    assert_eq!(vault_search.status, StatusCode::OK);
+    assert_eq!(vault_search.json()["assets"], json!([]));
+}
+
+#[tokio::test]
+async fn vault_session_expires_at_injected_ttl() {
+    let directory = TestDirectory::new();
+    let database = Database::open(&directory.path).expect("test database should open");
+    init_with_kdf(&directory.path, "vault password", KdfParams::for_tests())
+        .expect("test vault should initialize");
+    let app = TestApp {
+        router: illumia_server::app_with_vault_ttl(
+            database.clone(),
+            None,
+            Duration::from_millis(200),
+        ),
+        database,
+        _directory: directory,
+    };
+    let auth = app.setup().await;
+    let unlocked = app
+        .request(
+            Method::POST,
+            "/api/vault/unlock",
+            Some(&auth),
+            None,
+            Some(json!({"password": "vault password"})),
+        )
+        .await;
+    assert_eq!(unlocked.status, StatusCode::OK);
+    let session = unlocked.json()["vault_session"]
+        .as_str()
+        .expect("vault session")
+        .to_owned();
+
+    let replacement = app
+        .request(
+            Method::POST,
+            "/api/vault/unlock",
+            Some(&auth),
+            None,
+            Some(json!({"password": "vault password"})),
+        )
+        .await;
+    assert_eq!(replacement.status, StatusCode::OK);
+    let replacement_session = replacement.json()["vault_session"]
+        .as_str()
+        .expect("replacement vault session")
+        .to_owned();
+    assert_ne!(replacement_session, session);
+    let replaced = app
+        .request(
+            Method::GET,
+            "/api/vault/trash",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(replaced.status, StatusCode::NOT_FOUND);
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let active = app
+        .request(
+            Method::GET,
+            "/api/vault/trash",
+            Some(&auth),
+            Some(&replacement_session),
+            None,
+        )
+        .await;
+    assert_eq!(active.status, StatusCode::OK);
+
+    // This request is later than the original deadline but within the extended TTL.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let extended = app
+        .request(
+            Method::GET,
+            "/api/vault/trash",
+            Some(&auth),
+            Some(&replacement_session),
+            None,
+        )
+        .await;
+    assert_eq!(extended.status, StatusCode::OK);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let expired = app
+        .request(
+            Method::GET,
+            "/api/vault/trash",
+            Some(&auth),
+            Some(&replacement_session),
+            None,
+        )
+        .await;
+    assert_eq!(expired.status, StatusCode::NOT_FOUND);
+    let status = app
+        .request(Method::GET, "/api/vault/status", Some(&auth), None, None)
+        .await;
+    assert_eq!(
+        status.json(),
+        json!({"initialized": true, "unlocked": false})
+    );
+}
+
+fn assert_plaintext_trace_absent(database: &Database, asset_id: &str, search_term: &str) {
+    database
+        .with_connection(|connection| {
+            for (table, column) in [
+                ("assets", "id"),
+                ("faces", "asset_id"),
+                ("stack_pages", "asset_id"),
+                ("search_fts", "entity_id"),
+            ] {
+                let sql = format!("SELECT count(*) FROM {table} WHERE {column} = ?1");
+                assert_eq!(
+                    connection.query_row(&sql, [asset_id], |row| row.get::<_, i64>(0))?,
+                    0
+                );
+            }
+            assert_eq!(
+                connection.query_row(
+                    "SELECT count(*) FROM search_fts WHERE search_fts MATCH ?1",
+                    [search_term],
+                    |row| row.get::<_, i64>(0),
+                )?,
+                0
+            );
+            Ok(())
+        })
+        .expect("plaintext database should be inspectable");
+    let wal = database.data_root().join("illumia.db-wal");
+    assert!(!wal.exists() || fs::metadata(wal).expect("WAL metadata").len() == 0);
+    let database_bytes =
+        fs::read(database.data_root().join("illumia.db")).expect("main database bytes");
+    assert!(!contains_bytes(&database_bytes, asset_id.as_bytes()));
+    assert!(!contains_bytes(&database_bytes, search_term.as_bytes()));
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+fn one_pixel_png() -> Vec<u8> {
+    vec![
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x08, 0xd7, 0x63, 0xf8,
+        0xcf, 0xc0, 0xf0, 0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x72, 0x9c, 0x52, 0x67, 0x00, 0x00,
+        0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ]
+}

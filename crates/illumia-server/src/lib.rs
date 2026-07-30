@@ -4,6 +4,7 @@ mod api;
 mod auth;
 mod config;
 mod error;
+mod vault;
 
 use std::{path::PathBuf, time::Duration};
 
@@ -40,12 +41,14 @@ pub struct AppState {
     database: Database,
     auth: auth::AuthService,
     events: broadcast::Sender<Value>,
+    vault: vault::VaultSessionManager,
 }
 
 impl AppState {
-    fn new(database: Database, events: broadcast::Sender<Value>) -> Self {
+    fn new(database: Database, events: broadcast::Sender<Value>, vault_ttl: Duration) -> Self {
         Self {
             auth: auth::AuthService::new(database.clone()),
+            vault: vault::VaultSessionManager::new(database.data_root(), vault_ttl),
             database,
             events,
         }
@@ -64,16 +67,68 @@ impl AppState {
 /// This is also the entry point used by integration tests and future in-process
 /// hosts that need the transport service itself.
 pub fn app(database: Database, web_dist: Option<PathBuf>) -> Router {
+    app_with_vault_ttl(database, web_dist, Duration::from_secs(15 * 60))
+}
+
+/// Builds the HTTP service with an injectable vault TTL.
+///
+/// The custom duration is primarily useful for deterministic expiry tests.
+pub fn app_with_vault_ttl(
+    database: Database,
+    web_dist: Option<PathBuf>,
+    vault_ttl: Duration,
+) -> Router {
     let (events, _) = broadcast::channel(EVENT_BUFFER);
-    app_with_events(database, web_dist, events)
+    app_with_events(database, web_dist, events, vault_ttl)
 }
 
 fn app_with_events(
     database: Database,
     web_dist: Option<PathBuf>,
     events: broadcast::Sender<Value>,
+    vault_ttl: Duration,
 ) -> Router {
-    let state = AppState::new(database, events);
+    let state = AppState::new(database, events, vault_ttl);
+
+    let vault_session = Router::new()
+        .route("/vault/lock", post(api::vault_lock))
+        .route("/vault/import", post(api::vault_import))
+        .route("/vault/export", post(api::vault_export))
+        .route(
+            "/vault/assets/{id}",
+            get(api::asset_metadata).delete(api::trash_asset),
+        )
+        .route("/vault/assets/{id}/original", get(api::original))
+        .route("/vault/assets/{id}/thumbnail", get(api::thumbnail))
+        .route("/vault/assets/{id}/preview", get(api::preview))
+        .route("/vault/timeline/buckets", get(api::timeline_buckets))
+        .route("/vault/timeline/buckets/{key}", get(api::timeline_bucket))
+        .route("/vault/trash", get(api::trash))
+        .route("/vault/duplicates", get(api::duplicates))
+        .route(
+            "/vault/stacks",
+            get(api::list_stacks).post(api::create_stack),
+        )
+        .route(
+            "/vault/stacks/{id}",
+            get(api::get_stack)
+                .patch(api::patch_stack)
+                .delete(api::delete_stack),
+        )
+        .route(
+            "/vault/stacks/{id}/structure",
+            axum::routing::put(api::replace_stack_structure),
+        )
+        .route("/vault/stacks/{id}/pages", post(api::add_stack_pages))
+        .route(
+            "/vault/stacks/{id}/pages/{asset_id}",
+            axum::routing::patch(api::patch_stack_page).delete(api::remove_stack_page),
+        )
+        .route("/vault/search", get(api::search))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            vault::require_session,
+        ));
 
     let protected = Router::new()
         .route("/auth/devices", get(auth::devices))
@@ -116,6 +171,10 @@ fn app_with_events(
             "/settings",
             get(api::get_settings).patch(api::patch_settings),
         )
+        .route("/vault/init", post(api::vault_init))
+        .route("/vault/unlock", post(api::vault_unlock))
+        .route("/vault/status", get(api::vault_status))
+        .merge(vault_session)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -144,7 +203,21 @@ fn app_with_events(
     router
         .layer(DefaultBodyLimit::disable())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &Request| {
+                let uri = if request.uri().path().starts_with("/api/vault/") {
+                    "/api/vault/*".to_owned()
+                } else {
+                    request.uri().to_string()
+                };
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    uri = %uri,
+                    version = ?request.version(),
+                )
+            }),
+        )
         .layer(middleware::from_fn(normalize_error_response))
 }
 
@@ -181,9 +254,17 @@ pub async fn run(config: Config) -> Result<()> {
     let purge_task = tokio::spawn(run_purge_loop(purge));
     tracing::info!(address = %config.addr, "Illumia server listening");
 
-    let serve_result = axum::serve(listener, app_with_events(database, config.web_dist, events))
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let serve_result = axum::serve(
+        listener,
+        app_with_events(
+            database,
+            config.web_dist,
+            events,
+            Duration::from_secs(15 * 60),
+        ),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
 
     purge_task.abort();
     let _ = purge_task.await;

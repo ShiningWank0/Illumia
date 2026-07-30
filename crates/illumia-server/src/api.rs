@@ -8,7 +8,7 @@ use axum::{
     Json,
     body::Body,
     extract::{
-        Multipart, Path, Query, Request, State,
+        Extension, Multipart, Path, Query, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
@@ -29,6 +29,7 @@ use illumia_core::{
     thumbnails,
     timeline::{BucketItem, Granularity, TimelineService},
     uuid::Uuid,
+    vault::{self as core_vault, VaultHandle},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -37,9 +38,11 @@ use tower_http::services::ServeFile;
 use crate::{
     AppState,
     error::{ApiError, ApiResult},
+    vault::VaultAccess,
 };
 
 const IMMUTABLE_CACHE: &str = "public,max-age=31536000,immutable";
+const NO_STORE: &str = "no-store";
 
 #[derive(Serialize)]
 pub struct AssetResponse {
@@ -173,6 +176,40 @@ pub struct SearchResponse {
     assets: Vec<AssetResponse>,
     stacks: Vec<StackSummaryResponse>,
     clusters: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+pub struct VaultInitRequest {
+    password: String,
+}
+
+#[derive(Serialize)]
+pub struct VaultInitResponse {
+    recovery_key: String,
+}
+
+#[derive(Deserialize)]
+pub struct VaultUnlockRequest {
+    password: Option<String>,
+    recovery_key: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct VaultUnlockResponse {
+    vault_session: String,
+    expires_at: String,
+}
+
+#[derive(Serialize)]
+pub struct VaultStatusResponse {
+    initialized: bool,
+    unlocked: bool,
+}
+
+#[derive(Deserialize)]
+pub struct VaultTransferRequest {
+    asset_ids: Option<Vec<String>>,
+    stack_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -349,6 +386,163 @@ struct JobSnapshot {
     progress_bits: u64,
 }
 
+#[derive(Clone)]
+struct SelectedDatabase {
+    database: Database,
+    vault: Option<VaultHandle>,
+}
+
+impl SelectedDatabase {
+    fn from_request(state: &AppState, access: Option<Extension<VaultAccess>>) -> Self {
+        match access {
+            Some(Extension(access)) => Self {
+                database: access.handle.db.clone(),
+                vault: Some(access.handle),
+            },
+            None => Self {
+                database: state.database.clone(),
+                vault: None,
+            },
+        }
+    }
+
+    fn result<T>(&self, result: illumia_core::db::Result<T>) -> ApiResult<T> {
+        result.map_err(|error| {
+            if self.vault.is_none() {
+                return ApiError::from(error);
+            }
+            vault_core_error(error)
+        })
+    }
+}
+
+/// Initializes vault key material without exposing whether it exists to unauthenticated callers.
+///
+/// `vault: no-log`
+pub async fn vault_init(
+    State(state): State<AppState>,
+    Json(request): Json<VaultInitRequest>,
+) -> ApiResult<(StatusCode, Json<VaultInitResponse>)> {
+    if request.password.is_empty() {
+        return Err(ApiError::bad_request("password must not be empty"));
+    }
+    let data_root = state.database.data_root().to_path_buf();
+    let recovery_key =
+        tokio::task::spawn_blocking(move || core_vault::init(data_root, &request.password))
+            .await
+            .map_err(|_| ApiError::internal_silent())?
+            .map_err(vault_management_error)?;
+    Ok((
+        StatusCode::CREATED,
+        Json(VaultInitResponse { recovery_key }),
+    ))
+}
+
+/// Replaces the active vault session after password or recovery-key authentication.
+///
+/// `vault: no-log`
+pub async fn vault_unlock(
+    State(state): State<AppState>,
+    Json(request): Json<VaultUnlockRequest>,
+) -> ApiResult<Json<VaultUnlockResponse>> {
+    let manager = state.vault.clone();
+    let issued = match (request.password, request.recovery_key) {
+        (Some(password), None) if !password.is_empty() => {
+            tokio::task::spawn_blocking(move || manager.unlock_with_password(&password))
+                .await
+                .map_err(|_| ApiError::internal_silent())?
+        }
+        (None, Some(recovery_key)) if !recovery_key.is_empty() => {
+            tokio::task::spawn_blocking(move || manager.unlock_with_recovery(&recovery_key))
+                .await
+                .map_err(|_| ApiError::internal_silent())?
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "provide exactly one of password or recovery_key",
+            ));
+        }
+    }
+    .map_err(vault_unlock_error)?;
+    Ok(Json(VaultUnlockResponse {
+        vault_session: issued.token,
+        expires_at: issued.expires_at,
+    }))
+}
+
+/// Destroys the currently authenticated in-memory vault session.
+///
+/// `vault: no-log`
+pub async fn vault_lock(
+    State(state): State<AppState>,
+    Extension(access): Extension<VaultAccess>,
+) -> StatusCode {
+    state.vault.lock(&access);
+    StatusCode::NO_CONTENT
+}
+
+pub async fn vault_status(State(state): State<AppState>) -> ApiResult<Json<VaultStatusResponse>> {
+    let initialized = state.vault.initialized();
+    Ok(Json(VaultStatusResponse {
+        initialized,
+        unlocked: initialized && state.vault.unlocked(),
+    }))
+}
+
+/// Moves assets or a whole stack into the unlocked vault and fills missing image variants.
+///
+/// `vault: no-log`
+pub async fn vault_import(
+    State(state): State<AppState>,
+    Extension(access): Extension<VaultAccess>,
+    Json(request): Json<VaultTransferRequest>,
+) -> ApiResult<StatusCode> {
+    let main = state.database;
+    let vault = access.handle;
+    tokio::task::spawn_blocking(move || -> illumia_core::db::Result<()> {
+        let imported_ids = match (request.asset_ids, request.stack_id) {
+            (Some(asset_ids), None) => {
+                core_vault::import_assets(&main, &vault, &asset_ids)?;
+                asset_ids
+            }
+            (None, Some(stack_id)) => {
+                core_vault::import_stack(&main, &vault, &stack_id)?;
+                stack_asset_ids_for_vault(&vault.db, &stack_id)?
+            }
+            _ => return Err(illumia_core::db::Error::EmptyVaultTransfer),
+        };
+        for asset_id in imported_ids {
+            vault.generate_thumbnails(&asset_id)?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| ApiError::internal_silent())?
+    .map_err(vault_core_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Moves assets or a whole stack out of the unlocked vault.
+///
+/// `vault: no-log`
+pub async fn vault_export(
+    State(state): State<AppState>,
+    Extension(access): Extension<VaultAccess>,
+    Json(request): Json<VaultTransferRequest>,
+) -> ApiResult<StatusCode> {
+    let main = state.database;
+    let vault = access.handle;
+    tokio::task::spawn_blocking(move || match (request.asset_ids, request.stack_id) {
+        (Some(asset_ids), None) => core_vault::export_assets(&vault, &main, &asset_ids),
+        (None, Some(stack_id)) => core_vault::export_stack(&vault, &main, &stack_id),
+        _ => Err(illumia_core::db::Error::EmptyVaultTransfer),
+    })
+    .await
+    .map_err(|_| ApiError::internal_silent())?
+    .map_err(vault_core_error)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn upload_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -465,9 +659,11 @@ pub async fn assets_exist(
 pub async fn asset_metadata(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<AssetResponse>> {
-    let asset = AssetService::new(state.database)
-        .get(&id)?
+    let selected = SelectedDatabase::from_request(&state, access);
+    let asset = selected
+        .result(AssetService::new(selected.database.clone()).get(&id))?
         .ok_or_else(|| ApiError::not_found("asset not found"))?;
     Ok(Json(asset.into()))
 }
@@ -475,16 +671,34 @@ pub async fn asset_metadata(
 pub async fn original(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
     request: Request,
 ) -> ApiResult<Response> {
-    let asset = AssetService::new(state.database.clone())
-        .get(&id)?
+    let selected = SelectedDatabase::from_request(&state, access);
+    let asset = selected
+        .result(AssetService::new(selected.database.clone()).get(&id))?
         .ok_or_else(|| ApiError::not_found("asset not found"))?;
-    let path = asset_path(&state.database, &asset.library_path)?;
-    let mut response = serve_file(path, request).await?;
-    if response.status() == StatusCode::NOT_FOUND {
-        return Err(ApiError::not_found("original file not found"));
-    }
+    let mut response = if let Some(vault) = &selected.vault {
+        let bytes = vault
+            .read_blob(&asset.library_path)
+            .map_err(vault_core_error)?;
+        let mut response = Body::from(bytes).into_response();
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static(content_type_for_extension(&asset.ext)),
+        );
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
+        response
+    } else {
+        let path = asset_path(&selected.database, &asset.library_path)?;
+        let response = serve_file(path, request).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(ApiError::not_found("original file not found"));
+        }
+        response
+    };
     let disposition = format!(
         "attachment; filename=\"asset.{}\"; filename*=UTF-8''{}",
         asset.ext,
@@ -500,24 +714,29 @@ pub async fn original(
 pub async fn thumbnail(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
     request: Request,
 ) -> ApiResult<Response> {
-    image_variant(state, id, request, "t").await
+    image_variant(state, id, access, request, "thumbnail", "t").await
 }
 
 pub async fn preview(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
     request: Request,
 ) -> ApiResult<Response> {
-    image_variant(state, id, request, "p").await
+    image_variant(state, id, access, request, "preview", "p").await
 }
 
 pub async fn trash_asset(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<AssetResponse>> {
-    Ok(Json(AssetService::new(state.database).trash(&id)?.into()))
+    let selected = SelectedDatabase::from_request(&state, access);
+    let asset = selected.result(AssetService::new(selected.database.clone()).trash(&id))?;
+    Ok(Json(asset.into()))
 }
 
 pub async fn restore_asset(
@@ -532,9 +751,14 @@ pub async fn restore_asset(
 pub async fn timeline_buckets(
     State(state): State<AppState>,
     Query(query): Query<BucketQuery>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<Vec<BucketResponse>>> {
-    let buckets = TimelineService::new(state.database)
-        .bucket_records(query.granularity.into())?
+    let selected = SelectedDatabase::from_request(&state, access);
+    let buckets = selected
+        .result(
+            TimelineService::new(selected.database.clone())
+                .bucket_records(query.granularity.into()),
+        )?
         .into_iter()
         .map(|bucket| BucketResponse {
             key: bucket.key,
@@ -549,10 +773,12 @@ pub async fn timeline_bucket(
     Path(key): Path<String>,
     Query(query): Query<BucketQuery>,
     headers: HeaderMap,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Response> {
     validate_bucket_granularity(&key, query.granularity)?;
-    let items: Vec<_> = TimelineService::new(state.database)
-        .bucket_items(&key)?
+    let selected = SelectedDatabase::from_request(&state, access);
+    let items: Vec<_> = selected
+        .result(TimelineService::new(selected.database.clone()).bucket_items(&key))?
         .into_iter()
         .map(BucketItemResponse::from)
         .collect();
@@ -578,18 +804,26 @@ pub async fn timeline_bucket(
     Ok(response)
 }
 
-pub async fn trash(State(state): State<AppState>) -> ApiResult<Json<Vec<AssetResponse>>> {
-    let assets = AssetService::new(state.database)
-        .list_trash()?
+pub async fn trash(
+    State(state): State<AppState>,
+    access: Option<Extension<VaultAccess>>,
+) -> ApiResult<Json<Vec<AssetResponse>>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let assets = selected
+        .result(AssetService::new(selected.database.clone()).list_trash())?
         .into_iter()
         .map(AssetResponse::from)
         .collect();
     Ok(Json(assets))
 }
 
-pub async fn duplicates(State(state): State<AppState>) -> ApiResult<Json<Vec<DuplicateResponse>>> {
-    let duplicates = AssetService::new(state.database)
-        .list_duplicates()?
+pub async fn duplicates(
+    State(state): State<AppState>,
+    access: Option<Extension<VaultAccess>>,
+) -> ApiResult<Json<Vec<DuplicateResponse>>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let duplicates = selected
+        .result(AssetService::new(selected.database.clone()).list_duplicates())?
         .into_iter()
         .map(DuplicateResponse::from)
         .collect();
@@ -606,17 +840,23 @@ pub async fn purge_now(
 
 pub async fn create_stack(
     State(state): State<AppState>,
+    access: Option<Extension<VaultAccess>>,
     Json(request): Json<CreateStackRequest>,
 ) -> ApiResult<(StatusCode, Json<StackResponse>)> {
-    let stack = StackService::new(state.database).create(&request.title, &request.asset_ids)?;
+    let selected = SelectedDatabase::from_request(&state, access);
+    let stack = selected.result(
+        StackService::new(selected.database.clone()).create(&request.title, &request.asset_ids),
+    )?;
     Ok((StatusCode::CREATED, Json(stack.into())))
 }
 
 pub async fn list_stacks(
     State(state): State<AppState>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<Vec<StackSummaryResponse>>> {
-    let stacks = StackService::new(state.database)
-        .list()?
+    let selected = SelectedDatabase::from_request(&state, access);
+    let stacks = selected
+        .result(StackService::new(selected.database.clone()).list())?
         .into_iter()
         .map(StackSummaryResponse::from)
         .collect();
@@ -626,9 +866,11 @@ pub async fn list_stacks(
 pub async fn get_stack(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<StackResponse>> {
-    let stack = StackService::new(state.database)
-        .get(&id)?
+    let selected = SelectedDatabase::from_request(&state, access);
+    let stack = selected
+        .result(StackService::new(selected.database.clone()).get(&id))?
         .ok_or_else(|| ApiError::not_found("manga stack not found"))?;
     Ok(Json(stack.into()))
 }
@@ -636,6 +878,7 @@ pub async fn get_stack(
 pub async fn patch_stack(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
     Json(request): Json<PatchStackRequest>,
 ) -> ApiResult<Json<StackResponse>> {
     if request.title.is_none() && request.cover_asset_id.is_none() {
@@ -643,10 +886,13 @@ pub async fn patch_stack(
             "title or cover_asset_id must be provided",
         ));
     }
-    let stack = StackService::new(state.database).update_metadata(
-        &id,
-        request.title.as_deref(),
-        request.cover_asset_id.as_deref(),
+    let selected = SelectedDatabase::from_request(&state, access);
+    let stack = selected.result(
+        StackService::new(selected.database.clone()).update_metadata(
+            &id,
+            request.title.as_deref(),
+            request.cover_asset_id.as_deref(),
+        ),
     )?;
     Ok(Json(stack.into()))
 }
@@ -654,14 +900,17 @@ pub async fn patch_stack(
 pub async fn delete_stack(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<StatusCode> {
-    StackService::new(state.database).delete_stack(&id)?;
+    let selected = SelectedDatabase::from_request(&state, access);
+    selected.result(StackService::new(selected.database.clone()).delete_stack(&id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn replace_stack_structure(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
     Json(request): Json<ReplaceStackStructureRequest>,
 ) -> ApiResult<Json<StackResponse>> {
     let chapters = request
@@ -672,48 +921,58 @@ pub async fn replace_stack_structure(
             pages: chapter.pages,
         })
         .collect::<Vec<_>>();
-    let stack = StackService::new(state.database).replace_structure(&id, &chapters)?;
+    let selected = SelectedDatabase::from_request(&state, access);
+    let stack = selected
+        .result(StackService::new(selected.database.clone()).replace_structure(&id, &chapters))?;
     Ok(Json(stack.into()))
 }
 
 pub async fn add_stack_pages(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
     Json(request): Json<AddStackPagesRequest>,
 ) -> ApiResult<Json<StackResponse>> {
-    let stack = StackService::new(state.database).add_pages(
+    let selected = SelectedDatabase::from_request(&state, access);
+    let stack = selected.result(StackService::new(selected.database.clone()).add_pages(
         &id,
         &request.asset_ids,
         request.chapter_id.as_deref(),
-    )?;
+    ))?;
     Ok(Json(stack.into()))
 }
 
 pub async fn remove_stack_page(
     State(state): State<AppState>,
     Path((id, asset_id)): Path<(String, String)>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<StatusCode> {
-    StackService::new(state.database).remove_page(&id, &asset_id)?;
+    let selected = SelectedDatabase::from_request(&state, access);
+    selected.result(StackService::new(selected.database.clone()).remove_page(&id, &asset_id))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn patch_stack_page(
     State(state): State<AppState>,
     Path((id, asset_id)): Path<(String, String)>,
+    access: Option<Extension<VaultAccess>>,
     Json(request): Json<PatchStackPageRequest>,
 ) -> ApiResult<Json<StackResponse>> {
-    let stack = StackService::new(state.database).set_page_flag(
+    let selected = SelectedDatabase::from_request(&state, access);
+    let stack = selected.result(StackService::new(selected.database.clone()).set_page_flag(
         &id,
         &asset_id,
         request.show_in_timeline,
-    )?;
+    ))?;
     Ok(Json(stack.into()))
 }
 
 pub async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
+    access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<SearchResponse>> {
+    let selected = SelectedDatabase::from_request(&state, access);
     let query = query.q.trim().to_owned();
     if query.is_empty() {
         return Ok(Json(SearchResponse {
@@ -722,16 +981,16 @@ pub async fn search(
             clusters: Vec::new(),
         }));
     }
-    let ids = search_asset_ids(&state.database, &query)?;
-    let stacks = StackService::new(state.database.clone())
-        .search(&query)?
+    let ids = selected.result(search_asset_ids(&selected.database, &query))?;
+    let stacks = selected
+        .result(StackService::new(selected.database.clone()).search(&query))?
         .into_iter()
         .map(StackSummaryResponse::from)
         .collect();
-    let service = AssetService::new(state.database);
+    let service = AssetService::new(selected.database.clone());
     let mut assets = Vec::with_capacity(ids.len());
     for id in ids {
-        if let Some(asset) = service.get(&id)? {
+        if let Some(asset) = selected.result(service.get(&id))? {
             assets.push(asset.into());
         }
     }
@@ -874,31 +1133,48 @@ async fn send_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
 async fn image_variant(
     state: AppState,
     id: String,
+    access: Option<Extension<VaultAccess>>,
     request: Request,
+    vault_kind: &'static str,
     suffix: &str,
 ) -> ApiResult<Response> {
     Uuid::parse_str(&id).map_err(|_| ApiError::not_found("asset not found"))?;
-    if AssetService::new(state.database.clone())
-        .get(&id)?
+    let selected = SelectedDatabase::from_request(&state, access);
+    if selected
+        .result(AssetService::new(selected.database.clone()).get(&id))?
         .is_none()
     {
         return Err(ApiError::not_found("asset not found"));
     }
-    let path = state
-        .database
-        .data_root()
-        .join("thumbs")
-        .join(format!("{id}_{suffix}.webp"));
-    let mut response = serve_file(path, request).await?;
-    if response.status() == StatusCode::NOT_FOUND {
-        return Err(ApiError::not_found("image variant not found"));
-    }
+    let mut response = if let Some(vault) = &selected.vault {
+        let blob_id = selected
+            .result(vault_blob_id(&selected.database, &id, vault_kind))?
+            .ok_or_else(|| ApiError::not_found("image variant not found"))?;
+        let bytes = vault.read_blob(&blob_id).map_err(vault_core_error)?;
+        Body::from(bytes).into_response()
+    } else {
+        let path = selected
+            .database
+            .data_root()
+            .join("thumbs")
+            .join(format!("{id}_{suffix}.webp"));
+        let response = serve_file(path, request).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Err(ApiError::not_found("image variant not found"));
+        }
+        response
+    };
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("image/webp"));
-    response
-        .headers_mut()
-        .insert(CACHE_CONTROL, HeaderValue::from_static(IMMUTABLE_CACHE));
+    response.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static(if selected.vault.is_some() {
+            NO_STORE
+        } else {
+            IMMUTABLE_CACHE
+        }),
+    );
     Ok(response)
 }
 
@@ -911,11 +1187,10 @@ async fn serve_file(path: PathBuf, request: Request) -> ApiResult<Response> {
     Ok(response.map(Body::new))
 }
 
-fn search_asset_ids(database: &Database, query: &str) -> ApiResult<Vec<String>> {
-    database
-        .with_connection(|connection| {
-            let sql = if query.chars().count() < 3 {
-                "SELECT a.id
+fn search_asset_ids(database: &Database, query: &str) -> illumia_core::db::Result<Vec<String>> {
+    database.with_connection(|connection| {
+        let sql = if query.chars().count() < 3 {
+            "SELECT a.id
                  FROM search_fts f
                  JOIN assets a ON a.id = f.entity_id
                  WHERE f.entity_type = 'asset'
@@ -923,8 +1198,8 @@ fn search_asset_ids(database: &Database, query: &str) -> ApiResult<Vec<String>> 
                    AND a.lifecycle = 'active'
                    AND a.visible_in_timeline = 1
                  ORDER BY a.taken_at DESC"
-            } else {
-                "SELECT a.id
+        } else {
+            "SELECT a.id
                  FROM search_fts f
                  JOIN assets a ON a.id = f.entity_id
                  WHERE search_fts MATCH ?1
@@ -932,19 +1207,107 @@ fn search_asset_ids(database: &Database, query: &str) -> ApiResult<Vec<String>> 
                    AND a.lifecycle = 'active'
                    AND a.visible_in_timeline = 1
                  ORDER BY a.taken_at DESC"
-            };
-            let parameter = if query.chars().count() < 3 {
-                query.to_owned()
-            } else {
-                format!("\"{}\"", query.replace('"', "\"\""))
-            };
-            let mut statement = connection.prepare(sql)?;
-            let ids = statement
-                .query_map([parameter], |row| row.get(0))?
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(ids)
-        })
-        .map_err(Into::into)
+        };
+        let parameter = if query.chars().count() < 3 {
+            query.to_owned()
+        } else {
+            format!("\"{}\"", query.replace('"', "\"\""))
+        };
+        let mut statement = connection.prepare(sql)?;
+        let ids = statement
+            .query_map([parameter], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    })
+}
+
+/// `vault: no-log`
+fn vault_blob_id(
+    database: &Database,
+    asset_id: &str,
+    kind: &str,
+) -> illumia_core::db::Result<Option<String>> {
+    database.with_connection(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT blob_id FROM vault_blobs
+             WHERE asset_id = ?1 AND kind = ?2",
+        )?;
+        let mut rows = statement.query((asset_id, kind))?;
+        Ok(rows.next()?.map(|row| row.get(0)).transpose()?)
+    })
+}
+
+/// `vault: no-log`
+fn stack_asset_ids_for_vault(
+    database: &Database,
+    stack_id: &str,
+) -> illumia_core::db::Result<Vec<String>> {
+    database.with_connection(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT p.asset_id
+             FROM stack_pages p
+             JOIN stack_chapters c ON c.id = p.chapter_id
+             WHERE p.stack_id = ?1
+             ORDER BY c.chapter_no, p.page_no",
+        )?;
+        let ids = statement
+            .query_map([stack_id], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ids)
+    })
+}
+
+/// Maps vault errors without logging their attached SQL or filesystem context.
+///
+/// `vault: no-log`
+fn vault_core_error(error: illumia_core::db::Error) -> ApiError {
+    match error {
+        illumia_core::db::Error::AssetNotFound => ApiError::not_found("asset not found"),
+        illumia_core::db::Error::StackNotFound => ApiError::not_found("manga stack not found"),
+        illumia_core::db::Error::StackChapterNotFound => {
+            ApiError::not_found("stack chapter not found")
+        }
+        illumia_core::db::Error::VaultBlobNotFound => ApiError::not_found("image data not found"),
+        illumia_core::db::Error::InvalidBucketKey => {
+            ApiError::bad_request("invalid timeline bucket key")
+        }
+        illumia_core::db::Error::InvalidStack(_) => ApiError::bad_request("invalid manga stack"),
+        illumia_core::db::Error::EmptyVaultTransfer => {
+            ApiError::bad_request("provide exactly one of asset_ids or stack_id")
+        }
+        _ => ApiError::internal_silent(),
+    }
+}
+
+/// `vault: no-log`
+fn vault_management_error(error: illumia_core::db::Error) -> ApiError {
+    match error {
+        illumia_core::db::Error::VaultAlreadyInitialized => {
+            ApiError::conflict("vault_already_initialized", "vault is already initialized")
+        }
+        _ => ApiError::internal_silent(),
+    }
+}
+
+/// `vault: no-log`
+fn vault_unlock_error(error: illumia_core::db::Error) -> ApiError {
+    match error {
+        illumia_core::db::Error::VaultNotInitialized => ApiError::not_found("not found"),
+        illumia_core::db::Error::VaultAuthenticationFailed
+        | illumia_core::db::Error::InvalidRecoveryKey => ApiError::unauthorized(),
+        _ => ApiError::internal_silent(),
+    }
+}
+
+fn content_type_for_extension(extension: &str) -> &'static str {
+    match extension {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    }
 }
 
 enum SettingChange {
