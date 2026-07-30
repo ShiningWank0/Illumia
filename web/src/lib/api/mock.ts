@@ -396,13 +396,17 @@ interface MockVault {
   initialized: boolean;
   assets: MockAsset[];
   stacks: StackDetail[];
+  trashed: MockAsset[];
 }
 
-const mockVault: MockVault = { initialized: false, assets: [], stacks: [] };
+const mockVault: MockVault = { initialized: false, assets: [], stacks: [], trashed: [] };
 
 function seedVault() {
   if (mockVault.assets.length === 0) {
-    mockVault.assets = generateAssets(180, 0x5eed11, 'vault');
+    const seeded = generateAssets(180, 0x5eed11, 'vault');
+    // 末尾 2 件をゴミ箱に入れて復元/完全削除を試せるようにする。
+    mockVault.trashed = seeded.slice(0, 2);
+    mockVault.assets = seeded.slice(2);
   }
 }
 
@@ -481,17 +485,34 @@ export function createMockVaultClient(): IllumiaApi {
     },
 
     uploadAsset: () => nope('uploadAsset'),
-    async trashAsset(): Promise<void> {
+    async trashAsset(id: string): Promise<void> {
+      const i = mockVault.assets.findIndex((a) => a.id === id);
+      if (i >= 0) mockVault.trashed.unshift(...mockVault.assets.splice(i, 1));
       return delay(undefined);
     },
-    restoreAsset: () => nope('restoreAsset'),
+    async restoreAsset(id: string): Promise<void> {
+      const i = mockVault.trashed.findIndex((a) => a.id === id);
+      if (i >= 0) mockVault.assets.unshift(...mockVault.trashed.splice(i, 1));
+      return delay(undefined);
+    },
     async getTrash(): Promise<Asset[]> {
-      return delay([]);
+      const purgeAfter = new Date(Date.now() + 30 * 86400_000).toISOString();
+      return delay(
+        mockVault.trashed.map((a) => ({
+          ...toAsset(a),
+          status: 'trashed',
+          trashed_at: new Date().toISOString(),
+          purge_after: purgeAfter
+        }))
+      );
     },
     async getDuplicates(): Promise<DuplicatePair[]> {
       return delay([]);
     },
-    purgeNow: () => nope('purgeNow'),
+    async purgeNow(id: string): Promise<void> {
+      mockVault.trashed = mockVault.trashed.filter((a) => a.id !== id);
+      return delay(undefined);
+    },
     getSettings: () => nope('getSettings'),
     patchSettings: () => nope('patchSettings'),
 

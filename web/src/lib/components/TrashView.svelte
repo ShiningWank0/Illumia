@@ -81,14 +81,12 @@
             <span class="name">{a.filename}</span>
             <span class="muted small">完全削除予定: {fmt(a.purge_after)}</span>
           </div>
-          {#if mode === 'main'}
-            <div class="actions">
-              <button onclick={() => restore(a.id)} disabled={busy === a.id}>復元</button>
-              <button class="danger" onclick={() => purge(a.id)} disabled={busy === a.id}>
-                完全に削除
-              </button>
-            </div>
-          {/if}
+          <div class="actions">
+            <button onclick={() => restore(a.id)} disabled={busy === a.id}>復元</button>
+            <button class="danger" onclick={() => purge(a.id)} disabled={busy === a.id}>
+              完全に削除
+            </button>
+          </div>
         </li>
       {/each}
     </ul>

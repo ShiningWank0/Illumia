@@ -114,7 +114,7 @@ function unsupported(name: string): never {
 /**
  * vault ミラー用の IllumiaApi。Timeline / スタック / 検索コンポーネントを
  * そのまま再利用するため、同じインタフェースで /api/vault/... を叩く。
- * vault に存在しない操作 (upload / restore / purge / settings / auth) は投げる。
+ * vault に存在しない操作 (upload / settings / auth) は投げる。
  */
 export function createHttpVaultClient(): IllumiaApi {
   const enc = encodeURIComponent;
@@ -155,8 +155,8 @@ export function createHttpVaultClient(): IllumiaApi {
     async trashAsset(id: string): Promise<void> {
       await vreq<Asset>(`/api/vault/assets/${enc(id)}`, { method: 'DELETE' });
     },
-    restoreAsset(): Promise<void> {
-      return unsupported('restoreAsset');
+    async restoreAsset(id: string): Promise<void> {
+      await vreq<Asset>(`/api/vault/assets/${enc(id)}/restore`, { method: 'POST' });
     },
 
     getTrash(): Promise<Asset[]> {
@@ -165,8 +165,8 @@ export function createHttpVaultClient(): IllumiaApi {
     getDuplicates(): Promise<DuplicatePair[]> {
       return vreq<DuplicatePair[]>('/api/vault/duplicates');
     },
-    purgeNow(): Promise<void> {
-      return unsupported('purgeNow');
+    async purgeNow(id: string): Promise<void> {
+      await vreq<Response>(`/api/vault/trash/${enc(id)}`, { method: 'DELETE', raw: true });
     },
 
     getSettings(): Promise<AppSettings> {
