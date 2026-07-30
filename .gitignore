@@ -30,3 +30,12 @@ apps/android/src-tauri/gen/android/app/build/
 
 # ビルド成果物 (本番ビルドは GitHub Actions のみ → docs/09)
 /dist/
+
+# claude code の権限設定はローカルのみで十分
+.claude/settings.local.json
+
+
+
+# Added by cargo
+
+/target
