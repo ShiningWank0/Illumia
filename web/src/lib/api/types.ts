@@ -79,7 +79,13 @@ export interface AppSettings {
   'dedup.retention_days': number;
   'jobs.thumbnail_concurrency': number;
   'jobs.ml_concurrency': number;
-  [key: string]: number | string | null;
+  // ML (docs/02 / docs/07)
+  'ml.enabled': boolean;
+  'ml.tau_high_override': number | null;
+  'ml.tau_low_override': number | null;
+  'ml.min_cluster_size': number;
+  'ml.quality_gate': string | null; // 'review_only' | 'strict'
+  [key: string]: number | string | boolean | null;
 }
 
 // ---- 漫画スタック (docs/05) ----
@@ -126,11 +132,74 @@ export interface ChapterInput {
   pages: string[]; // asset_id の順序付き列
 }
 
+// ---- キャラクター (クラスタ) (docs/03 §キャラクター / docs/02 / docs/07) ----
+
+/** 正規化 bbox [x, y, w, h] (0..1)。 */
+export type Bbox = [number, number, number, number];
+
+export type FaceState = 'auto' | 'confirmed' | 'candidate' | 'rejected' | 'unassigned';
+
+/** 顔 (faces テーブル相当。crop 表示に必要な最小情報)。 */
+export interface Face {
+  id: string;
+  asset_id: string;
+  bbox: Bbox;
+  state?: FaceState;
+}
+
+/** クラスタ一覧の 1 件 (`GET /api/clusters`)。cover = 代表顔。 */
+export interface Cluster {
+  id: string;
+  name: string | null; // null = 未命名
+  count: number; // 枚数 (顔数)
+  cover: Face | null; // 代表顔
+}
+
+/**
+ * クラスタ内アセット 1 件 (`GET /api/clusters/{id}/assets`)。
+ * face = このクラスタでの顔 (bbox crop / 分割選択用)。実サーバーが顔情報を
+ * 返さない場合は null になり、その場合アセット全体表示・分割不可に縮退する。
+ */
+export interface ClusterAsset {
+  asset: Asset;
+  face: Face | null;
+}
+
+/** 確認キューの候補顔 (`GET /api/review/candidates`)。 */
+export interface Candidate {
+  face_id: string;
+  asset_id: string;
+  bbox: Bbox;
+  cluster_id: string | null;
+  cluster_name: string | null;
+  similarity: number | null;
+}
+
+/** ML サイドカー状態 (`GET /api/ml/status`)。 */
+export interface MlStatus {
+  enabled: boolean;
+  backend: 'onnx' | 'mock';
+  bundle_version: string | null;
+  model_ready: boolean;
+}
+
+/** ジョブ (`GET /api/jobs`)。進捗表示に使う。 */
+export interface Job {
+  id: string;
+  kind: string;
+  state: 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+  progress: number;
+  error: string | null;
+  created_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
 /** 横断検索結果 (`GET /api/search`)。 */
 export interface SearchResult {
   assets: Asset[];
   stacks: StackSummary[];
-  clusters: unknown[];
+  clusters: Cluster[];
 }
 
 // ---- Vault (docs/06) ----
@@ -223,6 +292,21 @@ export interface IllumiaApi {
   addStackPages(id: string, assetIds: string[], chapterId?: string): Promise<StackDetail>;
   removeStackPage(id: string, assetId: string): Promise<void>;
   setPageFlag(id: string, assetId: string, showInTimeline: boolean): Promise<StackDetail>;
+
+  // --- キャラクター (クラスタ) (docs/03 §キャラクター) ---
+  listClusters(): Promise<Cluster[]>;
+  getClusterAssets(id: string): Promise<ClusterAsset[]>;
+  renameCluster(id: string, name: string): Promise<Cluster>;
+  mergeClusters(fromId: string, intoId: string): Promise<void>;
+  splitCluster(id: string, faceIds: string[]): Promise<Cluster>;
+  getReviewCandidates(): Promise<Candidate[]>;
+  reviewCandidate(faceId: string, action: 'accept' | 'reject'): Promise<void>;
+
+  // --- ML 制御 (docs/07。docs/03 のジョブ・設定を拡張) ---
+  mlStatus(): Promise<MlStatus>;
+  analyzeAll(): Promise<void>;
+  recluster(): Promise<void>;
+  getJobs(state?: string): Promise<Job[]>;
 
   // --- 検索 ---
   search(q: string): Promise<SearchResult>;

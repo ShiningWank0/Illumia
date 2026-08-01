@@ -14,12 +14,18 @@ import {
   type AppSettings,
   type Asset,
   type AuthRequest,
+  type Bbox,
   type Bucket,
   type BucketItem,
+  type Candidate,
   type ChapterInput,
+  type Cluster,
+  type ClusterAsset,
   type DuplicatePair,
   type Granularity,
   type IllumiaApi,
+  type Job,
+  type MlStatus,
   type SearchResult,
   type ServerInfo,
   type StackDetail,
@@ -29,6 +35,49 @@ import {
 
 export interface ClientConfig {
   baseUrl?: string;
+}
+
+// ---- サーバー DTO → UI 型 のマッパ (crates/illumia-core の serialize 形に対応) ----
+
+export interface ServerClusterSummary {
+  id: string;
+  name: string | null;
+  cover_face_id: string | null;
+  asset_count: number;
+}
+interface ServerFaceRecord {
+  id: string;
+  asset_id: string;
+  bbox: Bbox;
+  cluster_id: string | null;
+  state?: string;
+  similarity?: number | null;
+}
+interface ServerReviewCandidate {
+  face: ServerFaceRecord;
+  asset: Asset;
+}
+interface ServerMlStatus {
+  enabled: boolean;
+  sidecar: {
+    backend: string;
+    model_bundle?: { name: string; version: string; sha256: string } | null;
+  } | null;
+}
+
+export function toCluster(c: ServerClusterSummary): Cluster {
+  // 実サーバーは cover_face_id のみ (asset+bbox 不明) → cover は null に縮退。
+  return { id: c.id, name: c.name, count: c.asset_count, cover: null };
+}
+function toCandidate(c: ServerReviewCandidate): Candidate {
+  return {
+    face_id: c.face.id,
+    asset_id: c.face.asset_id,
+    bbox: c.face.bbox,
+    cluster_id: c.face.cluster_id,
+    cluster_name: null,
+    similarity: c.face.similarity ?? null
+  };
 }
 
 /** 既定の baseUrl。VITE_API_BASE_URL があれば使用、無ければ同一オリジン。 */
@@ -298,6 +347,76 @@ export function createHttpClient(config: ClientConfig = {}): IllumiaApi {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ show_in_timeline: showInTimeline })
       });
+    },
+
+    // --- キャラクター (クラスタ) ---
+    // サーバーの ClusterSummary / FaceRecord / AssetResponse を UI 型へマップする。
+    async listClusters(): Promise<Cluster[]> {
+      const rows = await request<ServerClusterSummary[]>(base(), '/api/clusters');
+      return rows.map(toCluster);
+    },
+    async getClusterAssets(id: string): Promise<ClusterAsset[]> {
+      // 実サーバーはアセットのみ返す (顔情報なし) → face:null に縮退。
+      const assets = await request<Asset[]>(base(), `/api/clusters/${enc(id)}/assets`);
+      return assets.map((asset) => ({ asset, face: null }));
+    },
+    async renameCluster(id: string, name: string): Promise<Cluster> {
+      const c = await request<ServerClusterSummary>(base(), `/api/clusters/${enc(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      return toCluster(c);
+    },
+    async mergeClusters(fromId: string, intoId: string): Promise<void> {
+      await request<Response>(base(), '/api/clusters/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_id: fromId, into_id: intoId }),
+        raw: true
+      });
+    },
+    async splitCluster(id: string, faceIds: string[]): Promise<Cluster> {
+      const c = await request<ServerClusterSummary>(base(), `/api/clusters/${enc(id)}/split`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ face_ids: faceIds })
+      });
+      return toCluster(c);
+    },
+    async getReviewCandidates(): Promise<Candidate[]> {
+      const rows = await request<ServerReviewCandidate[]>(base(), '/api/review/candidates');
+      return rows.map(toCandidate);
+    },
+    async reviewCandidate(faceId: string, action: 'accept' | 'reject'): Promise<void> {
+      await request<Response>(base(), `/api/review/candidates/${enc(faceId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }),
+        raw: true
+      });
+    },
+
+    // --- ML 制御 ---
+    async mlStatus(): Promise<MlStatus> {
+      const raw = await request<ServerMlStatus>(base(), '/api/ml/status');
+      const backend = raw.sidecar?.backend === 'onnx' ? 'onnx' : 'mock';
+      return {
+        enabled: Boolean(raw.enabled),
+        backend,
+        bundle_version: raw.sidecar?.model_bundle?.version ?? null,
+        model_ready: backend === 'onnx'
+      };
+    },
+    async analyzeAll(): Promise<void> {
+      await request<Response>(base(), '/api/ml/analyze-all', { method: 'POST', raw: true });
+    },
+    async recluster(): Promise<void> {
+      await request<Response>(base(), '/api/ml/recluster', { method: 'POST', raw: true });
+    },
+    getJobs(state?: string): Promise<Job[]> {
+      const q = state ? `?state=${enc(state)}` : '';
+      return request<Job[]>(base(), `/api/jobs${q}`);
     },
 
     // --- 検索 ---

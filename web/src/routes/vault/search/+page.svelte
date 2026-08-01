@@ -8,4 +8,4 @@
 
 <svelte:head><title>Vault 検索: {query} - Illumia</title></svelte:head>
 
-<SearchView {query} api={getVaultApi()} basePath="/vault/stacks" />
+<SearchView {query} api={getVaultApi()} basePath="/vault/stacks" peopleBase="/vault/people" />

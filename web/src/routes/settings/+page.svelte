@@ -5,6 +5,7 @@
   import { isTauri } from '$lib/platform/tauri';
   import { appMode } from '$lib/appMode.svelte';
   import AutoUploadSettings from '$lib/components/AutoUploadSettings.svelte';
+  import MlSettings from '$lib/components/MlSettings.svelte';
 
   const api = getApi();
   const native = isTauri();
@@ -84,6 +85,8 @@
       </label>
       <button type="submit" disabled={saving}>{saving ? '保存中…' : '保存'}</button>
     </form>
+
+    <MlSettings />
   {/if}
 
   {#if native}

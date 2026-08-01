@@ -7,12 +7,18 @@ import {
   ApiError,
   type AppSettings,
   type Asset,
+  type Bbox,
   type Bucket,
   type BucketItem,
+  type Candidate,
   type ChapterInput,
+  type Cluster,
+  type ClusterAsset,
   type DuplicatePair,
   type Granularity,
   type IllumiaApi,
+  type Job,
+  type MlStatus,
   type SearchResult,
   type ServerInfo,
   type StackChapter,
@@ -299,10 +305,160 @@ function assetForFrom(byId: Map<string, MockAsset>): (id: string) => Asset {
   };
 }
 
+interface MockFace {
+  id: string;
+  asset_id: string;
+  bbox: Bbox;
+}
+interface MockCluster {
+  id: string;
+  name: string | null;
+  faces: MockFace[];
+}
+
+const round2 = (n: number): number => Math.round(n * 100) / 100;
+
+/** クラスタ / 候補 / ML / ジョブのモック (assets に対して決定的に生成)。 */
+function makeClusterMethods(assets: MockAsset[], assetFor: (id: string) => Asset) {
+  let seq = 1;
+  const bboxFor = (a: MockAsset): Bbox => [
+    round2(0.15 + (a.hue % 30) / 100),
+    round2(0.12 + (a.hue % 35) / 100),
+    0.32,
+    0.36
+  ];
+  const clusters: MockCluster[] = [];
+  const names: (string | null)[] = ['主人公', 'ヒロイン', null, null, '先生', null];
+  let idx = 0;
+  for (let c = 0; c < 6 && idx < assets.length; c++) {
+    const n = 8 + c * 2;
+    const slice = assets.slice(idx, idx + n);
+    idx += n;
+    clusters.push({
+      id: `mock-cluster-${seq++}`,
+      name: names[c] ?? null,
+      faces: slice.map((a) => ({ id: `face-${a.id}`, asset_id: a.id, bbox: bboxFor(a) }))
+    });
+  }
+  const candidates: Candidate[] = assets.slice(idx, idx + 6).map((a, i) => ({
+    face_id: `face-${a.id}`,
+    asset_id: a.id,
+    bbox: bboxFor(a),
+    cluster_id: clusters[i % Math.max(1, clusters.length)]?.id ?? null,
+    cluster_name: clusters[i % Math.max(1, clusters.length)]?.name ?? null,
+    similarity: round2(0.4 + (a.hue % 20) / 100)
+  }));
+
+  const find = (id: string) => clusters.find((c) => c.id === id);
+  const summaryOf = (c: MockCluster): Cluster => ({
+    id: c.id,
+    name: c.name,
+    count: c.faces.length,
+    cover: c.faces[0] ? { ...c.faces[0] } : null
+  });
+
+  const jobs: Job[] = [];
+  const pushJob = (kind: string) => {
+    const job: Job = {
+      id: `job-${kind}-${seq++}`,
+      kind,
+      state: 'running',
+      progress: 0,
+      error: null,
+      created_at: new Date().toISOString()
+    };
+    jobs.unshift(job);
+    let p = 0;
+    const timer = setInterval(() => {
+      p += 0.2;
+      job.progress = round2(Math.min(1, p));
+      if (p >= 1) {
+        job.state = 'done';
+        job.finished_at = new Date().toISOString();
+        clearInterval(timer);
+      }
+    }, 500);
+  };
+
+  return {
+    async listClusters(): Promise<Cluster[]> {
+      return delay(clusters.map(summaryOf));
+    },
+    async getClusterAssets(id: string): Promise<ClusterAsset[]> {
+      const c = find(id);
+      if (!c) throw new ApiError(404, 'not_found', 'cluster not found');
+      return delay(c.faces.map((f) => ({ asset: assetFor(f.asset_id), face: { ...f } })));
+    },
+    async renameCluster(id: string, name: string): Promise<Cluster> {
+      const c = find(id);
+      if (!c) throw new ApiError(404, 'not_found', 'cluster not found');
+      c.name = name.trim() || null;
+      return delay(summaryOf(c));
+    },
+    async mergeClusters(fromId: string, intoId: string): Promise<void> {
+      const from = find(fromId);
+      const into = find(intoId);
+      if (from && into && from !== into) {
+        into.faces.push(...from.faces);
+        clusters.splice(clusters.indexOf(from), 1);
+      }
+      return delay(undefined);
+    },
+    async splitCluster(id: string, faceIds: string[]): Promise<Cluster> {
+      const c = find(id);
+      if (!c) throw new ApiError(404, 'not_found', 'cluster not found');
+      const set = new Set(faceIds);
+      const moved = c.faces.filter((f) => set.has(f.id));
+      c.faces = c.faces.filter((f) => !set.has(f.id));
+      const nc: MockCluster = { id: `mock-cluster-${seq++}`, name: null, faces: moved };
+      clusters.unshift(nc);
+      return delay(summaryOf(nc));
+    },
+    async getReviewCandidates(): Promise<Candidate[]> {
+      return delay(candidates.map((c) => ({ ...c })));
+    },
+    async reviewCandidate(faceId: string, action: 'accept' | 'reject'): Promise<void> {
+      const i = candidates.findIndex((x) => x.face_id === faceId);
+      if (i >= 0) {
+        const cand = candidates[i];
+        candidates.splice(i, 1);
+        if (action === 'accept' && cand.cluster_id) {
+          find(cand.cluster_id)?.faces.push({
+            id: cand.face_id,
+            asset_id: cand.asset_id,
+            bbox: cand.bbox
+          });
+        }
+      }
+      return delay(undefined);
+    },
+    async mlStatus(): Promise<MlStatus> {
+      return delay({ enabled: true, backend: 'mock', bundle_version: null, model_ready: false });
+    },
+    async analyzeAll(): Promise<void> {
+      pushJob('ml_analyze');
+      return delay(undefined);
+    },
+    async recluster(): Promise<void> {
+      pushJob('ml_cluster');
+      return delay(undefined);
+    },
+    async getJobs(state?: string): Promise<Job[]> {
+      return delay(state ? jobs.filter((j) => j.state === state) : [...jobs]);
+    },
+    searchClusters(q: string): Cluster[] {
+      const query = q.trim().toLowerCase();
+      if (!query) return [];
+      return clusters.filter((c) => (c.name ?? '').toLowerCase().includes(query)).map(summaryOf);
+    }
+  };
+}
+
 function searchOver(
   assets: MockAsset[],
   stacks: StackDetail[],
   summaryOf: (s: StackDetail) => StackSummary,
+  searchClusters: (q: string) => Cluster[],
   q: string
 ): SearchResult {
   const query = q.trim().toLowerCase();
@@ -313,7 +469,7 @@ function searchOver(
       .slice(0, 50)
       .map(toAsset),
     stacks: stacks.filter((s) => s.title.toLowerCase().includes(query)).map(summaryOf),
-    clusters: []
+    clusters: searchClusters(query)
   };
 }
 
@@ -323,11 +479,17 @@ export function createMockClient(count = 3000): IllumiaApi {
   const views = makeAssetViews(assets);
   const stacks: StackDetail[] = [];
   const stackMethods = makeStackMethods(stacks, assetForFrom(views.byId));
+  const clusterMethods = makeClusterMethods(assets, assetForFrom(views.byId));
   const settings: AppSettings = {
     'trash.retention_days': 30,
     'dedup.retention_days': 14,
     'jobs.thumbnail_concurrency': 3,
-    'jobs.ml_concurrency': 1
+    'jobs.ml_concurrency': 1,
+    'ml.enabled': true,
+    'ml.tau_high_override': null,
+    'ml.tau_low_override': null,
+    'ml.min_cluster_size': 4,
+    'ml.quality_gate': 'review_only'
   };
 
   return {
@@ -394,8 +556,22 @@ export function createMockClient(count = 3000): IllumiaApi {
     removeStackPage: stackMethods.removeStackPage,
     setPageFlag: stackMethods.setPageFlag,
 
+    listClusters: clusterMethods.listClusters,
+    getClusterAssets: clusterMethods.getClusterAssets,
+    renameCluster: clusterMethods.renameCluster,
+    mergeClusters: clusterMethods.mergeClusters,
+    splitCluster: clusterMethods.splitCluster,
+    getReviewCandidates: clusterMethods.getReviewCandidates,
+    reviewCandidate: clusterMethods.reviewCandidate,
+    mlStatus: clusterMethods.mlStatus,
+    analyzeAll: clusterMethods.analyzeAll,
+    recluster: clusterMethods.recluster,
+    getJobs: clusterMethods.getJobs,
+
     async search(q: string): Promise<SearchResult> {
-      return delay(searchOver(assets, stacks, stackMethods.summaryOf, q));
+      return delay(
+        searchOver(assets, stacks, stackMethods.summaryOf, clusterMethods.searchClusters, q)
+      );
     }
   };
 }
@@ -468,6 +644,7 @@ export function createMockVaultClient(): IllumiaApi {
   seedVault();
   const views = makeAssetViews(mockVault.assets);
   const stackMethods = makeStackMethods(mockVault.stacks, assetForFrom(views.byId));
+  const clusterMethods = makeClusterMethods(mockVault.assets, assetForFrom(views.byId));
   const nope = (name: string): never => {
     throw new ApiError(0, 'unsupported', `${name} not available in vault`);
   };
@@ -538,8 +715,29 @@ export function createMockVaultClient(): IllumiaApi {
     removeStackPage: stackMethods.removeStackPage,
     setPageFlag: stackMethods.setPageFlag,
 
+    // vault はクラスタ閲覧・編集のみ (確認キュー / ML 制御は全体側)。
+    listClusters: clusterMethods.listClusters,
+    getClusterAssets: clusterMethods.getClusterAssets,
+    renameCluster: clusterMethods.renameCluster,
+    mergeClusters: clusterMethods.mergeClusters,
+    splitCluster: clusterMethods.splitCluster,
+    getReviewCandidates: () => nope('getReviewCandidates'),
+    reviewCandidate: () => nope('reviewCandidate'),
+    mlStatus: () => nope('mlStatus'),
+    analyzeAll: () => nope('analyzeAll'),
+    recluster: () => nope('recluster'),
+    getJobs: () => nope('getJobs'),
+
     async search(q: string): Promise<SearchResult> {
-      return delay(searchOver(mockVault.assets, mockVault.stacks, stackMethods.summaryOf, q));
+      return delay(
+        searchOver(
+          mockVault.assets,
+          mockVault.stacks,
+          stackMethods.summaryOf,
+          clusterMethods.searchClusters,
+          q
+        )
+      );
     }
   };
 }

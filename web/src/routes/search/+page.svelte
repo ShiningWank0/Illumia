@@ -7,4 +7,4 @@
 
 <svelte:head><title>検索: {query} - Illumia</title></svelte:head>
 
-<SearchView {query} basePath="/stacks" />
+<SearchView {query} basePath="/stacks" peopleBase="/people" />

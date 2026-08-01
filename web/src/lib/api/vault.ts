@@ -4,7 +4,7 @@
 //
 // vault: no-log — asset id / ファイル名 / トークン / 検索語をログに出さない。
 
-import { request, resolveBaseUrl } from './client';
+import { request, resolveBaseUrl, toCluster, type ServerClusterSummary } from './client';
 import { getVaultToken, vaultSession } from '$lib/vaultSession.svelte';
 import { isMock } from './index';
 import { createMockVaultClient, mockVaultLifecycle } from './mock';
@@ -15,6 +15,8 @@ import {
   type Bucket,
   type BucketItem,
   type ChapterInput,
+  type Cluster,
+  type ClusterAsset,
   type DuplicatePair,
   type Granularity,
   type IllumiaApi,
@@ -231,6 +233,47 @@ export function createHttpVaultClient(): IllumiaApi {
         body: JSON.stringify({ show_in_timeline: showInTimeline })
       });
     },
+
+    // --- キャラクター (クラスタ) --- サーバー DTO を UI 型へマップ。
+    async listClusters(): Promise<Cluster[]> {
+      const rows = await vreq<ServerClusterSummary[]>('/api/vault/clusters');
+      return rows.map(toCluster);
+    },
+    async getClusterAssets(id: string): Promise<ClusterAsset[]> {
+      const assets = await vreq<Asset[]>(`/api/vault/clusters/${enc(id)}/assets`);
+      return assets.map((asset) => ({ asset, face: null }));
+    },
+    async renameCluster(id: string, name: string): Promise<Cluster> {
+      const c = await vreq<ServerClusterSummary>(`/api/vault/clusters/${enc(id)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name })
+      });
+      return toCluster(c);
+    },
+    async mergeClusters(fromId: string, intoId: string): Promise<void> {
+      await vreq<Response>('/api/vault/clusters/merge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_id: fromId, into_id: intoId }),
+        raw: true
+      });
+    },
+    async splitCluster(id: string, faceIds: string[]): Promise<Cluster> {
+      const c = await vreq<ServerClusterSummary>(`/api/vault/clusters/${enc(id)}/split`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ face_ids: faceIds })
+      });
+      return toCluster(c);
+    },
+    // 確認キュー / ML 制御 / ジョブは vault では提供しない (ML 設定は全体設定)。
+    getReviewCandidates: () => unsupported('getReviewCandidates'),
+    reviewCandidate: () => unsupported('reviewCandidate'),
+    mlStatus: () => unsupported('mlStatus'),
+    analyzeAll: () => unsupported('analyzeAll'),
+    recluster: () => unsupported('recluster'),
+    getJobs: () => unsupported('getJobs'),
 
     search(q: string): Promise<SearchResult> {
       return vreq<SearchResult>(`/api/vault/search?q=${enc(q)}`);

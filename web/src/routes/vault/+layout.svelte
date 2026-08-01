@@ -15,6 +15,7 @@
   const links = [
     { href: '/vault', label: 'タイムライン', exact: true },
     { href: '/vault/stacks', label: '漫画', exact: false },
+    { href: '/vault/people', label: '人物', exact: false },
     { href: '/vault/trash', label: 'ゴミ箱', exact: false },
     { href: '/vault/duplicates', label: '重複', exact: false }
   ];

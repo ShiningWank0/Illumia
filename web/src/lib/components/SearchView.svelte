@@ -1,13 +1,17 @@
 <script lang="ts">
   import { getApi, type IllumiaApi, type SearchResult } from '$lib/api';
   import AssetImage from './AssetImage.svelte';
+  import FaceCrop from './FaceCrop.svelte';
 
   interface Props {
     query: string;
     api?: IllumiaApi;
+    /** スタックリンクのベース (/stacks or /vault/stacks)。 */
     basePath?: string;
+    /** クラスタリンクのベース (/people or /vault/people)。 */
+    peopleBase?: string;
   }
-  const { query, api = getApi(), basePath = '/stacks' }: Props = $props();
+  const { query, api = getApi(), basePath = '/stacks', peopleBase = '/people' }: Props = $props();
 
   let result = $state<SearchResult>({ assets: [], stacks: [], clusters: [] });
   let loading = $state(false);
@@ -59,6 +63,32 @@
               </div>
               <span class="name">{s.title}</span>
               <span class="muted small">{s.chapter_count} 話 / {s.page_count} ページ</span>
+            </a>
+          {/each}
+        </div>
+      {/if}
+    </section>
+
+    <section>
+      <h2>人物 ({result.clusters.length})</h2>
+      {#if result.clusters.length === 0}
+        <p class="muted small">該当なし</p>
+      {:else}
+        <div class="people-grid">
+          {#each result.clusters as c (c.id)}
+            <a class="person" href={`${peopleBase}/${c.id}`}>
+              <div class="face">
+                {#if c.cover}
+                  <FaceCrop
+                    {api}
+                    assetId={c.cover.asset_id}
+                    bbox={c.cover.bbox}
+                    alt={c.name ?? '未命名'}
+                  />
+                {/if}
+              </div>
+              <span class="name" class:unnamed={!c.name}>{c.name ?? '未命名'}</span>
+              <span class="muted small">{c.count} 枚</span>
             </a>
           {/each}
         </div>
@@ -141,5 +171,33 @@
     border-radius: 6px;
     overflow: hidden;
     background: #1c1c22;
+  }
+  .people-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+    gap: 1rem;
+  }
+  .person {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    text-decoration: none;
+    color: inherit;
+  }
+  .person .face {
+    aspect-ratio: 1;
+    border-radius: 8px;
+    overflow: hidden;
+    background: #1c1c22;
+  }
+  .person .name {
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .person .name.unnamed {
+    color: #71717a;
+    font-style: italic;
   }
 </style>

@@ -7,6 +7,7 @@
   const links = [
     { href: '/', label: 'タイムライン' },
     { href: '/stacks', label: '漫画' },
+    { href: '/people', label: '人物' },
     { href: '/trash', label: 'ゴミ箱' },
     { href: '/duplicates', label: '重複' },
     { href: '/settings', label: '設定' }
