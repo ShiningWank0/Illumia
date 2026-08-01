@@ -199,6 +199,8 @@ export interface IllumiaApi {
 
   // --- アセット操作 ---
   uploadAsset(file: File): Promise<UploadResult>;
+  /** ハッシュ照合。`{hex: asset_id}` を返す (自動アップロードの事前スキップ判定)。 */
+  assetsExist(hashes: string[]): Promise<Record<string, string>>;
   trashAsset(id: string): Promise<void>;
   restoreAsset(id: string): Promise<void>;
 

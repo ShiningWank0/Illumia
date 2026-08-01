@@ -358,6 +358,9 @@ export function createMockClient(count = 3000): IllumiaApi {
     async uploadAsset(): Promise<UploadResult> {
       return delay({ id: 'mock-upload', status: 'created' });
     },
+    async assetsExist(): Promise<Record<string, string>> {
+      return delay({});
+    },
     async trashAsset(): Promise<void> {
       return delay(undefined);
     },
@@ -493,6 +496,7 @@ export function createMockVaultClient(): IllumiaApi {
     },
 
     uploadAsset: () => nope('uploadAsset'),
+    assetsExist: () => nope('assetsExist'),
     async trashAsset(id: string): Promise<void> {
       const i = mockVault.assets.findIndex((a) => a.id === id);
       if (i >= 0) mockVault.trashed.unshift(...mockVault.assets.splice(i, 1));

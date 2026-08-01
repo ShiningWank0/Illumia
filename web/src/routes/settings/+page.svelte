@@ -2,8 +2,17 @@
   import { onMount } from 'svelte';
   import { getApi, type AppSettings } from '$lib/api';
   import { toasts } from '$lib/toast.svelte';
+  import { isTauri } from '$lib/platform/tauri';
+  import { appMode } from '$lib/appMode.svelte';
+  import AutoUploadSettings from '$lib/components/AutoUploadSettings.svelte';
 
   const api = getApi();
+  const native = isTauri();
+
+  function reconnect() {
+    // 接続プロファイル画面へ戻す (再プローブ / 変更)。
+    appMode.status = 'needs-connection';
+  }
 
   let trashDays = $state(30);
   let dedupDays = $state(14);
@@ -76,6 +85,14 @@
       <button type="submit" disabled={saving}>{saving ? '保存中…' : '保存'}</button>
     </form>
   {/if}
+
+  {#if native}
+    <AutoUploadSettings />
+    <section class="conn">
+      <h2>サーバー接続 (アプリ)</h2>
+      <button class="reconnect" onclick={reconnect}>接続設定を変更 / 再接続</button>
+    </section>
+  {/if}
 </div>
 
 <style>
@@ -128,5 +145,22 @@
   button:disabled {
     opacity: 0.6;
     cursor: default;
+  }
+  .conn {
+    margin-top: 2rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid #26262e;
+  }
+  .conn h2 {
+    margin: 0 0 0.75rem;
+    font-size: 1.1rem;
+  }
+  .reconnect {
+    border: 1px solid #3f3f46;
+    background: none;
+    color: #f4f4f5;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    cursor: pointer;
   }
 </style>

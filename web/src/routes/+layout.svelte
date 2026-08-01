@@ -1,18 +1,30 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { session } from '$lib/session.svelte';
+  import { appMode } from '$lib/appMode.svelte';
   import AuthGate from '$lib/components/AuthGate.svelte';
+  import ConnectionSetup from '$lib/components/ConnectionSetup.svelte';
   import NavBar from '$lib/components/NavBar.svelte';
   import Toaster from '$lib/components/Toaster.svelte';
 
   const { children } = $props();
 
-  onMount(() => {
-    session.init();
+  onMount(async () => {
+    // アプリモード (Tauri) は接続プロファイルのプローブを先に済ませる。
+    await appMode.init();
+    if (appMode.status === 'ready') session.init();
   });
+
+  function onConnected() {
+    session.init();
+  }
 </script>
 
-{#if session.status === 'loading'}
+{#if appMode.status === 'loading'}
+  <div class="center">読み込み中…</div>
+{:else if appMode.status === 'needs-connection'}
+  <ConnectionSetup {onConnected} />
+{:else if session.status === 'loading'}
   <div class="center">読み込み中…</div>
 {:else if session.status === 'error'}
   <div class="center">

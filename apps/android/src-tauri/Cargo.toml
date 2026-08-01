@@ -1,0 +1,32 @@
+# Illumia Android (Tauri 2) の Rust ラッパ。
+# 独立ワークスペースにして親 (crates/) の cargo コマンドに干渉させない。
+[workspace]
+
+[package]
+name = "illumia-android"
+version = "0.1.0"
+description = "Illumia Android client (Tauri 2 shell around the web SPA)"
+edition = "2021"
+rust-version = "1.77"
+publish = false
+
+[lib]
+# モバイルは cdylib/staticlib、デスクトップ dev 用に rlib も出す。
+name = "illumia_android_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-biometric = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-http = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[features]
+# tauri の dev 時に devtools を有効化する用のプレースホルダ。
+default = []

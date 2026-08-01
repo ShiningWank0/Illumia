@@ -3,7 +3,7 @@
 //   実サーバー: (既定) createHttpClient(baseUrl)
 //   モック:      VITE_USE_MOCK=1 → createMockClient()  (docs/03 と同一インタフェース)
 
-import { createHttpClient, defaultBaseUrl } from './client';
+import { createHttpClient } from './client';
 import { createMockClient } from './mock';
 import type { IllumiaApi } from './types';
 
@@ -20,6 +20,7 @@ let singleton: IllumiaApi | null = null;
 /** アプリ全体で共有する IllumiaApi を返す。 */
 export function getApi(): IllumiaApi {
   if (singleton) return singleton;
-  singleton = isMock() ? createMockClient() : createHttpClient({ baseUrl: defaultBaseUrl() });
+  // baseUrl はクライアント内で呼び出しごとに解決する (アプリモードのプローブ対応)。
+  singleton = isMock() ? createMockClient() : createHttpClient();
   return singleton;
 }

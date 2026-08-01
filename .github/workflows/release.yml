@@ -148,10 +148,17 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      - name: install Android NDK
+        run: |
+          sdkmanager "ndk;26.1.10909125"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
-          targets: aarch64-linux-android,armv7-linux-androideabi
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: apps/android/src-tauri
       - name: restore signing keystore
         env:
           KEYSTORE_B64: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_B64 }}
@@ -166,15 +173,29 @@ jobs:
           npm ci --ignore-scripts
           node node_modules/esbuild/install.js
           npm run build
-      - name: build signed APK
+      - name: install Tauri CLI
         working-directory: apps/android
+        run: npm ci
+      - name: initialize Android project (gen/ は非コミット)
+        working-directory: apps/android
+        # Rust ターゲットは rust-toolchain アクションで導入済みなので --skip-targets-install。
+        run: npm run tauri android init -- --ci --skip-targets-install
+      - name: configure release signing
+        working-directory: apps/android/src-tauri/gen/android
         env:
           ILLUMIA_KEYSTORE_PASSWORD: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_PASSWORD }}
           ILLUMIA_KEY_ALIAS: ${{ secrets.ILLUMIA_ANDROID_KEY_ALIAS }}
         run: |
-          npm ci
-          npm run tauri android build -- --apk
-          # TODO(M5): tauri.conf.json / gradle の署名設定と成果物パスを実装時に確定する
+          # keystore.properties を生成し、生成された app/build.gradle.kts に署名設定を注入する。
+          cat > keystore.properties <<EOF
+          password=$ILLUMIA_KEYSTORE_PASSWORD
+          keyAlias=$ILLUMIA_KEY_ALIAS
+          storeFile=$(cd ../.. && pwd)/illumia.keystore
+          EOF
+          python3 "$GITHUB_WORKSPACE/apps/android/scripts/inject-signing.py" app/build.gradle.kts
+      - name: build signed APK
+        working-directory: apps/android
+        run: npm run tauri android build -- --apk
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: android-apk

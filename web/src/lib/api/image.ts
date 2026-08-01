@@ -4,6 +4,8 @@
 // data: URL (モック) はそのまま返す。取得済み object URL は上限付きで再利用する。
 
 import { getVaultToken } from '$lib/vaultSession.svelte';
+import { isTauri, nativeFetch } from '$lib/platform/tauri';
+import { getNativeToken } from '$lib/platform/nativeAuth';
 import { thumbHashToDataURL } from 'thumbhash';
 import { ApiError } from './types';
 
@@ -20,19 +22,33 @@ function validatedAppUrl(url: string): URL {
   return parsed;
 }
 
-/** vault 配下の URL か (X-Vault-Session を付ける対象)。 */
+/** vault 配下の URL か (X-Vault-Session を付ける対象)。相対・絶対どちらも判定。 */
 function isVaultUrl(url: string): boolean {
-  return validatedAppUrl(url).pathname.startsWith('/api/vault/');
+  return url.includes('/api/vault/');
 }
 
-/** 認証ヘッダを組み立てる。vault URL には X-Vault-Session も付与。 */
+/** 認証ヘッダ。ネイティブは Bearer、vault URL には X-Vault-Session も付与。 */
 function authHeaders(url: string): Record<string, string> {
   const headers: Record<string, string> = {};
+  if (isTauri()) {
+    const t = getNativeToken();
+    if (t) headers.Authorization = `Bearer ${t}`;
+  }
   if (isVaultUrl(url)) {
     const vt = getVaultToken();
     if (vt) headers['X-Vault-Session'] = vt;
   }
   return headers;
+}
+
+/** ネイティブは CORS 回避のため plugin-http、ブラウザは同一オリジン Cookie。 */
+async function fetchAsset(url: string): Promise<Response> {
+  const headers = authHeaders(url);
+  if (isTauri()) {
+    return nativeFetch(url, { headers, credentials: 'omit' });
+  }
+  const target = validatedAppUrl(url);
+  return fetch(target, { headers, credentials: 'same-origin' });
 }
 
 /**
@@ -50,8 +66,7 @@ export async function authedObjectUrl(url: string): Promise<string> {
     return cached;
   }
 
-  const target = validatedAppUrl(url);
-  const res = await fetch(target, { headers: authHeaders(url), credentials: 'same-origin' });
+  const res = await fetchAsset(url);
   if (!res.ok) {
     // vault URL のログにパス (asset id を含む) を残さない。
     throw new ApiError(res.status, `http_${res.status}`, 'image fetch failed');
@@ -87,8 +102,7 @@ export function revokeVaultObjectUrls(): void {
  * 原本を認証付きで取得し、ファイルとして保存する (vault でもダウンロード可)。
  */
 export async function downloadOriginal(url: string, filename: string): Promise<void> {
-  const target = validatedAppUrl(url);
-  const res = await fetch(target, { headers: authHeaders(url), credentials: 'same-origin' });
+  const res = await fetchAsset(url);
   if (!res.ok) throw new ApiError(res.status, `http_${res.status}`, 'download failed');
   const blob = await res.blob();
   const objectUrl = URL.createObjectURL(blob);

@@ -1,0 +1,12 @@
+# Node
+node_modules/
+
+# Tauri / Rust build 成果物
+src-tauri/target/
+
+# `tauri android init` が生成する Android プロジェクト (CI で毎回生成)
+src-tauri/gen/
+
+# 署名関連 (CI で Secrets から復元・生成)
+src-tauri/illumia.keystore
+src-tauri/gen/android/keystore.properties

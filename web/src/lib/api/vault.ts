@@ -4,7 +4,7 @@
 //
 // vault: no-log — asset id / ファイル名 / トークン / 検索語をログに出さない。
 
-import { defaultBaseUrl, request } from './client';
+import { request, resolveBaseUrl } from './client';
 import { getVaultToken, vaultSession } from '$lib/vaultSession.svelte';
 import { isMock } from './index';
 import { createMockVaultClient, mockVaultLifecycle } from './mock';
@@ -28,7 +28,7 @@ import {
   type VaultUnlockResponse
 } from './types';
 
-const base = () => defaultBaseUrl();
+const base = () => resolveBaseUrl();
 
 /** X-Vault-Session を付けたヘッダを返す。 */
 function vaultHeaders(extra: Record<string, string> = {}): Record<string, string> {
@@ -117,9 +117,9 @@ function unsupported(name: string): never {
  */
 export function createHttpVaultClient(): IllumiaApi {
   const enc = encodeURIComponent;
-  const b = base();
+  const b = () => base();
   const vreq = <T>(path: string, opts: Parameters<typeof request>[2] = {}): Promise<T> =>
-    guard(request<T>(b, path, { ...opts, headers: vaultHeaders(opts?.headers) }));
+    guard(request<T>(b(), path, { ...opts, headers: vaultHeaders(opts?.headers) }));
 
   return {
     serverInfo(): Promise<ServerInfo> {
@@ -142,17 +142,20 @@ export function createHttpVaultClient(): IllumiaApi {
       return vreq<BucketItem[]>(`/api/vault/timeline/buckets/${enc(key)}?granularity=${g}`);
     },
     thumbnailUrl(id: string): string {
-      return `${b}/api/vault/assets/${enc(id)}/thumbnail`;
+      return `${b()}/api/vault/assets/${enc(id)}/thumbnail`;
     },
     previewUrl(id: string): string {
-      return `${b}/api/vault/assets/${enc(id)}/preview`;
+      return `${b()}/api/vault/assets/${enc(id)}/preview`;
     },
     originalUrl(id: string): string {
-      return `${b}/api/vault/assets/${enc(id)}/original`;
+      return `${b()}/api/vault/assets/${enc(id)}/original`;
     },
 
     uploadAsset(): Promise<UploadResult> {
       return unsupported('uploadAsset');
+    },
+    assetsExist(): Promise<Record<string, string>> {
+      return unsupported('assetsExist');
     },
     async trashAsset(id: string): Promise<void> {
       await vreq<Asset>(`/api/vault/assets/${enc(id)}`, { method: 'DELETE' });

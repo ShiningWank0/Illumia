@@ -2,6 +2,9 @@
 // GET /api/server/info の setup_completed / authenticated で状態を決める。
 
 import { getApi } from '$lib/api';
+import { nativeLogin, nativeSetup } from '$lib/api/client';
+import { isTauri } from '$lib/platform/tauri';
+import { setNativeToken } from '$lib/platform/nativeAuth';
 import { ApiError } from '$lib/api/types';
 
 export type SessionStatus = 'loading' | 'needs-setup' | 'needs-login' | 'authed' | 'error';
@@ -38,12 +41,21 @@ class Session {
   }
 
   async setup(password: string, deviceName: string, setupToken?: string): Promise<void> {
-    await getApi().setup({ password, device_name: deviceName }, setupToken);
+    if (isTauri()) {
+      // ネイティブは Bearer token を secure storage (現状メモリ) に保存する。
+      setNativeToken(await nativeSetup({ password, device_name: deviceName }, setupToken));
+    } else {
+      await getApi().setup({ password, device_name: deviceName }, setupToken);
+    }
     this.status = 'authed';
   }
 
   async login(password: string, deviceName: string): Promise<void> {
-    await getApi().login({ password, device_name: deviceName });
+    if (isTauri()) {
+      setNativeToken(await nativeLogin({ password, device_name: deviceName }));
+    } else {
+      await getApi().login({ password, device_name: deviceName });
+    }
     this.status = 'authed';
   }
 
@@ -52,6 +64,7 @@ class Session {
     try {
       await getApi().logout();
     } finally {
+      if (isTauri()) setNativeToken(null);
       this.status = 'needs-login';
     }
   }
