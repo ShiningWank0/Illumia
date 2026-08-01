@@ -72,6 +72,19 @@ impl TestApp {
         let value = serde_json::from_slice(&bytes).expect("response should be JSON");
         (status, value)
     }
+
+    async fn setup(&self) -> String {
+        let (status, setup) = self
+            .json(
+                Method::POST,
+                "/api/auth/setup",
+                None,
+                json!({"password":"character password", "device_name":"ml api"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        setup["token"].as_str().expect("token").to_owned()
+    }
 }
 
 impl Drop for TestApp {
@@ -83,16 +96,7 @@ impl Drop for TestApp {
 #[tokio::test]
 async fn authenticated_cluster_merge_split_review_and_minimum_filter_flow() {
     let app = TestApp::new();
-    let (status, setup) = app
-        .json(
-            Method::POST,
-            "/api/auth/setup",
-            None,
-            json!({"password":"character password", "device_name":"ml api"}),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK);
-    let token = setup["token"].as_str().expect("token").to_owned();
+    let token = app.setup().await;
 
     let (status, ml_status) = app.get("/api/ml/status", Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
@@ -242,6 +246,166 @@ async fn authenticated_cluster_merge_split_review_and_minimum_filter_flow() {
     let (status, assets_response) = app.get("/api/clusters/into/assets", Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(assets_response.as_array().expect("assets").len(), 5);
+}
+
+#[tokio::test]
+async fn cluster_responses_include_cover_and_only_member_faces() {
+    let app = TestApp::new();
+    let token = app.setup().await;
+    let assets = (0..3)
+        .map(|index| {
+            AssetService::new(app.database.clone())
+                .ingest(&one_pixel_png(), &format!("cover-{index}.png"), None)
+                .expect("asset should ingest")
+                .asset
+        })
+        .collect::<Vec<_>>();
+
+    app.database
+        .with_connection(|connection| {
+            for id in ["target", "other"] {
+                connection.execute(
+                    "INSERT INTO clusters(id, name, cover_face_id, created_by, created_at)
+                     VALUES (?1, NULL, NULL, 'user', '2026-01-01T00:00:00Z')",
+                    [id],
+                )?;
+            }
+            for (id, asset_index, cluster_id, state, similarity) in [
+                ("target-a", 0, "target", "auto", Some(0.91)),
+                ("target-a-2", 0, "target", "confirmed", None),
+                ("foreign-a", 0, "other", "auto", Some(0.88)),
+                ("target-b", 1, "target", "auto", Some(0.82)),
+                ("target-c", 2, "target", "auto", Some(0.73)),
+            ] {
+                connection.execute(
+                    "INSERT INTO faces(id, asset_id, kind, bbox, det_conf, quality_flags,
+                       embedding, model_version, cluster_id, state, similarity)
+                     VALUES (?1, ?2, 'face', '[0.1,0.2,0.3,0.4]', 0.9, '[]', ?3,
+                             'test-v1', ?4, ?5, ?6)",
+                    (
+                        id,
+                        &assets[asset_index].id,
+                        [1.0_f32.to_le_bytes(), 0.0_f32.to_le_bytes()].concat(),
+                        cluster_id,
+                        state,
+                        similarity,
+                    ),
+                )?;
+            }
+            connection.execute(
+                "UPDATE clusters SET cover_face_id = 'target-a' WHERE id = 'target'",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("cluster fixture should insert");
+
+    let (status, clusters) = app.get("/api/clusters", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let target = clusters
+        .as_array()
+        .expect("clusters")
+        .iter()
+        .find(|cluster| cluster["id"] == "target")
+        .expect("target cluster");
+    assert_eq!(
+        target["cover"],
+        json!({
+            "face_id": "target-a",
+            "asset_id": assets[0].id,
+            "bbox": [0.1, 0.2, 0.3, 0.4]
+        })
+    );
+    assert!(target.get("cover_face_id").is_none());
+
+    let (status, rows) = app
+        .get("/api/clusters/target/assets", Some(&token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows.as_array().expect("cluster assets").len(), 3);
+    let first = rows
+        .as_array()
+        .expect("cluster assets")
+        .iter()
+        .find(|row| row["id"] == assets[0].id)
+        .expect("first asset");
+    assert!(first["filename"].is_string());
+    assert_eq!(
+        first["faces"],
+        json!([
+            {
+                "face_id": "target-a",
+                "bbox": [0.1, 0.2, 0.3, 0.4],
+                "state": "auto",
+                "similarity": 0.91
+            },
+            {
+                "face_id": "target-a-2",
+                "bbox": [0.1, 0.2, 0.3, 0.4],
+                "state": "confirmed",
+                "similarity": null
+            }
+        ])
+    );
+}
+
+#[tokio::test]
+async fn cluster_cover_is_null_when_face_is_missing_or_asset_is_trashed() {
+    let app = TestApp::new();
+    let token = app.setup().await;
+    let assets = (0..3)
+        .map(|index| {
+            AssetService::new(app.database.clone())
+                .ingest(&one_pixel_png(), &format!("missing-cover-{index}.png"), None)
+                .expect("asset should ingest")
+                .asset
+        })
+        .collect::<Vec<_>>();
+
+    app.database
+        .with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO clusters(id, name, cover_face_id, created_by, created_at)
+                 VALUES ('target', NULL, 'missing-face', 'user', '2026-01-01T00:00:00Z')",
+                [],
+            )?;
+            for (index, asset) in assets.iter().enumerate() {
+                connection.execute(
+                    "INSERT INTO faces(id, asset_id, kind, bbox, det_conf, quality_flags,
+                       embedding, model_version, cluster_id, state, similarity)
+                     VALUES (?1, ?2, 'face', '[0,0,1,1]', 0.9, '[]', ?3,
+                             'test-v1', 'target', 'auto', 0.7)",
+                    (
+                        format!("target-{index}"),
+                        &asset.id,
+                        [1.0_f32.to_le_bytes(), 0.0_f32.to_le_bytes()].concat(),
+                    ),
+                )?;
+            }
+            Ok(())
+        })
+        .expect("cluster fixture should insert");
+
+    let (status, clusters) = app.get("/api/clusters", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(clusters[0]["cover"].is_null());
+
+    app.database
+        .with_connection(|connection| {
+            connection.execute(
+                "UPDATE clusters SET cover_face_id = 'target-0' WHERE id = 'target'",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("cover should update");
+    AssetService::new(app.database.clone())
+        .trash(&assets[0].id)
+        .expect("cover asset should trash");
+
+    let (status, clusters) = app.get("/api/clusters", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(clusters[0]["cover"].is_null());
 }
 
 fn rejection_exists(database: &Database, face_id: &str, cluster_id: &str) -> bool {

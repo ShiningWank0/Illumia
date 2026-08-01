@@ -24,7 +24,10 @@ use illumia_core::{
     chrono::{DateTime, Utc},
     db::Database,
     jobs::{Job, JobQueue, JobState},
-    ml::{ClusterSummary, FaceRecord, MlService, enqueue_analyze_all, enqueue_recluster},
+    ml::{
+        ClusterAssetFace, ClusterSummary, FaceRecord, MlService, enqueue_analyze_all,
+        enqueue_recluster,
+    },
     ml_client::MlClient,
     search::SearchService,
     settings::{
@@ -90,6 +93,13 @@ impl From<Asset> for AssetResponse {
             purge_after: asset.purge_after,
         }
     }
+}
+
+#[derive(Serialize)]
+pub struct ClusterAssetResponse {
+    #[serde(flatten)]
+    asset: AssetResponse,
+    faces: Vec<ClusterAssetFace>,
 }
 
 #[derive(Serialize)]
@@ -1115,13 +1125,16 @@ pub async fn cluster_assets(
     State(state): State<AppState>,
     Path(id): Path<String>,
     access: Option<Extension<VaultAccess>>,
-) -> ApiResult<Json<Vec<AssetResponse>>> {
+) -> ApiResult<Json<Vec<ClusterAssetResponse>>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let service = ml_service(&state, selected.database.clone())?;
     let assets = selected
         .result(service.cluster_assets(&id))?
         .into_iter()
-        .map(AssetResponse::from)
+        .map(|item| ClusterAssetResponse {
+            asset: item.asset.into(),
+            faces: item.faces,
+        })
         .collect();
     Ok(Json(assets))
 }

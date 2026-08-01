@@ -389,6 +389,136 @@ async fn vault_api_full_transfer_and_visibility_flow() {
 }
 
 #[tokio::test]
+async fn vault_cluster_endpoints_mirror_cover_and_faces_dtos() {
+    let app = TestApp::new(Duration::from_secs(15 * 60));
+    let auth = app.setup().await;
+    let initialized = app
+        .request(
+            Method::POST,
+            "/api/vault/init",
+            Some(&auth),
+            None,
+            Some(json!({"password": "vault cluster password"})),
+        )
+        .await;
+    assert_eq!(initialized.status, StatusCode::CREATED);
+    let unlocked = app
+        .request(
+            Method::POST,
+            "/api/vault/unlock",
+            Some(&auth),
+            None,
+            Some(json!({"password": "vault cluster password"})),
+        )
+        .await;
+    assert_eq!(unlocked.status, StatusCode::OK);
+    let session = unlocked.json()["vault_session"]
+        .as_str()
+        .expect("vault session")
+        .to_owned();
+
+    let assets = (0..3)
+        .map(|index| {
+            AssetService::new(app.database.clone())
+                .ingest(&one_pixel_png(), &format!("vault-cluster-{index}.png"), None)
+                .expect("main asset should ingest")
+                .asset
+        })
+        .collect::<Vec<_>>();
+    let imported = app
+        .request(
+            Method::POST,
+            "/api/vault/import",
+            Some(&auth),
+            Some(&session),
+            Some(json!({
+                "asset_ids": assets.iter().map(|asset| &asset.id).collect::<Vec<_>>()
+            })),
+        )
+        .await;
+    assert_eq!(imported.status, StatusCode::NO_CONTENT);
+
+    let vault = VaultHandle::unlock(app.root(), "vault cluster password")
+        .expect("vault should open for fixture setup");
+    vault
+        .db
+        .with_connection(|connection| {
+            for id in ["target", "other"] {
+                connection.execute(
+                    "INSERT INTO clusters(id, name, cover_face_id, created_by, created_at)
+                     VALUES (?1, NULL, NULL, 'user', '2026-01-01T00:00:00Z')",
+                    [id],
+                )?;
+            }
+            for (id, asset_index, cluster_id) in [
+                ("target-a", 0, "target"),
+                ("foreign-a", 0, "other"),
+                ("target-b", 1, "target"),
+                ("target-c", 2, "target"),
+            ] {
+                connection.execute(
+                    "INSERT INTO faces(id, asset_id, kind, bbox, det_conf, quality_flags,
+                       embedding, model_version, cluster_id, state, similarity)
+                     VALUES (?1, ?2, 'face', '[0.2,0.1,0.4,0.5]', 0.9, '[]', ?3,
+                             'test-v1', ?4, 'auto', 0.75)",
+                    (
+                        id,
+                        &assets[asset_index].id,
+                        [1.0_f32.to_le_bytes(), 0.0_f32.to_le_bytes()].concat(),
+                        cluster_id,
+                    ),
+                )?;
+            }
+            connection.execute(
+                "UPDATE clusters SET cover_face_id = 'target-a' WHERE id = 'target'",
+                [],
+            )?;
+            Ok(())
+        })
+        .expect("vault cluster fixture should insert");
+
+    let clusters = app
+        .request(
+            Method::GET,
+            "/api/vault/clusters",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(clusters.status, StatusCode::OK);
+    assert_eq!(
+        clusters.json()[0]["cover"],
+        json!({
+            "face_id": "target-a",
+            "asset_id": assets[0].id,
+            "bbox": [0.2, 0.1, 0.4, 0.5]
+        })
+    );
+
+    let rows = app
+        .request(
+            Method::GET,
+            "/api/vault/clusters/target/assets",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(rows.status, StatusCode::OK);
+    let body = rows.json();
+    assert_eq!(body.as_array().expect("cluster assets").len(), 3);
+    let first = body
+        .as_array()
+        .expect("cluster assets")
+        .iter()
+        .find(|row| row["id"] == assets[0].id)
+        .expect("first asset");
+    assert_eq!(first["faces"].as_array().expect("member faces").len(), 1);
+    assert_eq!(first["faces"][0]["face_id"], "target-a");
+}
+
+#[tokio::test]
 async fn vault_session_expires_at_injected_ttl() {
     let directory = TestDirectory::new();
     let database = Database::open(&directory.path).expect("test database should open");

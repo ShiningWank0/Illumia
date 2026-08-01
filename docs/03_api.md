@@ -126,6 +126,17 @@ API response は既定で `Cache-Control: private, no-store` とし、認証済�
 | GET | /api/review/candidates | 確認キュー (candidate 状態の顔) |
 | POST | /api/review/candidates/{face_id} | `{action: "accept"\|"reject"}` |
 
+- `GET /api/clusters` は
+  `[{id, name, cover: {face_id, asset_id, bbox}|null, asset_count}]` を返す。
+  `bbox` は正規化座標 `[x, y, w, h]`。`cover_face_id` に対応する face が存在しない、
+  または対応 asset がゴミ箱内の場合は `cover` を `null` とする。
+- `GET /api/clusters/{id}/assets` は AssetResponse の各要素に
+  `faces: [{face_id, bbox, state, similarity}]` を追加して返す。`faces` には指定した
+  クラスタに属する face だけを含める。同じ asset に複数の該当 face がある場合も
+  すべて返す。
+- vault ミラーの `/api/vault/clusters` と `/api/vault/clusters/{id}/assets` も同じ
+  レスポンス形状を返す。
+
 ## ジョブ・設定
 
 | Method | Path | 内容 |

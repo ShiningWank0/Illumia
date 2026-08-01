@@ -10,8 +10,11 @@ services:
       ILLUMIA_SETUP_TOKEN: ${ILLUMIA_SETUP_TOKEN:-}
       ILLUMIA_SECURE_COOKIES: ${ILLUMIA_SECURE_COOKIES:-true}
       ILLUMIA_TRUST_PROXY_HEADERS: ${ILLUMIA_TRUST_PROXY_HEADERS:-false}
+      # ML 有効化時は認証済みの設定 API (PATCH /api/settings) で
+      # {"ml.socket_path":"/run/illumia/ml.sock"} を指定する。
     volumes:
       - illumia_data:/data
+      - illumia_sock:/run/illumia
       # TrueNAS などでホスト上のデータセットを直接使う場合は、上の named volume を
       # 次のようなバインドマウントに置き換える:
       # - /mnt/pool/illumia:/data
@@ -29,16 +32,38 @@ services:
     mem_limit: 3g
     stop_grace_period: 30s
 
-  # 将来追加予定のステートレスな ML サイドカー。
-  # docker/Dockerfile.ml が追加され、イメージが公開された後に有効化する。
-  # illumia-ml:
-  #   image: ghcr.io/shiningwank0/illumia-ml:latest
-  #   build:
-  #     context: ..
-  #     dockerfile: docker/Dockerfile.ml
-  #   restart: unless-stopped
-  #   # cpus: "4"
-  #   # mem_limit: 4g
+  illumia-ml:
+    profiles: ["ml"]
+    image: ${ILLUMIA_ML_IMAGE:-ghcr.io/shiningwank0/illumia-ml:latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ml
+    environment:
+      ILLUMIA_MODEL_DIR: /data/models
+    volumes:
+      - illumia_sock:/run/illumia
+      - illumia_data:/data:ro
+    network_mode: none
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    cpus: "4"
+    mem_limit: 4g
+    stop_grace_period: 30s
 
 volumes:
   illumia_data:
+  illumia_sock:
+    driver: local
+    driver_opts:
+      # socket は永続化不要。非 root の両コンテナが確実に共有できる tmpfs とする。
+      type: tmpfs
+      device: tmpfs
+      o: uid=1000,gid=1000,mode=0700

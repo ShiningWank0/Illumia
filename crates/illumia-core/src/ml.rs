@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    assets::{Asset, AssetService, timestamp},
+    assets::{Asset, AssetService, asset_from_row, timestamp},
     db::{Database, Error, Result},
     jobs::{Job, JobQueue},
     ml_client::{Analysis, Assignment, ClusterMode, ClusterParams, ClusterRequest, MlClient},
@@ -37,8 +37,29 @@ pub struct MlReclusterPayload {}
 pub struct ClusterSummary {
     pub id: String,
     pub name: Option<String>,
-    pub cover_face_id: Option<String>,
+    pub cover: Option<ClusterCover>,
     pub asset_count: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ClusterCover {
+    pub face_id: String,
+    pub asset_id: String,
+    pub bbox: [f64; 4],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClusterAsset {
+    pub asset: Asset,
+    pub faces: Vec<ClusterAssetFace>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ClusterAssetFace {
+    pub face_id: String,
+    pub bbox: [f64; 4],
+    pub state: String,
+    pub similarity: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -219,26 +240,62 @@ impl MlService {
         self.cluster_summaries(Some(query), true)
     }
 
-    pub fn cluster_assets(&self, cluster_id: &str) -> Result<Vec<Asset>> {
+    pub fn cluster_assets(&self, cluster_id: &str) -> Result<Vec<ClusterAsset>> {
         self.ensure_cluster(cluster_id)?;
-        let ids = self.database.with_connection(|connection| {
+        self.database.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT DISTINCT asset_id FROM faces
-                 WHERE cluster_id = ?1 AND state IN ('auto','confirmed')
-                 ORDER BY asset_id LIMIT 10000",
+                "WITH selected_assets AS (
+                   SELECT a.id, a.hash, a.original_name, a.ext, a.size, a.width, a.height,
+                          a.aspect_ratio, a.taken_at, a.taken_at_local_date, a.uploaded_at,
+                          a.thumbhash, a.in_timeline, a.visible_in_timeline, a.lifecycle,
+                          a.duplicate_of, a.trashed_at, a.purge_after, a.library_path
+                   FROM assets a
+                   WHERE a.lifecycle != 'purging'
+                     AND EXISTS (
+                       SELECT 1 FROM faces member
+                       WHERE member.asset_id = a.id AND member.cluster_id = ?1
+                         AND member.state IN ('auto','confirmed')
+                     )
+                   ORDER BY a.id LIMIT 10000
+                 )
+                 SELECT a.id, a.hash, a.original_name, a.ext, a.size, a.width, a.height,
+                        a.aspect_ratio, a.taken_at, a.taken_at_local_date, a.uploaded_at,
+                        a.thumbhash, a.in_timeline, a.visible_in_timeline, a.lifecycle,
+                        a.duplicate_of, a.trashed_at, a.purge_after, a.library_path,
+                        f.id, f.bbox, f.state, f.similarity
+                 FROM selected_assets a
+                 JOIN faces f ON f.asset_id = a.id AND f.cluster_id = ?1
+                 ORDER BY a.id, f.id",
             )?;
-            Ok(statement
-                .query_map([cluster_id], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?)
-        })?;
-        let assets = AssetService::new(self.database.clone());
-        ids.into_iter()
-            .filter_map(|id| match assets.get(&id) {
-                Ok(Some(asset)) => Some(Ok(asset)),
-                Ok(None) => None,
-                Err(error) => Some(Err(error)),
-            })
-            .collect()
+            let rows = statement.query_map([cluster_id], |row| {
+                let bbox: String = row.get(20)?;
+                Ok((
+                    asset_from_row(row, 0)?,
+                    ClusterAssetFace {
+                        face_id: row.get(19)?,
+                        bbox: bbox_from_json(&bbox, 20)?,
+                        state: row.get(21)?,
+                        similarity: row.get(22)?,
+                    },
+                ))
+            })?;
+            let mut output: Vec<ClusterAsset> = Vec::new();
+            for row in rows {
+                let (asset, face) = row?;
+                if let Some(existing) = output
+                    .last_mut()
+                    .filter(|existing| existing.asset.id == asset.id)
+                {
+                    existing.faces.push(face);
+                } else {
+                    output.push(ClusterAsset {
+                        asset,
+                        faces: vec![face],
+                    });
+                }
+            }
+            Ok(output)
+        })
     }
 
     pub fn rename_cluster(&self, cluster_id: &str, name: &str) -> Result<ClusterSummary> {
@@ -707,9 +764,14 @@ impl MlService {
         self.database.with_connection(|connection| {
             connection
                 .query_row(
-                    "SELECT c.id, c.name, c.cover_face_id, COUNT(DISTINCT f.asset_id)
+                    "SELECT c.id, c.name, cover_face.id, cover_asset.id, cover_face.bbox,
+                            COUNT(DISTINCT f.asset_id)
                      FROM clusters c LEFT JOIN faces f ON f.cluster_id = c.id
                        AND f.state IN ('auto','confirmed')
+                     LEFT JOIN faces cover_face ON cover_face.id = c.cover_face_id
+                       AND cover_face.cluster_id = c.id
+                     LEFT JOIN assets cover_asset ON cover_asset.id = cover_face.asset_id
+                       AND cover_asset.lifecycle IN ('active','duplicate')
                      WHERE c.id = ?1 GROUP BY c.id",
                     [cluster_id],
                     cluster_summary_from_row,
@@ -732,9 +794,14 @@ impl MlService {
         self.database.with_connection(|connection| {
             let mut output = Vec::new();
             let mut statement = connection.prepare(
-                "SELECT c.id, c.name, c.cover_face_id, COUNT(DISTINCT f.asset_id) AS asset_count
+                "SELECT c.id, c.name, cover_face.id, cover_asset.id, cover_face.bbox,
+                        COUNT(DISTINCT f.asset_id) AS asset_count
                  FROM clusters c LEFT JOIN faces f ON f.cluster_id = c.id
                    AND f.state IN ('auto','confirmed')
+                 LEFT JOIN faces cover_face ON cover_face.id = c.cover_face_id
+                   AND cover_face.cluster_id = c.id
+                 LEFT JOIN assets cover_asset ON cover_asset.id = cover_face.asset_id
+                   AND cover_asset.lifecycle IN ('active','duplicate')
                  WHERE (?1 IS NULL OR c.name IS NOT NULL)
                    AND (?1 IS NULL OR c.id IN (
                      SELECT entity_id FROM search_fts
@@ -933,12 +1000,33 @@ fn face_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FaceRecord> {
     })
 }
 
+fn bbox_from_json(value: &str, column: usize) -> rusqlite::Result<[f64; 4]> {
+    serde_json::from_str(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
 fn cluster_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClusterSummary> {
-    let count: i64 = row.get(3)?;
+    let cover_asset_id = row.get::<_, Option<String>>(3)?;
+    let cover = if let Some(asset_id) = cover_asset_id {
+        let bbox: String = row.get(4)?;
+        Some(ClusterCover {
+            face_id: row.get(2)?,
+            asset_id,
+            bbox: bbox_from_json(&bbox, 4)?,
+        })
+    } else {
+        None
+    };
+    let count: i64 = row.get(5)?;
     Ok(ClusterSummary {
         id: row.get(0)?,
         name: row.get(1)?,
-        cover_face_id: row.get(2)?,
+        cover,
         asset_count: u64::try_from(count).unwrap_or(0),
     })
 }

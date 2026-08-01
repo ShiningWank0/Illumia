@@ -12,8 +12,8 @@ Illumia のサーバーと Web UI を1つのコンテナで実行します。コ
 `127.0.0.1:2283` だけです。Web UI も同じポートから配信し、永続データはすべて
 コンテナ内の `/data` に保存します。
 
-現時点の Compose 構成では `illumia-server` のみを起動します。設計上の
-`illumia-ml` サイドカーは将来追加予定です。
+既定では `illumia-server` のみを起動します。`illumia-ml` サイドカーはモデル未配置時も
+mock で動作しますが、リソース節約のため `ml` profile による opt-in です。
 
 ## Docker Compose で起動する
 
@@ -43,6 +43,34 @@ docker compose --env-file docker/.env -f docker/compose.yaml down
 
 `down -v` は永続データの volume も削除するため、データを失ってよい場合を除いて
 実行しないでください。
+
+## ML サイドカーを有効にする
+
+ML サイドカーを含めて pull・起動する場合は `ml` profile を指定します。
+
+```sh
+docker compose --env-file docker/.env -f docker/compose.yaml --profile ml pull
+docker compose --env-file docker/.env -f docker/compose.yaml --profile ml up -d
+```
+
+モデルバンドルは `illumia_data` named volume 内の `models/`、コンテナから見て
+`/data/models/<bundle_name>/` に配置します。サイドカーからは読み取り専用でマウントされ、
+探索先は `ILLUMIA_MODEL_DIR=/data/models` です。必要なファイル構成と checksum の要件は
+[モデル要件](../docs/13_model_requirements.md) を参照してください。
+
+起動後、認証済み device token を用いて設定 API に共有 UDS のパスを登録します。
+`ILLUMIA_DEVICE_TOKEN` は `POST /api/auth/login` で取得した token を設定してください。
+
+```sh
+curl --fail-with-body -X PATCH http://127.0.0.1:2283/api/settings \
+  -H "Authorization: Bearer ${ILLUMIA_DEVICE_TOKEN}" \
+  -H "Content-Type: application/json" \
+  --data '{"ml.socket_path":"/run/illumia/ml.sock","ml.enabled":true}'
+```
+
+`illumia-server` と `illumia-ml` は `illumia_sock` named volume 上の Unix domain socket
+だけで通信します。ML コンテナは `network_mode: none` のため TCP/IP ネットワークへ
+接続しません。モデル未配置時は mock バックエンドへフォールバックします。
 
 ## 初回セットアップ
 
