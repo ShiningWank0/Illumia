@@ -5,14 +5,25 @@ description = "Illumia ML sidecar (ステートレス推論ワーカー → docs
 readme = "README.md"
 # anime_character_recognize (dghs-imgutils) が Python 3.14 未対応のため 3.12 固定
 requires-python = ">=3.12,<3.13"
-dependencies = []
-# M4 で追加予定: fastapi, uvicorn, onnxruntime, anime_character_recognize (git 依存 pin)
+dependencies = [
+    "fastapi>=0.115",
+    "msgpack>=1.1",
+    "numpy>=2.1",
+    "onnxruntime>=1.20",
+    "pillow>=11",
+    "pyyaml>=6.0",
+    "uvicorn>=0.34",
+]
 
 [dependency-groups]
 dev = [
+    "httpx>=0.28",
     "ruff>=0.8",
     "pytest>=8",
 ]
+
+[project.scripts]
+illumia-ml = "illumia_ml.cli:main"
 
 [build-system]
 requires = ["hatchling"]

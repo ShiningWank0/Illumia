@@ -1,3 +1,3 @@
-"""illumia-ml: ステートレス ML サイドカー (→ docs/07_ml_integration.md)。M4 で実装。"""
+"""Stateless Illumia ML sidecar (see docs/07_ml_integration.md)."""
 
 __version__ = "0.1.0"
