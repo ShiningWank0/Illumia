@@ -62,7 +62,8 @@
 - 用途 2 種を `mode` で分ける:
   - `full`: 全埋め込みからクラスタ構築 (初回・再クラスタリング)
   - `assign`: 新規埋め込みを既存クラスタ代表 (medoid) と照合して割り当て
-- リクエスト (msgpack): `{mode, params: {tau_high?, tau_low?, min_cluster_size?},
+- リクエスト (JSON。サイドカーは msgpack も受けるが、**Rust クライアントは JSON モードを正**とする
+  — 依存を増やさないため。2026-08 実装で確定): `{mode, params: {tau_high?, tau_low?, min_cluster_size?},
   embeddings: <f32 LE bytes>, shape: [n, dim], ids: [...],
   medoids?: {cluster_id: <f32 LE bytes>}, rejections?: [[id, cluster_id], ...]}`
 - レスポンス: `{assignments: [{id, cluster: "c3"|null, state: "auto"|"candidate"|"unassigned",
@@ -104,6 +105,12 @@
 | ml.quality_gate | 'review_only' / 'strict' | review_only |
 | jobs.ml_concurrency | 解析ジョブ並列度 | 1 |
 | ml.enabled | ML 機能の全体 ON/OFF (all-in-one で無効化可) | true |
+| ml.socket_path | サイドカーの unix socket パス。未設定なら ML 無効 | NULL |
+
+補足 (2026-08 実装で確定): サイドカーのプロセス管理は Rust 側では行わない
+(Docker では別コンテナ + healthcheck、デスクトップ all-in-one では子プロセス起動を
+デスクトップ側が担う)。`ml.enabled` かつ `ml.socket_path` 設定時のみ
+ML ジョブハンドラが登録される。
 
 ## テスト要件
 
