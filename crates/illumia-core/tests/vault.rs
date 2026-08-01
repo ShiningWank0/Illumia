@@ -114,6 +114,15 @@ fn blob_roundtrip_and_aead_tamper_and_aad_checks() -> Result<()> {
     }
     let first = fixture.vault.write_blob(&bytes)?;
     assert_eq!(fixture.vault.read_blob(&first)?, bytes);
+    let chunks = fixture
+        .vault
+        .blob_reader(&first)?
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        chunks.iter().map(Vec::len).collect::<Vec<_>>(),
+        [1024 * 1024, 1024 * 1024, 31]
+    );
+    assert_eq!(chunks.concat(), bytes);
 
     let path = fixture.root().join("vault").join("blobs").join(&first);
     let mut encrypted = fs::read(&path)?;

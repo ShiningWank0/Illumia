@@ -5,7 +5,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
 };
 
@@ -124,6 +124,21 @@ pub struct VaultHandle {
     pub key: VaultKey,
 }
 
+/// 1 chunk ずつ AEAD 検証して返す Vault blob reader。
+///
+/// `vault: no-log`
+pub struct VaultBlobReader {
+    file: fs::File,
+    blob_id: String,
+    file_key: Zeroizing<[u8; KEY_LEN]>,
+    header: [u8; BLOB_HEADER_LEN],
+    nonce_prefix: [u8; NONCE_PREFIX_LEN],
+    encrypted_remaining: u64,
+    plaintext_total: usize,
+    index: usize,
+    finished: bool,
+}
+
 impl VaultHandle {
     /// unlock 済み鍵で vault DB を開く。
     ///
@@ -157,10 +172,11 @@ impl VaultHandle {
         self.write_blob_for(bytes, BlobKind::Standalone, None)
     }
 
-    /// blob 全体をメモリへ復号する。
+    /// blob を逐次復号する reader を開く。
     ///
     /// `vault: no-log`
-    pub fn read_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
+    pub fn blob_reader(&self, blob_id: &str) -> Result<VaultBlobReader> {
+        let path = self.blob_path(blob_id)?;
         let (wrapped_key, kind, asset_id) = self.db.with_connection(|connection| {
             connection
                 .query_row(
@@ -180,12 +196,55 @@ impl VaultHandle {
         })?;
         let aad = blob_key_aad(blob_id, &kind, asset_id.as_deref());
         let file_key = Zeroizing::new(unwrap_bytes(&self.key.master_key, &wrapped_key, &aad)?);
-        let path = self.blob_path(blob_id)?;
-        if fs::metadata(&path)?.len() > MAX_ENCRYPTED_BLOB_BYTES {
+        let mut file = fs::File::open(path)?;
+        let encrypted_len = file.metadata()?.len();
+        let minimum_len =
+            u64::try_from(BLOB_HEADER_LEN + 5 + TAG_LEN).map_err(|_| Error::InvalidVaultBlob)?;
+        if !(minimum_len..=MAX_ENCRYPTED_BLOB_BYTES).contains(&encrypted_len) {
             return Err(Error::InvalidVaultBlob);
         }
-        let encrypted = fs::read(path)?;
-        decrypt_blob(blob_id, &file_key, &encrypted)
+
+        let mut header = [0_u8; BLOB_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|_| Error::InvalidVaultBlob)?;
+        if &header[..MAGIC.len()] != MAGIC {
+            return Err(Error::InvalidVaultBlob);
+        }
+        let mut nonce_prefix = [0_u8; NONCE_PREFIX_LEN];
+        nonce_prefix.copy_from_slice(&header[MAGIC.len()..MAGIC.len() + NONCE_PREFIX_LEN]);
+        let chunk_size = u32::from_be_bytes(
+            header[MAGIC.len() + NONCE_PREFIX_LEN..]
+                .try_into()
+                .map_err(|_| Error::InvalidVaultBlob)?,
+        );
+        if usize::try_from(chunk_size).map_err(|_| Error::InvalidVaultBlob)? != CHUNK_SIZE {
+            return Err(Error::InvalidVaultBlob);
+        }
+
+        Ok(VaultBlobReader {
+            file,
+            blob_id: blob_id.to_owned(),
+            file_key,
+            header,
+            nonce_prefix,
+            encrypted_remaining: encrypted_len
+                .checked_sub(u64::try_from(BLOB_HEADER_LEN).map_err(|_| Error::InvalidVaultBlob)?)
+                .ok_or(Error::InvalidVaultBlob)?,
+            plaintext_total: 0,
+            index: 0,
+            finished: false,
+        })
+    }
+
+    /// 内部処理向けに blob 全体をメモリへ復号する。
+    ///
+    /// `vault: no-log`
+    pub fn read_blob(&self, blob_id: &str) -> Result<Vec<u8>> {
+        let mut plaintext = Vec::new();
+        for chunk in self.blob_reader(blob_id)? {
+            plaintext.extend_from_slice(&chunk?);
+        }
+        Ok(plaintext)
     }
 
     /// Vault 内原本から 240px/1440px WebP をメモリ内生成して暗号化保存する。
@@ -270,6 +329,82 @@ impl VaultHandle {
             .join("vault")
             .join("blobs")
             .join(blob_id))
+    }
+}
+
+impl VaultBlobReader {
+    fn read_chunk(&mut self) -> Result<Vec<u8>> {
+        if self.encrypted_remaining < 5 {
+            return Err(Error::InvalidVaultBlob);
+        }
+        let mut record_header = [0_u8; 5];
+        self.file
+            .read_exact(&mut record_header)
+            .map_err(|_| Error::InvalidVaultBlob)?;
+        self.encrypted_remaining -= 5;
+
+        let final_chunk = match record_header[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(Error::InvalidVaultBlob),
+        };
+        let ciphertext_len = usize::try_from(u32::from_be_bytes(
+            record_header[1..]
+                .try_into()
+                .map_err(|_| Error::InvalidVaultBlob)?,
+        ))
+        .map_err(|_| Error::InvalidVaultBlob)?;
+        if !(TAG_LEN..=CHUNK_SIZE + TAG_LEN).contains(&ciphertext_len)
+            || u64::try_from(ciphertext_len).map_err(|_| Error::InvalidVaultBlob)?
+                > self.encrypted_remaining
+        {
+            return Err(Error::InvalidVaultBlob);
+        }
+
+        let mut ciphertext = vec![0_u8; ciphertext_len];
+        self.file
+            .read_exact(&mut ciphertext)
+            .map_err(|_| Error::InvalidVaultBlob)?;
+        self.encrypted_remaining -=
+            u64::try_from(ciphertext_len).map_err(|_| Error::InvalidVaultBlob)?;
+        let nonce = chunk_nonce(&self.nonce_prefix, self.index)?;
+        let aad = chunk_aad(&self.blob_id, &self.header, self.index, final_chunk)?;
+        let plaintext = aead_decrypt(&self.file_key, &nonce, &ciphertext, &aad)
+            .map_err(|_| Error::InvalidVaultBlob)?;
+        if (!final_chunk && plaintext.len() != CHUNK_SIZE)
+            || (final_chunk && self.encrypted_remaining != 0)
+        {
+            return Err(Error::InvalidVaultBlob);
+        }
+        self.plaintext_total = self
+            .plaintext_total
+            .checked_add(plaintext.len())
+            .ok_or(Error::InvalidVaultBlob)?;
+        if self.plaintext_total > images::MAX_ASSET_BYTES {
+            return Err(Error::InvalidVaultBlob);
+        }
+
+        if final_chunk {
+            self.finished = true;
+        } else {
+            self.index = self.index.checked_add(1).ok_or(Error::InvalidVaultBlob)?;
+        }
+        Ok(plaintext)
+    }
+}
+
+impl Iterator for VaultBlobReader {
+    type Item = Result<Vec<u8>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let result = self.read_chunk();
+        if result.is_err() {
+            self.finished = true;
+        }
+        Some(result)
     }
 }
 
@@ -1549,6 +1684,7 @@ fn encrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<
     Ok(output)
 }
 
+#[cfg(test)]
 fn decrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], encrypted: &[u8]) -> Result<Vec<u8>> {
     if encrypted.len() < BLOB_HEADER_LEN
         || u64::try_from(encrypted.len()).map_err(|_| Error::InvalidVaultBlob)?

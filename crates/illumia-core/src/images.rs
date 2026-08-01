@@ -1,6 +1,10 @@
 //! Resource-bounded decoding for untrusted uploaded images.
 
-use std::{io::Cursor, path::Path};
+use std::{
+    io::Cursor,
+    path::Path,
+    sync::{Condvar, LazyLock, Mutex},
+};
 
 use image::{DynamicImage, ImageFormat, ImageReader, Limits};
 
@@ -10,8 +14,54 @@ pub const MAX_ASSET_BYTES: usize = 128 * 1024 * 1024;
 pub const MAX_IMAGE_DIMENSION: u32 = 32_768;
 pub const MAX_IMAGE_PIXELS: u64 = 100_000_000;
 pub const MAX_DECODE_ALLOCATION: u64 = 512 * 1024 * 1024;
+pub const MAX_CONCURRENT_IMAGE_DECODES: usize = 2;
 pub const MAX_ORIGINAL_NAME_BYTES: usize = 1024;
 pub const MAX_ORIGINAL_NAME_CHARS: usize = 255;
+
+static DECODE_LIMITER: LazyLock<DecodeLimiter> = LazyLock::new(DecodeLimiter::new);
+
+struct DecodeLimiter {
+    active: Mutex<usize>,
+    available: Condvar,
+}
+
+struct DecodePermit(&'static DecodeLimiter);
+
+impl DecodeLimiter {
+    const fn new() -> Self {
+        Self {
+            active: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&'static self) -> DecodePermit {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        while *active >= MAX_CONCURRENT_IMAGE_DECODES {
+            active = self
+                .available
+                .wait(active)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+        *active += 1;
+        DecodePermit(self)
+    }
+}
+
+impl Drop for DecodePermit {
+    fn drop(&mut self) {
+        let mut active = self
+            .0
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *active = active.saturating_sub(1);
+        self.0.available.notify_one();
+    }
+}
 
 /// Returns the canonical extension after validating metadata that can later be
 /// surfaced in HTTP headers and the UI.
@@ -35,6 +85,7 @@ pub fn normalized_extension(original_name: &str) -> Result<String> {
 /// reaching another decoder through content sniffing. Dimensions are inspected
 /// before the full pixel buffer is allocated.
 pub fn decode(bytes: &[u8], extension: &str) -> Result<DynamicImage> {
+    let _permit = DECODE_LIMITER.acquire();
     if bytes.is_empty() {
         return Err(Error::InvalidImage("image is empty".to_owned()));
     }

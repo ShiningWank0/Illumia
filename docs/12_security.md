@@ -84,6 +84,9 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
   private browser cache を許可し、共有 proxy cache には保存させない。
 - API body・配列・文字列・画像 dimension/decode allocation・検索結果・WS connection/frame に
   固定上限を設ける。上限超過は処理・allocation 前に 400/413/429 で拒否する。
+- 画像 decoder の同時実行数は job worker 数とは独立した process-wide 上限で制御する。
+  Vault の暗号化 blob は固定長 channel でチャンク復号し、同時配信数を制限することで、
+  大容量画像や slow client を組み合わせても平文全体や無制限の先読みを memory に保持しない。
 - user value は SQL bind parameter で渡す。LIKE wildcard は escape し、動的識別子は
   allowlist からのみ選ぶ。filesystem path は UUID と allowlist extension から生成し、
   DB 由来 relative path も component 単位で検証する。

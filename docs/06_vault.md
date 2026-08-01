@@ -33,6 +33,9 @@ vault.keyfile: XChaCha20-Poly1305_wrap(KEK, MK)   # MK = 初期化時に CSPRNG 
 
 - 方式: XChaCha20-Poly1305 の **チャンク AEAD (secretstream 方式)**。チャンク 1MiB。
   大きな画像でも全読み込みせずストリーム復号できる。
+- HTTP での原本・サムネ・プレビュー配信も 1MiB チャンク単位で復号し、平文全体を
+  response 用 `Vec` に載せない。producer と response 間は固定長 channel とし、slow
+  client / 切断時に未制限の平文を先読みしない。同時 Vault 配信数にも固定上限を設ける。
 - blob ファイル: `vault/blobs/<uuid>` (拡張子なし・ランダム名)。
   ヘッダ: magic `ILMV1` + nonce prefix + chunk size。AAD に blob uuid を入れる
   (ファイル差し替え検知)。
