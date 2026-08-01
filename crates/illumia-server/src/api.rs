@@ -24,6 +24,8 @@ use illumia_core::{
     chrono::{DateTime, Utc},
     db::Database,
     jobs::{Job, JobQueue, JobState},
+    ml::{ClusterSummary, FaceRecord, MlService, enqueue_analyze_all, enqueue_recluster},
+    ml_client::MlClient,
     search::SearchService,
     settings::{
         MAX_CLUSTER_SIZE_VALUE, MAX_JOB_CONCURRENCY, MAX_RETENTION_DAYS, MIN_CLUSTER_SIZE_VALUE,
@@ -183,7 +185,41 @@ pub struct SearchQuery {
 pub struct SearchResponse {
     assets: Vec<AssetResponse>,
     stacks: Vec<StackSummaryResponse>,
-    clusters: Vec<Value>,
+    clusters: Vec<ClusterSummary>,
+}
+
+#[derive(Deserialize)]
+pub struct RenameClusterRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
+pub struct MergeClustersRequest {
+    from_id: String,
+    into_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct SplitClusterRequest {
+    face_ids: Vec<String>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReviewAction {
+    Accept,
+    Reject,
+}
+
+#[derive(Deserialize)]
+pub struct ReviewCandidateRequest {
+    action: ReviewAction,
+}
+
+#[derive(Serialize)]
+pub struct ReviewCandidateResponse {
+    face: FaceRecord,
+    asset: AssetResponse,
 }
 
 #[derive(Deserialize)]
@@ -1037,8 +1073,166 @@ pub async fn search(
     Ok(Json(SearchResponse {
         assets,
         stacks,
-        clusters: Vec::new(),
+        clusters: result.clusters,
     }))
+}
+
+pub async fn ml_status(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    let settings = Settings::new(state.database);
+    let enabled = settings.ml_enabled()?;
+    let sidecar = if enabled {
+        settings
+            .ml_socket_path()?
+            .and_then(|path| MlClient::new(path).health().ok())
+    } else {
+        None
+    };
+    Ok(Json(json!({"enabled": enabled, "sidecar": sidecar})))
+}
+
+pub async fn analyze_all(State(state): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
+    require_ml_configured(&state)?;
+    let jobs = enqueue_analyze_all(&state.database)?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"enqueued": jobs.len()}))))
+}
+
+pub async fn recluster(State(state): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
+    require_ml_configured(&state)?;
+    let job = enqueue_recluster(&state.database)?;
+    Ok((StatusCode::ACCEPTED, Json(json!({"job_id": job.id}))))
+}
+
+pub async fn list_clusters(
+    State(state): State<AppState>,
+    access: Option<Extension<VaultAccess>>,
+) -> ApiResult<Json<Vec<ClusterSummary>>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let service = ml_service(&state, selected.database.clone())?;
+    Ok(Json(selected.result(service.list_clusters())?))
+}
+
+pub async fn cluster_assets(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
+) -> ApiResult<Json<Vec<AssetResponse>>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let service = ml_service(&state, selected.database.clone())?;
+    let assets = selected
+        .result(service.cluster_assets(&id))?
+        .into_iter()
+        .map(AssetResponse::from)
+        .collect();
+    Ok(Json(assets))
+}
+
+pub async fn rename_cluster(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
+    Json(request): Json<RenameClusterRequest>,
+) -> ApiResult<Json<ClusterSummary>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let service = ml_service(&state, selected.database.clone())?;
+    Ok(Json(
+        selected.result(service.rename_cluster(&id, &request.name))?,
+    ))
+}
+
+pub async fn merge_clusters(
+    State(state): State<AppState>,
+    access: Option<Extension<VaultAccess>>,
+    Json(request): Json<MergeClustersRequest>,
+) -> ApiResult<Json<ClusterSummary>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let service = ml_service(&state, selected.database.clone())?;
+    Ok(Json(selected.result(
+        service.merge_clusters(&request.from_id, &request.into_id),
+    )?))
+}
+
+pub async fn split_cluster(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
+    Json(request): Json<SplitClusterRequest>,
+) -> ApiResult<(StatusCode, Json<ClusterSummary>)> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let service = ml_service(&state, selected.database.clone())?;
+    let cluster = selected.result(service.split_cluster(&id, &request.face_ids))?;
+    Ok((StatusCode::CREATED, Json(cluster)))
+}
+
+pub async fn review_candidates(
+    State(state): State<AppState>,
+    access: Option<Extension<VaultAccess>>,
+) -> ApiResult<Json<Vec<ReviewCandidateResponse>>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let service = ml_service(&state, selected.database.clone())?;
+    let candidates = selected
+        .result(service.review_candidates())?
+        .into_iter()
+        .map(|candidate| ReviewCandidateResponse {
+            face: candidate.face,
+            asset: candidate.asset.into(),
+        })
+        .collect();
+    Ok(Json(candidates))
+}
+
+pub async fn review_candidate(
+    State(state): State<AppState>,
+    Path(face_id): Path<String>,
+    access: Option<Extension<VaultAccess>>,
+    Json(request): Json<ReviewCandidateRequest>,
+) -> ApiResult<Json<FaceRecord>> {
+    let selected = SelectedDatabase::from_request(&state, access);
+    let service = ml_service(&state, selected.database.clone())?;
+    let accept = matches!(request.action, ReviewAction::Accept);
+    Ok(Json(
+        selected.result(service.review_candidate(&face_id, accept))?,
+    ))
+}
+
+/// Runs vault inference only while the request holds a valid unlock session.
+///
+/// `vault: no-log`
+pub async fn vault_analyze_all(
+    State(state): State<AppState>,
+    Extension(access): Extension<VaultAccess>,
+) -> ApiResult<Json<Value>> {
+    let socket_path = require_ml_configured(&state)?;
+    let handle = access.handle;
+    let analyzed = tokio::task::spawn_blocking(move || -> illumia_core::db::Result<usize> {
+        let ids = handle.db.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, library_path FROM assets a
+                 WHERE lifecycle IN ('active','duplicate')
+                   AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.asset_id = a.id)
+                 ORDER BY id LIMIT 10000",
+            )?;
+            Ok(statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?)
+        })?;
+        let service = MlService::new(handle.db.clone(), MlClient::new(socket_path));
+        let mut count = 0;
+        for (asset_id, blob_id) in ids {
+            let bytes = handle.read_blob(&blob_id)?;
+            service.analyze_bytes(&asset_id, &bytes)?;
+            count += 1;
+        }
+        if count != 0 {
+            service.recluster()?;
+        }
+        Ok(count)
+    })
+    .await
+    .map_err(|_| ApiError::internal_silent())?
+    .map_err(|_| ApiError::internal_silent())?;
+    Ok(Json(json!({"analyzed": analyzed})))
 }
 
 pub async fn jobs(
@@ -1351,6 +1545,8 @@ enum SettingChange {
     TauLow(f64),
     MinClusterSize(u32),
     QualityGate(QualityGate),
+    MlEnabled(bool),
+    MlSocketPath(String),
 }
 
 fn validate_settings_patch(patch: &Map<String, Value>) -> ApiResult<Vec<SettingChange>> {
@@ -1393,6 +1589,15 @@ fn validate_settings_patch(patch: &Map<String, Value>) -> ApiResult<Vec<SettingC
                     "ml.quality_gate must be review_only or strict",
                 )),
             },
+            "ml.enabled" => value
+                .as_bool()
+                .map(SettingChange::MlEnabled)
+                .ok_or_else(|| ApiError::bad_request("ml.enabled must be a boolean")),
+            "ml.socket_path" => value
+                .as_str()
+                .filter(|path| !path.is_empty() && path.len() <= 4096 && !path.contains('\0'))
+                .map(|path| SettingChange::MlSocketPath(path.to_owned()))
+                .ok_or_else(|| ApiError::bad_request("ml.socket_path must be a non-empty path")),
             _ => Err(ApiError::bad_request(format!(
                 "unsupported setting key: {key}"
             ))),
@@ -1435,6 +1640,8 @@ fn apply_settings_patch(settings: &Settings, changes: Vec<SettingChange>) -> Api
             SettingChange::TauLow(value) => settings.set_tau_low_override(value)?,
             SettingChange::MinClusterSize(value) => settings.set_min_cluster_size(value)?,
             SettingChange::QualityGate(value) => settings.set_quality_gate(value)?,
+            SettingChange::MlEnabled(value) => settings.set_ml_enabled(value)?,
+            SettingChange::MlSocketPath(value) => settings.set_ml_socket_path(&value)?,
         }
     }
     Ok(())
@@ -1449,8 +1656,27 @@ fn settings_json(settings: &Settings) -> ApiResult<Value> {
         "ml.tau_high_override": settings.tau_high_override()?,
         "ml.tau_low_override": settings.tau_low_override()?,
         "ml.min_cluster_size": settings.min_cluster_size()?,
-        "ml.quality_gate": settings.quality_gate()?.map(quality_gate_name),
+        "ml.quality_gate": quality_gate_name(settings.quality_gate()?),
+        "ml.enabled": settings.ml_enabled()?,
+        "ml.socket_path": settings.ml_socket_path()?,
     }))
+}
+
+fn require_ml_configured(state: &AppState) -> ApiResult<PathBuf> {
+    let settings = Settings::new(state.database.clone());
+    if !settings.ml_enabled()? {
+        return Err(ApiError::bad_request("ML is disabled"));
+    }
+    settings
+        .ml_socket_path()?
+        .ok_or_else(|| ApiError::bad_request("ml.socket_path is not configured"))
+}
+
+fn ml_service(state: &AppState, database: Database) -> ApiResult<MlService> {
+    let path = Settings::new(state.database.clone())
+        .ml_socket_path()?
+        .unwrap_or_else(|| PathBuf::from("/dev/null"));
+    Ok(MlService::new(database, MlClient::new(path)))
 }
 
 fn value_u32(key: &str, value: &Value) -> ApiResult<u32> {

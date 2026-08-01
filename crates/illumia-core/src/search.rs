@@ -3,6 +3,7 @@
 use crate::{
     assets::{Asset, AssetService},
     db::{Database, Error, Result},
+    ml::{ClusterSummary, search_named_clusters},
     stacks::{MAX_SEARCH_BYTES, MAX_SEARCH_CHARS, StackService, StackSummary},
 };
 
@@ -12,6 +13,7 @@ const MAX_ASSET_RESULTS: usize = 200;
 pub struct SearchResult {
     pub assets: Vec<Asset>,
     pub stacks: Vec<StackSummary>,
+    pub clusters: Vec<ClusterSummary>,
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +33,7 @@ impl SearchService {
             return Ok(SearchResult {
                 assets: Vec::new(),
                 stacks: Vec::new(),
+                clusters: Vec::new(),
             });
         }
         if query.len() > MAX_SEARCH_BYTES || query.chars().count() > MAX_SEARCH_CHARS {
@@ -49,7 +52,12 @@ impl SearchService {
             assets
         };
         let stacks = StackService::new(self.database.clone()).search(query)?;
-        Ok(SearchResult { assets, stacks })
+        let clusters = search_named_clusters(&self.database, query)?;
+        Ok(SearchResult {
+            assets,
+            stacks,
+            clusters,
+        })
     }
 
     fn asset_ids(&self, query: &str) -> Result<Vec<String>> {

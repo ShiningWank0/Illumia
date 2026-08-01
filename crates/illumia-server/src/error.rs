@@ -100,6 +100,8 @@ impl From<illumia_core::db::Error> for ApiError {
             illumia_core::db::Error::StackChapterNotFound => {
                 Self::not_found("stack chapter not found")
             }
+            illumia_core::db::Error::FaceNotFound => Self::not_found("face not found"),
+            illumia_core::db::Error::ClusterNotFound => Self::not_found("cluster not found"),
             illumia_core::db::Error::InvalidBucketKey
             | illumia_core::db::Error::InvalidStack(_)
             | illumia_core::db::Error::InvalidSearch
@@ -108,6 +110,7 @@ impl From<illumia_core::db::Error> for ApiError {
             | illumia_core::db::Error::InvalidSetting(_)
             | illumia_core::db::Error::InvalidJobProgress
             | illumia_core::db::Error::InvalidJobState(_) => Self::bad_request(error.to_string()),
+            illumia_core::db::Error::InvalidMl(_) => Self::bad_request(error.to_string()),
             _ => Self::internal(error),
         }
     }

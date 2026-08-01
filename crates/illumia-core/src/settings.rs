@@ -1,6 +1,6 @@
 //! `settings` テーブルの型付きアクセス。
 
-use std::str::FromStr;
+use std::{path::PathBuf, str::FromStr};
 
 use rusqlite::{OptionalExtension, params};
 
@@ -14,6 +14,8 @@ const TAU_HIGH_OVERRIDE: &str = "ml.tau_high_override";
 const TAU_LOW_OVERRIDE: &str = "ml.tau_low_override";
 const MIN_CLUSTER_SIZE: &str = "ml.min_cluster_size";
 const QUALITY_GATE: &str = "ml.quality_gate";
+const ML_ENABLED: &str = "ml.enabled";
+const ML_SOCKET_PATH: &str = "ml.socket_path";
 
 pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub const MAX_RETENTION_DAYS: u32 = 36_500;
@@ -21,6 +23,8 @@ pub const MIN_JOB_CONCURRENCY: u32 = 1;
 pub const MAX_JOB_CONCURRENCY: u32 = 64;
 pub const MIN_CLUSTER_SIZE_VALUE: u32 = 2;
 pub const MAX_CLUSTER_SIZE_VALUE: u32 = 100_000;
+pub const DEFAULT_ML_CONCURRENCY: u32 = 1;
+pub const DEFAULT_MIN_CLUSTER_SIZE: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QualityGate {
@@ -111,17 +115,13 @@ impl Settings {
         self.set_u32(THUMBNAIL_CONCURRENCY, value)
     }
 
-    pub fn ml_concurrency(&self) -> Result<Option<u32>> {
-        self.get_optional(ML_CONCURRENCY)?
-            .map(|value| {
-                bounded_u32(
-                    ML_CONCURRENCY,
-                    value,
-                    MIN_JOB_CONCURRENCY,
-                    MAX_JOB_CONCURRENCY,
-                )
-            })
-            .transpose()
+    pub fn ml_concurrency(&self) -> Result<u32> {
+        bounded_u32(
+            ML_CONCURRENCY,
+            self.get_u32(ML_CONCURRENCY, DEFAULT_ML_CONCURRENCY)?,
+            MIN_JOB_CONCURRENCY,
+            MAX_JOB_CONCURRENCY,
+        )
     }
 
     pub fn set_ml_concurrency(&self, value: u32) -> Result<()> {
@@ -156,17 +156,13 @@ impl Settings {
         self.set(TAU_LOW_OVERRIDE, &value.to_string())
     }
 
-    pub fn min_cluster_size(&self) -> Result<Option<u32>> {
-        self.get_optional(MIN_CLUSTER_SIZE)?
-            .map(|value| {
-                bounded_u32(
-                    MIN_CLUSTER_SIZE,
-                    value,
-                    MIN_CLUSTER_SIZE_VALUE,
-                    MAX_CLUSTER_SIZE_VALUE,
-                )
-            })
-            .transpose()
+    pub fn min_cluster_size(&self) -> Result<u32> {
+        bounded_u32(
+            MIN_CLUSTER_SIZE,
+            self.get_u32(MIN_CLUSTER_SIZE, DEFAULT_MIN_CLUSTER_SIZE)?,
+            MIN_CLUSTER_SIZE_VALUE,
+            MAX_CLUSTER_SIZE_VALUE,
+        )
     }
 
     pub fn set_min_cluster_size(&self, value: u32) -> Result<()> {
@@ -179,22 +175,50 @@ impl Settings {
         self.set_u32(MIN_CLUSTER_SIZE, value)
     }
 
-    pub fn quality_gate(&self) -> Result<Option<QualityGate>> {
+    pub fn quality_gate(&self) -> Result<QualityGate> {
         self.database.with_connection(|connection| {
-            connection
+            let value = connection
                 .query_row(
                     "SELECT value FROM settings WHERE key = ?1",
                     [QUALITY_GATE],
                     |row| row.get::<_, String>(0),
                 )
-                .optional()?
-                .map(|value| value.parse())
-                .transpose()
+                .optional()?;
+            value.map_or(Ok(QualityGate::ReviewOnly), |value| value.parse())
         })
     }
 
     pub fn set_quality_gate(&self, value: QualityGate) -> Result<()> {
         self.set(QUALITY_GATE, value.as_str())
+    }
+
+    pub fn ml_enabled(&self) -> Result<bool> {
+        self.get_optional::<bool>(ML_ENABLED)
+            .map(|value| value.unwrap_or(true))
+    }
+
+    pub fn set_ml_enabled(&self, value: bool) -> Result<()> {
+        self.set(ML_ENABLED, if value { "true" } else { "false" })
+    }
+
+    pub fn ml_socket_path(&self) -> Result<Option<PathBuf>> {
+        self.database.with_connection(|connection| {
+            let value = connection
+                .query_row(
+                    "SELECT value FROM settings WHERE key = ?1",
+                    [ML_SOCKET_PATH],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            value
+                .map(|raw| validate_socket_path(&raw).map(PathBuf::from))
+                .transpose()
+        })
+    }
+
+    pub fn set_ml_socket_path(&self, value: &str) -> Result<()> {
+        validate_socket_path(value)?;
+        self.set(ML_SOCKET_PATH, value)
     }
 
     fn get_u32(&self, key: &'static str, default: u32) -> Result<u32> {
@@ -269,5 +293,13 @@ fn bounded_ratio(key: &'static str, value: f64) -> Result<f64> {
         Ok(value)
     } else {
         Err(Error::InvalidSetting(key))
+    }
+}
+
+fn validate_socket_path(value: &str) -> Result<&str> {
+    if value.is_empty() || value.len() > 4096 || value.contains('\0') {
+        Err(Error::InvalidSetting(ML_SOCKET_PATH))
+    } else {
+        Ok(value)
     }
 }

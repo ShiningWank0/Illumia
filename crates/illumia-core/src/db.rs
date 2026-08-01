@@ -26,6 +26,8 @@ pub enum Error {
     Image(#[from] image::ImageError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("ML client error: {0}")]
+    MlClient(#[from] crate::ml_client::Error),
     #[error("image processing error: {0}")]
     ImageProcessing(String),
     #[error("invalid image input: {0}")]
@@ -36,6 +38,12 @@ pub enum Error {
     DatabasePoisoned,
     #[error("asset not found")]
     AssetNotFound,
+    #[error("face not found")]
+    FaceNotFound,
+    #[error("cluster not found")]
+    ClusterNotFound,
+    #[error("invalid ML operation: {0}")]
+    InvalidMl(String),
     #[error("manga stack not found")]
     StackNotFound,
     #[error("stack chapter not found")]

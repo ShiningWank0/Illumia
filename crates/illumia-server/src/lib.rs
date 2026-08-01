@@ -9,7 +9,12 @@ mod security;
 mod security_tests;
 mod vault;
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Condvar, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -24,6 +29,9 @@ use illumia_core::{
     PurgeService,
     db::Database,
     jobs::JobRunner,
+    ml::{ML_ANALYZE_JOB_KIND, ML_RECLUSTER_JOB_KIND, MlService},
+    ml_client::MlClient,
+    settings::Settings,
     thumbnails::{self, THUMBNAIL_JOB_KIND, ThumbnailPayload},
 };
 use serde_json::{Value, json};
@@ -39,6 +47,50 @@ pub use illumia_core::VERSION;
 const EVENT_BUFFER: usize = 128;
 const JSON_BODY_LIMIT: usize = 256 * 1024;
 const UPLOAD_BODY_LIMIT: usize = 129 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct MlConcurrencyGate {
+    inner: Arc<(Mutex<usize>, Condvar)>,
+    limit: usize,
+}
+
+struct MlConcurrencyPermit {
+    gate: MlConcurrencyGate,
+}
+
+impl MlConcurrencyGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(0), Condvar::new())),
+            limit: limit.max(1),
+        }
+    }
+
+    fn acquire(&self) -> MlConcurrencyPermit {
+        let (mutex, condition) = &*self.inner;
+        let mut active = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *active >= self.limit {
+            active = condition
+                .wait(active)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *active += 1;
+        MlConcurrencyPermit { gate: self.clone() }
+    }
+}
+
+impl Drop for MlConcurrencyPermit {
+    fn drop(&mut self) {
+        let (mutex, condition) = &*self.gate.inner;
+        let mut active = mutex
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        condition.notify_one();
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct AppState {
@@ -154,6 +206,20 @@ fn app_with_events(
             axum::routing::patch(api::patch_stack_page).delete(api::remove_stack_page),
         )
         .route("/vault/search", get(api::search))
+        .route("/vault/clusters", get(api::list_clusters))
+        .route("/vault/clusters/merge", post(api::merge_clusters))
+        .route(
+            "/vault/clusters/{id}",
+            axum::routing::patch(api::rename_cluster),
+        )
+        .route("/vault/clusters/{id}/assets", get(api::cluster_assets))
+        .route("/vault/clusters/{id}/split", post(api::split_cluster))
+        .route("/vault/review/candidates", get(api::review_candidates))
+        .route(
+            "/vault/review/candidates/{face_id}",
+            post(api::review_candidate),
+        )
+        .route("/vault/ml/analyze-all", post(api::vault_analyze_all))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             vault::require_session,
@@ -206,6 +272,16 @@ fn app_with_events(
             axum::routing::patch(api::patch_stack_page).delete(api::remove_stack_page),
         )
         .route("/search", get(api::search))
+        .route("/ml/status", get(api::ml_status))
+        .route("/ml/analyze-all", post(api::analyze_all))
+        .route("/ml/recluster", post(api::recluster))
+        .route("/clusters", get(api::list_clusters))
+        .route("/clusters/merge", post(api::merge_clusters))
+        .route("/clusters/{id}", axum::routing::patch(api::rename_cluster))
+        .route("/clusters/{id}/assets", get(api::cluster_assets))
+        .route("/clusters/{id}/split", post(api::split_cluster))
+        .route("/review/candidates", get(api::review_candidates))
+        .route("/review/candidates/{face_id}", post(api::review_candidate))
         .route("/jobs", get(api::jobs))
         .route("/jobs/{id}/cancel", post(api::cancel_job))
         .route(
@@ -329,6 +405,32 @@ pub async fn run(config: Config) -> Result<()> {
         }
         Ok(())
     });
+    let ml_settings = Settings::new(database.clone());
+    if ml_settings.ml_enabled().context("read ml.enabled")?
+        && let Some(socket_path) = ml_settings
+            .ml_socket_path()
+            .context("read ml.socket_path")?
+    {
+        let gate = MlConcurrencyGate::new(
+            usize::try_from(
+                ml_settings
+                    .ml_concurrency()
+                    .context("read jobs.ml_concurrency")?,
+            )
+            .unwrap_or(1),
+        );
+        let analyze_client = MlClient::new(socket_path.clone());
+        let analyze_gate = gate.clone();
+        runner.register_handler(ML_ANALYZE_JOB_KIND, move |database, job| {
+            let _permit = analyze_gate.acquire();
+            MlService::new(database.clone(), analyze_client.clone()).handle_analyze_job(job)
+        });
+        let recluster_client = MlClient::new(socket_path);
+        runner.register_handler(ML_RECLUSTER_JOB_KIND, move |database, job| {
+            let _permit = gate.acquire();
+            MlService::new(database.clone(), recluster_client.clone()).handle_recluster_job(job)
+        });
+    }
     runner.start().context("start job runner")?;
 
     let purge_task = tokio::spawn(run_purge_loop(purge));

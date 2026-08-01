@@ -7,6 +7,8 @@ pub mod assets;
 pub mod db;
 pub mod images;
 pub mod jobs;
+pub mod ml;
+pub mod ml_client;
 mod purge;
 pub mod search;
 pub mod settings;
