@@ -125,4 +125,42 @@
     cursor: pointer;
     font-size: 0.85rem;
   }
+
+  @media (max-width: 720px) {
+    nav {
+      flex-wrap: wrap;
+      gap: 0.35rem 0.5rem;
+      padding: 0.4rem 0.5rem;
+    }
+    ul {
+      order: 2;
+      flex: 0 0 100%;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    ul::-webkit-scrollbar {
+      display: none;
+    }
+    ul a {
+      padding: 0.35rem 0.55rem;
+      white-space: nowrap;
+    }
+    .vault-link {
+      margin-left: auto;
+      padding: 0.35rem 0.55rem;
+      white-space: nowrap;
+    }
+    .search {
+      flex: 1;
+      min-width: 4.5rem;
+    }
+    .search input {
+      width: 100%;
+      max-width: none;
+    }
+    .logout {
+      padding: 0.35rem 0.55rem;
+      white-space: nowrap;
+    }
+  }
 </style>

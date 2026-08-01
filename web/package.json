@@ -6,6 +6,9 @@
   "engines": {
     "node": "22.x"
   },
+  "overrides": {
+    "cookie": "0.7.2"
+  },
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
@@ -18,7 +21,7 @@
   "devDependencies": {
     "@sveltejs/adapter-static": "^3.0.2",
     "@sveltejs/kit": "^2.5.27",
-    "@sveltejs/vite-plugin-svelte": "^4.0.0",
+    "@sveltejs/vite-plugin-svelte": "^7.2.0",
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-biometric": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.7.2",
@@ -37,7 +40,7 @@
     "svelte-check": "^4.0.0",
     "thumbhash": "^0.1.1",
     "typescript": "^5.5.4",
-    "vite": "^5.4.21",
-    "vitest": "^1.6.1"
+    "vite": "^8.2.0",
+    "vitest": "^4.1.10"
   }
 }

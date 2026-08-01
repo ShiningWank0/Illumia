@@ -420,7 +420,11 @@ async fn vault_cluster_endpoints_mirror_cover_and_faces_dtos() {
     let assets = (0..3)
         .map(|index| {
             AssetService::new(app.database.clone())
-                .ingest(&one_pixel_png(), &format!("vault-cluster-{index}.png"), None)
+                .ingest(
+                    &one_pixel_png(),
+                    &format!("vault-cluster-{index}.png"),
+                    None,
+                )
                 .expect("main asset should ingest")
                 .asset
         })

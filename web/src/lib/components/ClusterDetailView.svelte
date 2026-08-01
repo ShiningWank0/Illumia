@@ -3,7 +3,6 @@
   import { goto } from '$app/navigation';
   import { getApi, type Cluster, type ClusterAsset, type IllumiaApi } from '$lib/api';
   import { toasts } from '$lib/toast.svelte';
-  import AssetImage from './AssetImage.svelte';
   import FaceCrop from './FaceCrop.svelte';
 
   interface Props {
@@ -24,7 +23,6 @@
   let splitMode = $state(false);
   let selected = $state<string[]>([]); // face_id
   const selectedSet = $derived(new Set(selected));
-  const hasFaces = $derived(items.some((it) => it.face != null));
 
   async function load() {
     loading = true;
@@ -104,7 +102,7 @@
         placeholder="未命名"
         aria-label="クラスタ名"
       />
-      <span class="muted count">{items.length} 枚</span>
+      <span class="muted count">{cluster?.count ?? 0} 枚</span>
       <div class="actions">
         {#if splitMode}
           <button class="btn primary" disabled={selected.length === 0} onclick={doSplit}>
@@ -123,36 +121,29 @@
           <button class="btn" onclick={() => (mergeOpen = true)} disabled={others.length === 0}>
             マージ
           </button>
-          <button class="btn" onclick={() => (splitMode = true)} disabled={!hasFaces}>分割</button>
+          <button class="btn" onclick={() => (splitMode = true)} disabled={items.length === 0}>
+            分割
+          </button>
         {/if}
       </div>
     </header>
 
     {#if splitMode}
       <p class="hint muted small">新しいクラスタへ移す顔を選択してください。</p>
-    {:else if !hasFaces}
-      <p class="hint muted small">
-        このサーバーは顔単位の情報を返さないため、分割は利用できません (アセット表示のみ)。
-      </p>
     {/if}
 
     <div class="grid">
-      {#each items as it (it.asset.id)}
-        {@const faceId = it.face?.id ?? null}
+      {#each items as it (it.face.id)}
         <button
           class="tile"
-          class:selectable={splitMode && faceId != null}
-          class:selected={faceId != null && selectedSet.has(faceId)}
-          onclick={() => splitMode && faceId && toggleFace(faceId)}
-          disabled={!splitMode || faceId == null}
-          aria-label={it.asset.filename}
+          class:selectable={splitMode}
+          class:selected={selectedSet.has(it.face.id)}
+          onclick={() => splitMode && toggleFace(it.face.id)}
+          disabled={!splitMode}
+          aria-label={`${it.asset.filename} の顔`}
         >
-          {#if it.face}
-            <FaceCrop {api} assetId={it.asset.id} bbox={it.face.bbox} alt={it.asset.filename} />
-          {:else}
-            <AssetImage {api} id={it.asset.id} thumbhash={it.asset.thumbhash} />
-          {/if}
-          {#if splitMode && faceId != null && selectedSet.has(faceId)}
+          <FaceCrop {api} assetId={it.asset.id} bbox={it.face.bbox} alt={it.asset.filename} />
+          {#if splitMode && selectedSet.has(it.face.id)}
             <span class="check">✓</span>
           {/if}
         </button>
@@ -356,5 +347,26 @@
     padding: 0.5rem 1rem;
     border-radius: 8px;
     cursor: pointer;
+  }
+
+  @media (max-width: 640px) {
+    .page {
+      padding: 1rem 1rem 2rem;
+    }
+    header {
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+    .name {
+      flex: 1;
+      min-width: 0;
+    }
+    .count {
+      flex: 0 0 auto;
+    }
+    .actions {
+      flex-basis: 100%;
+      justify-content: flex-end;
+    }
   }
 </style>

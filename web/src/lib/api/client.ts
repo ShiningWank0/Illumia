@@ -8,6 +8,7 @@ import { blake3 } from 'hash-wasm';
 import { isTauri, nativeFetch } from '$lib/platform/tauri';
 import { getNativeToken } from '$lib/platform/nativeAuth';
 import { getActiveBaseUrl } from '$lib/platform/connection';
+import { mapCluster, mapClusterAssets, mapClusters, mapSearchResult } from './mappers';
 import {
   ApiError,
   type ApiErrorBody,
@@ -37,14 +38,6 @@ export interface ClientConfig {
   baseUrl?: string;
 }
 
-// ---- サーバー DTO → UI 型 のマッパ (crates/illumia-core の serialize 形に対応) ----
-
-export interface ServerClusterSummary {
-  id: string;
-  name: string | null;
-  cover_face_id: string | null;
-  asset_count: number;
-}
 interface ServerFaceRecord {
   id: string;
   asset_id: string;
@@ -65,10 +58,6 @@ interface ServerMlStatus {
   } | null;
 }
 
-export function toCluster(c: ServerClusterSummary): Cluster {
-  // 実サーバーは cover_face_id のみ (asset+bbox 不明) → cover は null に縮退。
-  return { id: c.id, name: c.name, count: c.asset_count, cover: null };
-}
 function toCandidate(c: ServerReviewCandidate): Candidate {
   return {
     face_id: c.face.id,
@@ -352,21 +341,18 @@ export function createHttpClient(config: ClientConfig = {}): IllumiaApi {
     // --- キャラクター (クラスタ) ---
     // サーバーの ClusterSummary / FaceRecord / AssetResponse を UI 型へマップする。
     async listClusters(): Promise<Cluster[]> {
-      const rows = await request<ServerClusterSummary[]>(base(), '/api/clusters');
-      return rows.map(toCluster);
+      return mapClusters(await request<unknown>(base(), '/api/clusters'));
     },
     async getClusterAssets(id: string): Promise<ClusterAsset[]> {
-      // 実サーバーはアセットのみ返す (顔情報なし) → face:null に縮退。
-      const assets = await request<Asset[]>(base(), `/api/clusters/${enc(id)}/assets`);
-      return assets.map((asset) => ({ asset, face: null }));
+      return mapClusterAssets(await request<unknown>(base(), `/api/clusters/${enc(id)}/assets`));
     },
     async renameCluster(id: string, name: string): Promise<Cluster> {
-      const c = await request<ServerClusterSummary>(base(), `/api/clusters/${enc(id)}`, {
+      const response = await request<unknown>(base(), `/api/clusters/${enc(id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
       });
-      return toCluster(c);
+      return mapCluster(response);
     },
     async mergeClusters(fromId: string, intoId: string): Promise<void> {
       await request<Response>(base(), '/api/clusters/merge', {
@@ -377,12 +363,12 @@ export function createHttpClient(config: ClientConfig = {}): IllumiaApi {
       });
     },
     async splitCluster(id: string, faceIds: string[]): Promise<Cluster> {
-      const c = await request<ServerClusterSummary>(base(), `/api/clusters/${enc(id)}/split`, {
+      const response = await request<unknown>(base(), `/api/clusters/${enc(id)}/split`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ face_ids: faceIds })
       });
-      return toCluster(c);
+      return mapCluster(response);
     },
     async getReviewCandidates(): Promise<Candidate[]> {
       const rows = await request<ServerReviewCandidate[]>(base(), '/api/review/candidates');
@@ -420,8 +406,8 @@ export function createHttpClient(config: ClientConfig = {}): IllumiaApi {
     },
 
     // --- 検索 ---
-    search(q: string): Promise<SearchResult> {
-      return request<SearchResult>(base(), `/api/search?q=${enc(q)}`);
+    async search(q: string): Promise<SearchResult> {
+      return mapSearchResult(await request<unknown>(base(), `/api/search?q=${enc(q)}`));
     }
   };
 }

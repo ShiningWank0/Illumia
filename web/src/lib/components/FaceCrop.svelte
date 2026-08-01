@@ -44,7 +44,7 @@
   class="face"
   role="img"
   aria-label={alt}
-  style={src ? `background-image:url(${src});${style}` : ''}
+  style={src ? `background-image:url("${src}");${style}` : ''}
 ></div>
 
 <style>

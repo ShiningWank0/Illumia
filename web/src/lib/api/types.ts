@@ -145,24 +145,24 @@ export interface Face {
   asset_id: string;
   bbox: Bbox;
   state?: FaceState;
+  similarity?: number | null;
 }
 
 /** クラスタ一覧の 1 件 (`GET /api/clusters`)。cover = 代表顔。 */
 export interface Cluster {
   id: string;
   name: string | null; // null = 未命名
-  count: number; // 枚数 (顔数)
+  count: number; // クラスタに属するアセット数
   cover: Face | null; // 代表顔
 }
 
 /**
- * クラスタ内アセット 1 件 (`GET /api/clusters/{id}/assets`)。
- * face = このクラスタでの顔 (bbox crop / 分割選択用)。実サーバーが顔情報を
- * 返さない場合は null になり、その場合アセット全体表示・分割不可に縮退する。
+ * クラスタ内の顔タイル 1 件。API の 1 asset + faces[] を mapper が
+ * 1 face = 1 件へ flatten するため、同じ asset が複数回現れることがある。
  */
 export interface ClusterAsset {
   asset: Asset;
-  face: Face | null;
+  face: Face;
 }
 
 /** 確認キューの候補顔 (`GET /api/review/candidates`)。 */

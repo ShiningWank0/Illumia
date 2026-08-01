@@ -5,9 +5,8 @@ FROM node:22-slim@sha256:f32b81066cde10a75dbac96646099533316d94bac4150c55da1636e
 WORKDIR /app/web
 
 COPY web/package.json web/package-lock.json ./
-# dependency lifecycle script は既定で実行せず、build に必要な esbuild の検証だけを明示する。
-RUN npm ci --ignore-scripts \
-    && node node_modules/esbuild/install.js
+# dependency lifecycle script は既定で実行しない。Vite 8 は esbuild install script に依存しない。
+RUN npm ci --ignore-scripts
 
 COPY web/ ./
 RUN npm run build

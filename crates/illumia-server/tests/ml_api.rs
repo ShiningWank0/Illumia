@@ -318,9 +318,7 @@ async fn cluster_responses_include_cover_and_only_member_faces() {
     );
     assert!(target.get("cover_face_id").is_none());
 
-    let (status, rows) = app
-        .get("/api/clusters/target/assets", Some(&token))
-        .await;
+    let (status, rows) = app.get("/api/clusters/target/assets", Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(rows.as_array().expect("cluster assets").len(), 3);
     let first = rows
@@ -356,7 +354,11 @@ async fn cluster_cover_is_null_when_face_is_missing_or_asset_is_trashed() {
     let assets = (0..3)
         .map(|index| {
             AssetService::new(app.database.clone())
-                .ingest(&one_pixel_png(), &format!("missing-cover-{index}.png"), None)
+                .ingest(
+                    &one_pixel_png(),
+                    &format!("missing-cover-{index}.png"),
+                    None,
+                )
                 .expect("asset should ingest")
                 .asset
         })
