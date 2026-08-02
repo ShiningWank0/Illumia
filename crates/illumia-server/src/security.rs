@@ -31,7 +31,8 @@ const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_AUTH_SOURCES: usize = 4096;
 const MAX_ARGON2_CONCURRENCY: usize = 2;
 const MAX_INGEST_CONCURRENCY: usize = 2;
-const MAX_WEBSOCKETS: usize = 32;
+/// WS の同時接続上限。adversarial test (SEC-010) から参照する。
+pub(crate) const MAX_WEBSOCKETS: usize = 32;
 const MIN_SETUP_TOKEN_BYTES: usize = 32;
 const MAX_SETUP_TOKEN_BYTES: usize = 256;
 const OVERFLOW_SOURCE: &str = "<overflow>";

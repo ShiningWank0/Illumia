@@ -1291,7 +1291,7 @@ pub async fn patch_settings(
     Ok(Json(settings_json(&settings)?))
 }
 
-const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// Browser clients authenticate with the HttpOnly session cookie. Native
 /// clients may use the Authorization header. Credentials are never accepted

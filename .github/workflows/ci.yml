@@ -113,6 +113,14 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --locked
+      # 本番依存を完全 pin + hash 付きで export し、既知脆弱性を監査する。
+      # audit tool 自身の version も固定する (docs/12: SEC-008)。
+      - name: dependency audit
+        run: |
+          uv export --frozen --no-dev --no-emit-project \
+            --format requirements.txt -o requirements-audit.txt
+          uv run --no-project --with pip-audit==2.9.0 -- \
+            pip-audit --strict --disable-pip -r requirements-audit.txt
       - name: ruff
         run: |
           uv run ruff check .

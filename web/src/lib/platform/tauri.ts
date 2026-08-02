@@ -13,26 +13,81 @@ export function isTauri(): boolean {
   );
 }
 
-type FetchFn = (input: string, init?: RequestInit) => Promise<Response>;
+/** Rust 側ブリッジの応答 (apps/android/src-tauri/src/bridge.rs)。 */
+interface BridgeResponse {
+  status: number;
+  headers: Record<string, string>;
+  body_base64: string;
+}
 
-let nativeFetchImpl: FetchFn | null = null;
+function base64ToBytes(encoded: string): Uint8Array {
+  const binary = atob(encoded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+async function bytesToBase64(body: BodyInit): Promise<string> {
+  const buffer = await new Response(body).arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  // 大きな body で引数上限に当たらないよう分割する。
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
+/** 現在ブリッジに登録済みの base URL (重複登録を避けるためのキャッシュ)。 */
+let boundBaseUrl: string | null = null;
 
 /**
- * ネイティブ HTTP。Tauri では tauri-plugin-http の fetch を使い、WebView の CORS 制約と
- * クロスオリジン Cookie の問題を回避する (docs/12: ネイティブに CORS は不要)。
- * ブラウザではグローバル fetch にフォールバックする。
+ * ブリッジへ接続先サーバーを登録する。Rust 側でも URL を検証する。
+ * 未登録のまま `illumia_request` を呼ぶと拒否される。
+ */
+export async function bindNativeServer(baseUrl: string | null): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('illumia_set_server', { url: baseUrl });
+  boundBaseUrl = baseUrl;
+}
+
+/**
+ * ネイティブ HTTP。汎用 plugin-http は capability から外しているため
+ * (docs/12: SEC-004)、登録済み Illumia サーバー宛だけを通す Rust 側の
+ * `illumia_request` command を使う。ブラウザではグローバル fetch を使う。
  */
 export async function nativeFetch(input: string, init?: RequestInit): Promise<Response> {
   if (!isTauri()) return fetch(input, init);
-  if (!nativeFetchImpl) {
-    try {
-      const mod = await import('@tauri-apps/plugin-http');
-      nativeFetchImpl = mod.fetch as unknown as FetchFn;
-    } catch {
-      nativeFetchImpl = fetch;
+
+  const { invoke } = await import('@tauri-apps/api/core');
+
+  // input は絶対 URL。base 部分はブリッジ側の登録値と突き合わせるので path だけ渡す。
+  const url = new URL(input);
+  const base = `${url.protocol}//${url.host}`;
+  if (boundBaseUrl !== base) await bindNativeServer(base);
+
+  const headers: Record<string, string> = {};
+  new Headers(init?.headers ?? {}).forEach((value, key) => {
+    headers[key] = value;
+  });
+
+  const response = await invoke<BridgeResponse>('illumia_request', {
+    request: {
+      path: `${url.pathname}${url.search}`,
+      method: init?.method ?? 'GET',
+      headers,
+      body_base64: init?.body ? await bytesToBase64(init.body) : null
     }
-  }
-  return nativeFetchImpl(input, init);
+  });
+
+  return new Response(
+    response.status === 204 || response.status === 304
+      ? null
+      : (base64ToBytes(response.body_base64) as unknown as BodyInit),
+    { status: response.status, headers: response.headers }
+  );
 }
 
 // ---- 生体認証 (vault アンロックの代替) ----

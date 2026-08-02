@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
-use crate::{EVENT_BUFFER, JSON_BODY_LIMIT, app_with_events};
+use crate::{EVENT_BUFFER, JSON_BODY_LIMIT, api::MAX_WEBSOCKET_MESSAGE_BYTES, app_with_events};
 
 struct TestApp {
     path: PathBuf,
@@ -477,4 +477,201 @@ async fn setup_token_body_limit_rate_limit_and_cors_are_enforced() {
         .await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(response.headers().get("retry-after").is_some());
+}
+
+/// 実 TCP listener を立て、`router` を serve する。テスト終了時に abort する。
+struct ServedApp {
+    path: PathBuf,
+    addr: std::net::SocketAddr,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl ServedApp {
+    /// setup を済ませ、Bearer token 付きで待ち受ける server を起動する。
+    async fn start() -> (Self, String) {
+        let path = std::env::temp_dir().join(format!("illumia-ws-{}", Uuid::now_v7()));
+        fs::create_dir_all(&path).expect("test directory should be created");
+        let database = Database::open(&path).expect("test database should open");
+        let (events, _) = broadcast::channel(EVENT_BUFFER);
+        let router = app_with_events(
+            database,
+            None,
+            events,
+            Duration::from_secs(15 * 60),
+            None,
+            false,
+            false,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("ephemeral port should bind");
+        let addr = listener.local_addr().expect("listener address");
+        let serve_router = router.clone();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                serve_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        // device token を得る (WS は認証必須)。
+        let response = reqwest_post(
+            addr,
+            "/api/auth/setup",
+            r#"{"password":"security password","device_name":"ws-test"}"#,
+        )
+        .await;
+        let token = response["token"]
+            .as_str()
+            .expect("setup should return a device token")
+            .to_owned();
+
+        (Self { path, addr, handle }, token)
+    }
+
+    fn ws_url(&self) -> String {
+        format!("ws://{}/api/ws", self.addr)
+    }
+}
+
+impl Drop for ServedApp {
+    fn drop(&mut self) {
+        self.handle.abort();
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+/// テスト用の最小 JSON POST (依存を増やさないため手書き HTTP)。
+async fn reqwest_post(addr: std::net::SocketAddr, path: &str, body: &str) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to test server");
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read response");
+    let text = String::from_utf8_lossy(&raw);
+    let body = text
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("response should have a body");
+    serde_json::from_str(body).expect("response body should be JSON")
+}
+
+/// 認証済み WS 接続を 1 本張る。成功したら stream を返す。
+async fn open_ws(
+    url: &str,
+    token: &str,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::tungstenite::Error,
+> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let mut request = url.into_client_request().expect("ws url should parse");
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        format!("Bearer {token}").parse().expect("bearer header"),
+    );
+    tokio_tungstenite::connect_async(request)
+        .await
+        .map(|(stream, _)| stream)
+}
+
+/// docs/12 が公開前必須とする WS connection flood の adversarial test (SEC-010)。
+///
+/// 検証内容:
+///   - 上限本数まで接続でき、上限超過は 429 で拒否される
+///   - 1 本閉じれば新規接続できる (permit が確実に解放される)
+///   - 上限超過フレームを送っても permit がリークしない
+#[tokio::test]
+async fn websocket_connection_flood_is_bounded_and_permits_are_released() {
+    use futures_util::SinkExt;
+
+    // docs/12 が定める上限値そのものを固定する。実装側で黙って緩められた場合に
+    // このテストが追随してしまわないよう、値自体を検証する。
+    assert_eq!(
+        crate::security::MAX_WEBSOCKETS,
+        32,
+        "WS の同時接続上限は 32 (docs/12_security.md)"
+    );
+
+    let (app, token) = ServedApp::start().await;
+    let url = app.ws_url();
+
+    // 1. 上限まで接続を保持する。
+    let mut connections = Vec::new();
+    for index in 0..crate::security::MAX_WEBSOCKETS {
+        let socket = open_ws(&url, &token)
+            .await
+            .unwrap_or_else(|error| panic!("connection {index} should succeed: {error}"));
+        connections.push(socket);
+    }
+    assert_eq!(connections.len(), crate::security::MAX_WEBSOCKETS);
+
+    // 2. 上限 + 1 本目は 429 で拒否される。
+    let rejected = open_ws(&url, &token).await;
+    match rejected {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        Err(other) => panic!("expected an HTTP 429 rejection, got {other}"),
+        Ok(_) => panic!("connections beyond the limit must be rejected"),
+    }
+
+    // 3. 1 本閉じれば再び接続できる (permit の解放)。
+    let mut closed = connections.pop().expect("a connection to close");
+    closed.close(None).await.expect("close should be sent");
+    drop(closed);
+
+    let reconnected = wait_for_slot(&url, &token).await;
+    assert!(
+        reconnected.is_some(),
+        "closing a connection must release its permit"
+    );
+    connections.push(reconnected.expect("reconnected socket"));
+
+    // 4. 上限超過フレームを送った接続も、切断後に permit を返す。
+    let mut offender = connections.pop().expect("a connection to abuse");
+    let oversized = vec![b'x'; MAX_WEBSOCKET_MESSAGE_BYTES * 2];
+    // 送信自体は失敗しうる (server 側が閉じる)。permit が戻ることだけを見る。
+    let _ = offender
+        .send(tokio_tungstenite::tungstenite::Message::Binary(
+            oversized.into(),
+        ))
+        .await;
+    drop(offender);
+
+    let after_abuse = wait_for_slot(&url, &token).await;
+    assert!(
+        after_abuse.is_some(),
+        "an over-limit frame must not leak the connection permit"
+    );
+}
+
+/// permit の解放は server 側の非同期処理なので、短時間ポーリングして待つ。
+async fn wait_for_slot(
+    url: &str,
+    token: &str,
+) -> Option<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+> {
+    for _ in 0..50 {
+        if let Ok(socket) = open_ws(url, token).await {
+            return Some(socket);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    None
 }

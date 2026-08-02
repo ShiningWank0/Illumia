@@ -1,14 +1,23 @@
 # 本番ビルド (配布物はここでのみ作る → docs/09)。
 # タグ `v*` の push または手動実行 (workflow_dispatch) で起動する。
-# コンポーネントが未実装の間は preflight の存在チェックで該当ジョブを自動スキップし、
-# リポジトリがどの段階でも green を保つ。各ジョブの詳細は該当コンポーネント実装時
-# (M0/M1/M5/M6) に仕上げる。
+#
+# 配布ゲート (docs/12: SEC-006 / SEC-007):
+#   1. preflight でタグと全コンポーネントの version 一致を必須にする。
+#   2. 同一 commit の CI (fmt/clippy/test/audit/web/ml/e2e/container scan) を
+#      release から呼び出し、全成功後だけ publish する。
+#   3. container は scan を通した digest だけを publish し、digest を記録する。
+#   4. 未署名の desktop 成果物は GitHub Release へ添付しない (CI artifact 止まり)。
 name: Release
 
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '成果物を公開せずビルドだけ検証する'
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -26,8 +35,10 @@ jobs:
       android: ${{ steps.check.outputs.android }}
       version: ${{ steps.check.outputs.version }}
       owner_lc: ${{ steps.check.outputs.owner_lc }}
+      publish: ${{ steps.check.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - id: check
         run: |
           out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; echo "$1=$2"; }
@@ -39,18 +50,41 @@ jobs:
           out owner_lc "${GITHUB_REPOSITORY_OWNER,,}"
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             out version "${GITHUB_REF#refs/tags/}"
+            out publish true
           else
             out version "dev-$(git rev-parse --short HEAD)"
+            out publish false
+          fi
+      # タグと全 manifest の version 一致を必須にする (SEC-006)。
+      # 不一致のまま publish すると、GHCR のタグと server が返す version がずれる。
+      - name: verify component versions
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            uv run --no-project scripts/check-versions.py --tag "${GITHUB_REF#refs/tags/}"
+          else
+            uv run --no-project scripts/check-versions.py
           fi
 
-  docker:
+  # 同一 commit の CI をそのまま実行する。ここが落ちれば publish へ進まない (SEC-006)。
+  ci:
     needs: preflight
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  docker:
+    needs: [preflight, ci]
     if: needs.preflight.outputs.docker_server == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
+    outputs:
+      server_digest: ${{ steps.record.outputs.illumia-server }}
+      ml_digest: ${{ steps.record.outputs.illumia-ml }}
     strategy:
+      # digest を確実に記録するため直列化する。
+      max-parallel: 1
       matrix:
         include:
           - image: illumia-server
@@ -63,8 +97,33 @@ jobs:
         run: echo "skip=1" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
         if: env.skip != '1'
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+
+      # scan 前に registry へ push しない。まずローカルへ load して Trivy を通す。
+      - name: build for scanning
         if: env.skip != '1'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          load: true
+          push: false
+          tags: ${{ matrix.image }}:scan
+          build-args: SOURCE_COMMIT=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+      - name: scan ${{ matrix.image }}
+        if: env.skip != '1'
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ matrix.image }}:scan
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -79,11 +138,16 @@ jobs:
           {
             echo 'tags<<EOF'
             echo "$IMAGE:$VERSION"
+            # latest はタグ push (= release 成功経路) のときだけ更新する。
             if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "$IMAGE:latest"; fi
             echo EOF
           } >> "$GITHUB_OUTPUT"
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
-        if: env.skip != '1'
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+      # scan を通った同一 context を push する。digest を release notes へ記録する。
+      - name: push scanned image
+        id: push
+        if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -92,16 +156,30 @@ jobs:
           build-args: SOURCE_COMMIT=${{ github.sha }}
           sbom: true
           provenance: mode=max
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.image }}
+      - name: record digest
+        id: record
+        if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
+        run: |
+          echo "${{ matrix.image }}=${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
+          mkdir -p digests
+          echo "${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}" \
+            > "digests/${{ matrix.image }}.txt"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
+        with:
+          name: digest-${{ matrix.image }}
+          path: digests/*
 
+  # 未署名バイナリは配布しない (SEC-007)。ビルド検証と CI artifact 保管のみ行い、
+  # GitHub Release へは添付しない。署名・公証を導入したら publish 対象へ戻す。
   desktop:
-    needs: preflight
+    needs: [preflight, ci]
     if: needs.preflight.outputs.desktop == 'true'
     strategy:
       matrix:
         include:
-          - os: macos-14        # Apple Silicon ランナー。x86_64 も cross ビルドし universal 化
+          - os: macos-14 # Apple Silicon ランナー。x86_64 も cross ビルドし universal 化
             name: macos
           - os: windows-latest
             name: windows
@@ -114,28 +192,29 @@ jobs:
         if: matrix.name == 'macos'
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
-          cargo build --release -p illumia-desktop --target aarch64-apple-darwin
-          cargo build --release -p illumia-desktop --target x86_64-apple-darwin
+          cargo build --release --locked -p illumia-desktop --target aarch64-apple-darwin
+          cargo build --release --locked -p illumia-desktop --target x86_64-apple-darwin
           mkdir -p dist
           lipo -create \
             target/aarch64-apple-darwin/release/illumia-desktop \
             target/x86_64-apple-darwin/release/illumia-desktop \
             -output dist/illumia-desktop-macos-universal
-          # TODO(M6): .app バンドル化・PyInstaller 製 ml サイドカー同梱・署名/公証
+          # TODO: .app バンドル化・PyInstaller 製 ml サイドカー同梱・署名/公証。
+          # 完了するまで GitHub Release へは添付しない (SEC-007)。
       - name: build (Windows)
         if: matrix.name == 'windows'
         run: |
-          cargo build --release -p illumia-desktop
+          cargo build --release --locked -p illumia-desktop
           mkdir dist
           copy target\release\illumia-desktop.exe dist\illumia-desktop-windows-x64.exe
         shell: cmd
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: desktop-${{ matrix.name }}
+          name: unsigned-desktop-${{ matrix.name }}
           path: dist/*
 
   android:
-    needs: preflight
+    needs: [preflight, ci]
     if: needs.preflight.outputs.android == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -148,6 +227,7 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: install Android NDK
         run: |
           sdkmanager "ndk;26.1.10909125"
@@ -160,6 +240,7 @@ jobs:
         with:
           workspaces: apps/android/src-tauri
       - name: restore signing keystore
+        if: needs.preflight.outputs.publish == 'true'
         env:
           KEYSTORE_B64: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_B64 }}
         run: |
@@ -169,9 +250,10 @@ jobs:
           echo "$KEYSTORE_B64" | base64 -d > apps/android/src-tauri/illumia.keystore
       - name: build web frontend
         working-directory: web
+        # npm ci はライフサイクルスクリプトを実行しない。esbuild 等の
+        # optionalDependencies バイナリは npm ci が直接展開するので追加処理は不要。
         run: |
           npm ci --ignore-scripts
-          node node_modules/esbuild/install.js
           npm run build
       - name: install Tauri CLI
         working-directory: apps/android
@@ -181,6 +263,7 @@ jobs:
         # Rust ターゲットは rust-toolchain アクションで導入済みなので --skip-targets-install。
         run: npm run tauri android init -- --ci --skip-targets-install
       - name: configure release signing
+        if: needs.preflight.outputs.publish == 'true'
         working-directory: apps/android/src-tauri/gen/android
         env:
           ILLUMIA_KEYSTORE_PASSWORD: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_PASSWORD }}
@@ -192,34 +275,77 @@ jobs:
           keyAlias=$ILLUMIA_KEY_ALIAS
           storeFile=$(cd ../.. && pwd)/illumia.keystore
           EOF
-          python3 "$GITHUB_WORKSPACE/apps/android/scripts/inject-signing.py" app/build.gradle.kts
-      - name: build signed APK
+          # Python は必ず uv 経由 (AGENTS.md 6)。
+          uv run --no-project "$GITHUB_WORKSPACE/apps/android/scripts/inject-signing.py" \
+            app/build.gradle.kts
+      - name: build APK
         working-directory: apps/android
         run: npm run tauri android build -- --apk
+      # 配布物の同一性を release notes へ記録する (SEC-007)。
+      - name: record APK fingerprints
+        if: needs.preflight.outputs.publish == 'true'
+        run: |
+          mkdir -p fingerprints
+          out=fingerprints/android-apk.txt
+          : > "$out"
+          find apps/android/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -print0 |
+            while IFS= read -r -d '' apk; do
+              echo "file: $(basename "$apk")" >> "$out"
+              echo "sha256: $(sha256sum "$apk" | cut -d' ' -f1)" >> "$out"
+              # 署名証明書の fingerprint (apksigner は build-tools に含まれる)
+              "$ANDROID_SDK_ROOT"/build-tools/*/apksigner verify --print-certs "$apk" \
+                | grep -i 'SHA-256 digest' >> "$out" || echo "certs: unavailable" >> "$out"
+              echo >> "$out"
+            done
+          cat "$out"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: android-apk
-          path: apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          path: |
+            apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            fingerprints/*
 
-  # タグ push のとき、ビルドされた成果物を GitHub Release に添付する。
-  # スキップされたコンポーネントがあっても、存在する成果物だけで Release を作る。
+  # タグ push のとき、署名済み成果物だけを GitHub Release に添付する。
+  # 未署名 desktop バイナリは対象外 (SEC-007)。
   publish-release:
-    needs: [preflight, docker, desktop, android]
+    needs: [preflight, ci, docker, desktop, android]
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
+      needs.ci.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
-      (needs.desktop.result == 'success' || needs.android.result == 'success' || needs.docker.result == 'success')
+      (needs.android.result == 'success' || needs.docker.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      # desktop/android が未実装でスキップされた場合は成果物ゼロなので失敗を許容する
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         continue-on-error: true
         with:
           path: artifacts
+          pattern: '!unsigned-desktop-*'
           merge-multiple: true
+      - name: compose provenance notes
+        run: |
+          {
+            echo "## 配布物の同一性"
+            echo
+            echo "- tag: \`${GITHUB_REF#refs/tags/}\`"
+            echo "- commit: \`$GITHUB_SHA\`"
+            echo
+            if compgen -G 'artifacts/*.txt' > /dev/null; then
+              echo '### container image digest / APK fingerprint'
+              echo
+              echo '```'
+              cat artifacts/*.txt
+              echo '```'
+            fi
+            echo
+            echo "未署名の macOS / Windows デスクトップバイナリは配布対象外です"
+            echo "(署名・公証の導入まで CI artifact 止まり → docs/12 SEC-007)。"
+          } > release-notes.md
+          cat release-notes.md
       - uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3
         with:
           files: artifacts/**/*
+          body_path: release-notes.md
           generate_release_notes: true

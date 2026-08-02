@@ -20,12 +20,23 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
-tauri-plugin-biometric = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
-tauri-plugin-http = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 汎用 plugin-http は frontend へ公開せず (docs/12: SEC-004)、専用ブリッジ
+# (src/bridge.rs) から直接 reqwest を使う。OS の CA ストア差異による検証の緩みを
+# 避けるため rustls + webpki roots を使う。
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls-webpki-roots",
+] }
+base64 = "0.22"
+url = "2"
+
+# biometric はモバイル専用プラグイン。desktop (dev ビルド・単体テスト) では
+# そもそも解決できないため、モバイルターゲットのみで依存する。
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-plugin-biometric = "2"
 
 [features]
 # tauri の dev 時に devtools を有効化する用のプレースホルダ。

@@ -41,7 +41,7 @@ function authHeaders(url: string): Record<string, string> {
   return headers;
 }
 
-/** ネイティブは CORS 回避のため plugin-http、ブラウザは同一オリジン Cookie。 */
+/** ネイティブは専用ブリッジ (illumia_request)、ブラウザは同一オリジン Cookie。 */
 async function fetchAsset(url: string): Promise<Response> {
   const headers = authHeaders(url);
   if (isTauri()) {

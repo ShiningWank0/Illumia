@@ -23,3 +23,6 @@ workspace = true
 [dev-dependencies]
 http-body-util = "0.1.4"
 tower = { version = "0.5.3", features = ["util"] }
+# WS connection flood の adversarial test 用 (docs/12: SEC-010)。
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
