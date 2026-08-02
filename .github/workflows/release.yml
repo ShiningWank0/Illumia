@@ -159,6 +159,19 @@ jobs:
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=${{ matrix.image }}
+      # push した実 image を digest 指定で再 scan する。scan 済み context と
+      # 実際に配布される image が一致していることを、配布物側から確認する
+      # (docs/12 の公開前チェック)。
+      - name: rescan published image by digest
+        if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
       - name: record digest
         id: record
         if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
