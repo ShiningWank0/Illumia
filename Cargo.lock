@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "illumia-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "blake3",
@@ -1616,7 +1616,7 @@ dependencies = [
 
 [[package]]
 name = "illumia-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "illumia-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",

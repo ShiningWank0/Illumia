@@ -1,6 +1,6 @@
 [project]
 name = "illumia-ml"
-version = "0.1.0"
+version = "0.2.0"
 description = "Illumia ML sidecar (ステートレス推論ワーカー → docs/07_ml_integration.md)"
 readme = "README.md"
 # anime_character_recognize (dghs-imgutils) が Python 3.14 未対応のため 3.12 固定
