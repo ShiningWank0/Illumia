@@ -7,6 +7,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml から同一 commit に対して呼び出す (docs/12: SEC-006)。
+  workflow_call:
+    inputs:
+      full:
+        description: 'paths-filter を無視して全ジョブを実行する (release 用)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -18,14 +25,18 @@ concurrency:
 jobs:
   changes:
     runs-on: ubuntu-latest
+    # release から呼ばれたときは paths-filter を通さず全ジョブを走らせる。
+    # タグ push には比較対象が無く、フィルタが全 false になって CI が
+    # 素通りするのを防ぐ (docs/12: SEC-006)。
     outputs:
-      rust: ${{ steps.filter.outputs.rust }}
-      web: ${{ steps.filter.outputs.web }}
-      ml: ${{ steps.filter.outputs.ml }}
-      docker: ${{ steps.filter.outputs.docker }}
+      rust: ${{ inputs.full && 'true' || steps.filter.outputs.rust }}
+      web: ${{ inputs.full && 'true' || steps.filter.outputs.web }}
+      ml: ${{ inputs.full && 'true' || steps.filter.outputs.ml }}
+      docker: ${{ inputs.full && 'true' || steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
+        if: ${{ !inputs.full }}
         id: filter
         with:
           filters: |

@@ -71,6 +71,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+    with:
+      full: true
 
   docker:
     needs: [preflight, ci]
