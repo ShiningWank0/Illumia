@@ -324,8 +324,20 @@ jobs:
         continue-on-error: true
         with:
           path: artifacts
-          pattern: '!unsigned-desktop-*'
-          merge-multiple: true
+      # 未署名 desktop バイナリは配布対象外 (SEC-007)。負の glob に頼らず、
+      # 取得後に明示的に削除し、残っていないことを検証してから添付する。
+      - name: drop unsigned desktop artifacts
+        run: |
+          rm -rf artifacts/unsigned-desktop-* || true
+          if compgen -G 'artifacts/unsigned-desktop-*' > /dev/null; then
+            echo "::error::未署名 desktop 成果物を除外できていない"; exit 1
+          fi
+          # 実行ファイル形式が紛れ込んでいないことも確認する。
+          if find artifacts -type f \( -name '*.exe' -o -name '*-macos-universal' \) \
+              | grep -q .; then
+            echo "::error::未署名の実行ファイルが配布対象に含まれている"; exit 1
+          fi
+          find artifacts -type f | sort
       - name: compose provenance notes
         run: |
           {
