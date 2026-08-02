@@ -344,6 +344,17 @@ jobs:
             echo
             echo "未署名の macOS / Windows デスクトップバイナリは配布対象外です"
             echo "(署名・公証の導入まで CI artifact 止まり → docs/12 SEC-007)。"
+            echo
+            echo "## インターネット公開前に必要な未実施の検証"
+            echo
+            echo "コード側の防御は CI で継続検証していますが、**設置環境に対する"
+            echo "次の検証は未実施**です。インターネットへ公開する前に必ず実施してください"
+            echo "(詳細: docs/12_security.md)。"
+            echo
+            echo "- Pangolin/Newt 配下の外部回線からの adversarial test"
+            echo "- 外部回線から origin IP / host port へ直接到達できないことの IPv4/IPv6 確認"
+            echo "- 配布 APK の実機動作と署名証明書 fingerprint の確認"
+            echo "- reverse proxy の timeout / rate limit / sensitive header ログ除外の確認"
           } > release-notes.md
           cat release-notes.md
       - uses: softprops/action-gh-release@c12583777ecdfd3be55c69cf75464299dc01057e # v3

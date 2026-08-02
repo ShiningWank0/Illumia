@@ -22,11 +22,14 @@
 APK の署名ビルドは GitHub Actions (`.github/workflows/release.yml` の `android` ジョブ)
 でのみ行う。ローカルでは Android SDK/NDK が必要なため通常ビルドしない。
 
-必要な Secrets:
+必要な Secrets (作成手順は [SIGNING.md](SIGNING.md)):
 
 - `ILLUMIA_ANDROID_KEYSTORE_B64` … keystore を base64 化したもの
 - `ILLUMIA_ANDROID_KEYSTORE_PASSWORD`
 - `ILLUMIA_ANDROID_KEY_ALIAS`
+
+これらが未設定のままタグを push すると release の android ジョブが失敗する。
+先に [SIGNING.md](SIGNING.md) の手順で登録すること。
 
 ## アプリモード (web 側)
 

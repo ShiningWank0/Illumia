@@ -143,3 +143,20 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - `docker compose config`、Dockerfile/Compose lint、CI での multi-stage image build と scan
 - 認証なし、改ざん token、異なる Origin、oversize body、画像 bomb、SQLi metacharacter、
   path traversal、WS connection flood、Vault lock 中の 404 秘匿を含む adversarial test
+
+## 公開前に必須の実環境検証 (v0.2.0 時点で未実施)
+
+以下は Illumia のコードではなく**設置環境**に対する検証であり、実際の
+Pangolin/Newt・回線・実機が無いと確認できない。**v0.2.0 はこれらを未実施のまま
+リリースしている**。インターネットへ公開する前に必ず実施すること。
+完了をもって v1.0 以降の公開運用へ進む。
+
+- [ ] Pangolin/Newt 配下の外部回線から adversarial test を実施する
+- [ ] 外部回線から origin IP / host port へ直接到達できないことを IPv4 / IPv6 双方で確認する
+      (router の port forward、UPnP、IPv6 firewall を含め Pangolin を迂回する経路を閉じる)
+- [ ] 配布 APK を実機へ導入し、動作と署名証明書の fingerprint を確認する
+- [ ] reverse proxy の upload/body/idle timeout、rate limit、sensitive header のログ除外を確認する
+- [ ] private GitHub の Dependabot / code scanning / secret scanning alerts を確認する
+
+コード側の防御 (認証境界・入力検証・資源上限・container 権限・supply chain gate) は
+CI で継続的に検証している。上記は「その外側」の設置作業であり、CI では代替できない。
