@@ -103,6 +103,11 @@ jobs:
       # scan 前に registry へ push しない。まずローカルへ load して Trivy を通す。
       - name: build for scanning
         if: env.skip != '1'
+        env:
+          # build record (*.dockerbuild) を artifact として上げない。
+          # Release に無関係なファイルが混ざるのを防ぐ。
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -149,6 +154,9 @@ jobs:
       - name: push scanned image
         id: push
         if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
+        env:
+          DOCKER_BUILD_SUMMARY: false
+          DOCKER_BUILD_RECORD_UPLOAD: false
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
@@ -300,18 +308,41 @@ jobs:
       - name: record APK fingerprints
         if: needs.preflight.outputs.publish == 'true'
         run: |
+          set -euo pipefail
+          # apksigner は build-tools に含まれる。glob が外れて黙って
+          # "certs: unavailable" を書くことがあったため、明示的に探して
+          # 見つからなければ失敗させる (SEC-007 の記録要件)。
+          apksigner=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" \
+            -name apksigner -type f 2>/dev/null | sort -V | tail -1)
+          if [ -z "$apksigner" ]; then
+            echo "::error::apksigner が見つからない (build-tools 未導入)"; exit 1
+          fi
+          echo "using: $apksigner"
+
           mkdir -p fingerprints
           out=fingerprints/android-apk.txt
           : > "$out"
-          find apps/android/src-tauri/gen/android/app/build/outputs/apk -name '*.apk' -print0 |
-            while IFS= read -r -d '' apk; do
-              echo "file: $(basename "$apk")" >> "$out"
-              echo "sha256: $(sha256sum "$apk" | cut -d' ' -f1)" >> "$out"
-              # 署名証明書の fingerprint (apksigner は build-tools に含まれる)
-              "$ANDROID_SDK_ROOT"/build-tools/*/apksigner verify --print-certs "$apk" \
-                | grep -i 'SHA-256 digest' >> "$out" || echo "certs: unavailable" >> "$out"
-              echo >> "$out"
-            done
+          mapfile -d '' apks < <(
+            find apps/android/src-tauri/gen/android/app/build/outputs/apk \
+              -name '*.apk' -print0
+          )
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "::error::APK が見つからない"; exit 1
+          fi
+          for apk in "${apks[@]}"; do
+            echo "file: $(basename "$apk")" >> "$out"
+            echo "sha256: $(sha256sum "$apk" | cut -d' ' -f1)" >> "$out"
+            # 署名の検証と証明書 fingerprint。失敗したら release を止める。
+            if ! "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1; then
+              echo "::error::APK の署名検証に失敗した: $apk"; cat /tmp/certs.txt; exit 1
+            fi
+            grep -iE 'SHA-256 digest|SHA-1 digest|Signer #1 certificate DN' /tmp/certs.txt \
+              >> "$out"
+            echo >> "$out"
+          done
+          if grep -qi 'unavailable' "$out"; then
+            echo "::error::証明書 fingerprint を記録できていない"; exit 1
+          fi
           cat "$out"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -342,6 +373,8 @@ jobs:
       - name: drop unsigned desktop artifacts
         run: |
           rm -rf artifacts/unsigned-desktop-* || true
+          # docker build record は配布物ではないので添付しない。
+          find artifacts -name '*.dockerbuild' -delete 2>/dev/null || true
           if compgen -G 'artifacts/unsigned-desktop-*' > /dev/null; then
             echo "::error::未署名 desktop 成果物を除外できていない"; exit 1
           fi

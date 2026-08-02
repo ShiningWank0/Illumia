@@ -43,3 +43,9 @@ Immich を基軸に、イラスト閲覧・漫画スタック・キャラクタ�
 ## License
 
 [LICENSE](LICENSE)
+
+## インストール・使い方
+
+プラットフォーム別の手順は [docs/14_install.md](docs/14_install.md) を参照。
+Android APK のダウンロード方法、Docker でのサーバー構築、デスクトップ版の
+ビルド手順を記載している。

@@ -135,3 +135,4 @@ Illumia/
 | 11_dedup_and_trash.md | 重複管理・ゴミ箱・誤削除防止の不変条件 |
 | 12_security.md | 脅威モデル・認証境界・インターネット公開時の必須要件 |
 | 13_model_requirements.md | ML モデルバンドルの要件・配置・較正手順 (ACR 契約) |
+| 14_install.md | プラットフォーム別のインストール・使い方 (Docker / Web / Android APK / デスクトップ) |
