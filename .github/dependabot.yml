@@ -55,3 +55,29 @@ updates:
       actions:
         patterns:
           - "*"
+
+  # Android は独立 Cargo ワークスペース。ルートの cargo 設定では追従されないため
+  # 個別に登録する (Cargo.lock をコミットしている → docs/12 SEC-007)。
+  - package-ecosystem: cargo
+    directory: /apps/android/src-tauri
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:15"
+      timezone: Asia/Tokyo
+    groups:
+      android-rust-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: npm
+    directory: /apps/android
+    schedule:
+      interval: weekly
+      day: monday
+      time: "04:30"
+      timezone: Asia/Tokyo
+    groups:
+      android-tooling:
+        patterns:
+          - "*"
