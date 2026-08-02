@@ -121,6 +121,42 @@ jobs:
         run: |
           if [ -d tests ]; then uv run pytest; else echo "no tests yet"; fi
 
+  # 実 server がビルド済み SPA を配信する経路で主要 route を開き、CSP 違反を検出する。
+  # SEC-001 (本番 Web UI が CSP で起動しない) の回帰ゲート → docs/12_security.md
+  e2e:
+    needs: changes
+    if: needs.changes.outputs.web == 'true' || needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - name: build server
+        run: cargo build --release -p illumia-server
+      - name: install web deps
+        working-directory: web
+        run: npm ci --ignore-scripts
+      - name: build web (inline script の外部化を含む)
+        working-directory: web
+        run: npm run build
+      - name: install browser
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: e2e
+        working-directory: web
+        run: npm run test:e2e
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: failure()
+        with:
+          name: playwright-report
+          path: web/test-results
+          retention-days: 7
+
   docker:
     needs: changes
     if: needs.changes.outputs.docker == 'true'
@@ -161,7 +197,7 @@ jobs:
   # ブランチ保護の必須チェックはこのジョブだけを指定する。
   # skip されたジョブは成功扱い、failure / cancelled があれば落とす。
   ci-ok:
-    needs: [changes, rust, web, ml, docker]
+    needs: [changes, rust, web, ml, e2e, docker]
     if: always()
     runs-on: ubuntu-latest
     steps:
