@@ -7,26 +7,45 @@ gen/android は CI で生成され (非コミット)、その内容はバージ�
 
 Tauri 公式ドキュメント "Sign the APK" の Kotlin DSL 手順に準拠。ローカルでは
 Android SDK/NDK が無く実ビルド検証できないため、CI 実行時にのみ効果を検証する。
+
+**Kotlin DSL の注意**: `android { ... }` の内側では `java` が Gradle の
+JavaPluginExtension に解決され、`java.util.Properties` / `java.io.FileInputStream`
+のような完全修飾名が "Unresolved reference: util" で失敗する。そのため
+ファイル先頭で明示的に import し、短い名前で参照する。
 """
 
 import sys
 from pathlib import Path
 
+# `android { }` の内側で `java.*` が使えないため先頭で import する。
+IMPORTS = ("java.io.FileInputStream", "java.util.Properties")
+
 SIGNING_BLOCK = """
     signingConfigs {
         create("release") {
-            val props = java.util.Properties()
             val propFile = rootProject.file("keystore.properties")
             if (propFile.exists()) {
-                props.load(java.io.FileInputStream(propFile))
-                keyAlias = props["keyAlias"] as String
-                keyPassword = props["password"] as String
-                storeFile = file(props["storeFile"] as String)
-                storePassword = props["password"] as String
+                val props = Properties()
+                FileInputStream(propFile).use { stream -> props.load(stream) }
+                // getProperty は String を返すのでキャスト不要
+                // (`as String` は "No cast needed" でコンパイルエラーになる)。
+                keyAlias = props.getProperty("keyAlias")
+                keyPassword = props.getProperty("password")
+                storeFile = file(props.getProperty("storeFile"))
+                storePassword = props.getProperty("password")
             }
         }
     }
 """
+
+
+def add_imports(text: str) -> str:
+    """必要な import をファイル先頭へ (冪等に) 追加する。"""
+    missing = [name for name in IMPORTS if f"import {name}" not in text]
+    if not missing:
+        return text
+    header = "".join(f"import {name}\n" for name in missing)
+    return header + text
 
 
 def inject(path: Path) -> None:
@@ -34,6 +53,8 @@ def inject(path: Path) -> None:
     if "signingConfigs {" in text and 'create("release")' in text:
         print(f"[inject-signing] already configured: {path}")
         return
+
+    text = add_imports(text)
 
     idx = text.find("android {")
     if idx == -1:
@@ -48,7 +69,7 @@ def inject(path: Path) -> None:
         insert_at = pos + len(needle)
         text = (
             text[:insert_at]
-            + "\n            signingConfig = signingConfigs.getByName(\"release\")"
+            + '\n            signingConfig = signingConfigs.getByName("release")'
             + text[insert_at:]
         )
     else:
@@ -64,6 +85,24 @@ def inject(path: Path) -> None:
         )
 
     path.write_text(text, encoding="utf-8")
+
+    # 注入後の状態を検証する。壊れた gradle を無言で残さない。
+    written = path.read_text(encoding="utf-8")
+    for name in IMPORTS:
+        if f"import {name}" not in written:
+            raise SystemExit(f"[inject-signing] import が入っていない: {name}")
+    if "signingConfig = signingConfigs.getByName(\"release\")" not in written:
+        raise SystemExit("[inject-signing] release ビルドタイプへの紐付けに失敗した")
+    # import 行そのものは完全修飾名を含むので、本文だけを見る。
+    body = "\n".join(
+        line for line in written.splitlines() if not line.startswith("import ")
+    )
+    for name in IMPORTS:
+        if name in body:
+            raise SystemExit(
+                f"[inject-signing] `{name}` の完全修飾参照が本文に残っている "
+                "(android ブロック内では解決できない)"
+            )
     print(f"[inject-signing] release signing injected into {path}")
 
 

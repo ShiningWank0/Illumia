@@ -6,19 +6,25 @@
 
 use std::{
     collections::BTreeMap,
-    io::{Read, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
+// 以下は Unix domain socket 経由の実装専用。Windows では named pipe 実装が
+// 入るまで参照されないので、cfg で分けて dead_code 警告を出さない。
 #[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use std::{
+    io::{Read, Write},
+    os::unix::net::UnixStream,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(unix)]
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
 const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -44,6 +50,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Debug)]
 pub struct MlClient {
     socket_path: PathBuf,
+    /// Windows は named pipe 実装が未了で socket 経路を通らないため参照されない。
+    #[cfg_attr(not(unix), allow(dead_code))]
     timeout: Duration,
 }
 
@@ -304,6 +312,7 @@ impl TryFrom<InstanceWire> for Instance {
     }
 }
 
+#[cfg(unix)]
 fn map_io(error: std::io::Error) -> Error {
     match error.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => Error::Unavailable,
@@ -314,6 +323,7 @@ fn map_io(error: std::io::Error) -> Error {
 
 /// HTTP 応答を読む。transport 非依存にして、将来の named pipe 実装でも使える
 /// ようにする。
+#[cfg(unix)]
 fn read_response<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
     let mut response = Vec::new();
     let header_end = loop {
