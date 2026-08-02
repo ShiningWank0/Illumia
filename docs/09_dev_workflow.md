@@ -68,7 +68,10 @@
 - `ci.yml`: push / PR で実行。paths-filter により変更のあったコンポーネントのみ
   lint + test を走らせる (docs のみの変更でも全体は green になる)。
   集約ジョブ `ci-ok` をブランチ保護の必須チェックにする。
-- Rust は `cargo audit`、Web は `npm audit` を品質ゲートに含める。Dockerに影響する変更は
+- Rust は `cargo audit`、Web は `npm audit`、Python は `uv export` + `pip-audit` を
+  品質ゲートに含める。`cargo audit` の例外は `.cargo/audit.toml` に限定し、
+  **修正版が存在せず、かつ脆弱性ではない勧告 (unmaintained 等) のみ**許可する。
+  実際の脆弱性は ignore しない。追加時は理由と再評価条件をコメントで残す。Dockerに影響する変更は
   BuildKitで実imageをbuildし、TrivyでHIGH/CRITICALをscanする。
 - `release.yml`: タグ `v*` / 手動 (workflow_dispatch) で本番ビルド。
   コンポーネント未実装の間は preflight 判定で該当ジョブを自動スキップする。

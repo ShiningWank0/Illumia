@@ -1,0 +1,21 @@
+# cargo-audit の設定 (docs/09: cargo audit を品質ゲートに含める)。
+#
+# ここに書けるのは「修正版が存在せず、かつ脆弱性ではない」勧告だけとする。
+# 実際の脆弱性 (RUSTSEC の vulnerability) は絶対に ignore しない。
+# 追加するときは必ず理由と再評価条件をコメントで残すこと。
+
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0192: ttf-parser is unmaintained
+  #
+  # 種別: unmaintained (脆弱性ではない)。
+  # 経路: illumia-desktop -> eframe/egui -> epaint -> ab_glyph -> owned_ttf_parser
+  #       -> ttf-parser。直接依存ではなく、egui のフォント描画に必須。
+  # 状況: 0.25.1 が最新で、修正版・後継への移行パスが upstream に無い。
+  #       egui 側が別パーサへ移行するまでこちらで解消できない。
+  # 影響: フォントのパースはローカルのバンドル済みフォントに対してのみ行う。
+  #       ユーザー入力のフォントファイルを読む経路は無い。
+  # 再評価: egui/epaint がフォントパーサを差し替えたら、この ignore を削除して
+  #         audit が通ることを確認する。
+  "RUSTSEC-2026-0192",
+]

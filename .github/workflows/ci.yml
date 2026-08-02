@@ -19,7 +19,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # event_name を含めないと、release から呼ばれた CI (workflow_call) と
+  # main への push で起動した CI が同じ group になり、後から来た push が
+  # release 側の CI を巻き込んで cancel してしまう。
+  group: ci-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
