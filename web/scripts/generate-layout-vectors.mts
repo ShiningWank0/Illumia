@@ -7,7 +7,11 @@
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-import { justifiedLayout, type JustifiedOptions, type LayoutItem } from '../src/lib/layout/justified';
+import {
+  justifiedLayout,
+  type JustifiedOptions,
+  type LayoutItem
+} from '../src/lib/layout/justified';
 
 interface Case {
   name: string;
