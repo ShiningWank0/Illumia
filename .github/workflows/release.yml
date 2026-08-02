@@ -351,6 +351,15 @@ jobs:
             echo "::error::未署名の実行ファイルが配布対象に含まれている"; exit 1
           fi
           find artifacts -type f | sort
+      - name: collect provenance records
+        run: |
+          # digest / fingerprint は artifact 名のサブディレクトリ配下にある。
+          find artifacts -type f -name '*.txt' -exec cat {} + > provenance.txt || true
+          if [ ! -s provenance.txt ]; then
+            echo "::error::image digest / APK fingerprint を回収できていない (SEC-007)"
+            exit 1
+          fi
+          cat provenance.txt
       - name: compose provenance notes
         run: |
           {
@@ -359,11 +368,13 @@ jobs:
             echo "- tag: \`${GITHUB_REF#refs/tags/}\`"
             echo "- commit: \`$GITHUB_SHA\`"
             echo
-            if compgen -G 'artifacts/*.txt' > /dev/null; then
+            # download-artifact は artifact 名のサブディレクトリへ展開するので、
+            # トップレベルの glob では拾えない。再帰的に探す。
+            if [ -s provenance.txt ]; then
               echo '### container image digest / APK fingerprint'
               echo
               echo '```'
-              cat artifacts/*.txt
+              cat provenance.txt
               echo '```'
             fi
             echo
