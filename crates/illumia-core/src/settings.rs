@@ -16,6 +16,7 @@ const MIN_CLUSTER_SIZE: &str = "ml.min_cluster_size";
 const QUALITY_GATE: &str = "ml.quality_gate";
 const ML_ENABLED: &str = "ml.enabled";
 const ML_SOCKET_PATH: &str = "ml.socket_path";
+const INSTANCE_ID: &str = "server.instance_id";
 
 pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub const MAX_RETENTION_DAYS: u32 = 36_500;
@@ -219,6 +220,30 @@ impl Settings {
     pub fn set_ml_socket_path(&self, value: &str) -> Result<()> {
         validate_socket_path(value)?;
         self.set(ML_SOCKET_PATH, value)
+    }
+
+    /// このサーバーインスタンスの一意な識別子。初回参照時に生成して永続化する。
+    ///
+    /// ネイティブクライアントは初回接続時にこの値を pin し、以後 pin と一致しない
+    /// サーバーへは credential を一切送らない。これにより、別ネットワーク上の攻撃者が
+    /// 同じ private IP で偽の `/api/server/info` を返しても採用されない
+    /// (→ docs/12_security.md, SEC-002)。値は乱数 UUID であり、秘密情報や
+    /// ホストの構成情報を含まない。
+    pub fn instance_id(&self) -> Result<String> {
+        // 生成時刻を漏らさないよう、時刻順 UUID ではなく純粋な乱数を使う。
+        let generated = crate::hex::encode(crate::rand::random::<[u8; 16]>());
+        self.database.with_connection(|connection| {
+            // 生成と読み出しを 1 接続で行い、同時起動でも 1 つの値に収束させる。
+            connection.execute(
+                "INSERT OR IGNORE INTO settings(key, value) VALUES (?1, ?2)",
+                params![INSTANCE_ID, generated],
+            )?;
+            Ok(connection.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                [INSTANCE_ID],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
     }
 
     fn get_u32(&self, key: &'static str, default: u32) -> Result<u32> {

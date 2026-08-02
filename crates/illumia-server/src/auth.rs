@@ -66,6 +66,9 @@ pub struct ServerInfo {
     setup_completed: bool,
     authenticated: bool,
     setup_token_required: bool,
+    /// このサーバーインスタンスの一意識別子。ネイティブクライアントが初回接続で
+    /// pin し、以後の接続先が同一サーバーであることの確認に使う (→ SEC-002)。
+    instance_id: String,
 }
 
 #[derive(Serialize)]
@@ -418,6 +421,7 @@ pub async fn server_info(
         setup_completed: state.auth.setup_completed()?,
         authenticated,
         setup_token_required: state.security.setup_token_required(),
+        instance_id: state.instance_id()?,
     }))
 }
 

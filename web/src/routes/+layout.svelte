@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { session } from '$lib/session.svelte';
   import { appMode } from '$lib/appMode.svelte';
+  import { confirmInsecureLocal } from '$lib/platform/insecurePrompt';
   import AuthGate from '$lib/components/AuthGate.svelte';
   import ConnectionSetup from '$lib/components/ConnectionSetup.svelte';
   import NavBar from '$lib/components/NavBar.svelte';
@@ -11,7 +12,8 @@
 
   onMount(async () => {
     // アプリモード (Tauri) は接続プロファイルのプローブを先に済ませる。
-    await appMode.init();
+    // 平文 HTTP の local は自動選択せず、毎回明示確認を取る (docs/12: SEC-002)。
+    await appMode.init(confirmInsecureLocal);
     if (appMode.status === 'ready') session.init();
   });
 

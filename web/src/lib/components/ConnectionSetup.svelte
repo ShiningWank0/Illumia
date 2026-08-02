@@ -1,8 +1,11 @@
 <script lang="ts">
   // アプリモードのサーバー接続設定 (docs/08)。external / local の複数 URL を登録し、
-  // local → external の到達性プローブで自動選択する。
+  // external → local の順で到達性と server identity を確認して自動選択する。
+  // 平文 HTTP の local は自動選択せず、毎回この画面で明示確認を取る (docs/12: SEC-002)。
   import { appMode } from '$lib/appMode.svelte';
   import { loadProfile } from '$lib/platform/connection';
+  import { parseServerUrl, ServerUrlError } from '$lib/platform/serverUrl';
+  import { confirmInsecureLocal } from '$lib/platform/insecurePrompt';
 
   interface Props {
     onConnected: () => void;
@@ -14,16 +17,44 @@
   let local = $state(existing?.local ?? '');
   let ssid = $state(existing?.ssid ?? '');
   let connecting = $state(false);
+  let validationError = $state<string | null>(null);
+
+  /** 入力中の local が平文 HTTP かどうか (警告表示用)。 */
+  const localIsInsecure = $derived.by(() => {
+    if (local.trim() === '') return false;
+    try {
+      return parseServerUrl(local, { allowInsecurePrivate: true }).insecure;
+    } catch {
+      return false;
+    }
+  });
 
   async function connect(e: SubmitEvent) {
     e.preventDefault();
+    validationError = null;
     if (external.trim() === '') return;
+
+    // 送信前にクライアント側でも検証し、理由を具体的に表示する。
+    try {
+      parseServerUrl(external, { label: '外部 URL' });
+      if (local.trim() !== '') {
+        parseServerUrl(local, { label: 'ローカル URL', allowInsecurePrivate: true });
+      }
+    } catch (err) {
+      validationError = err instanceof ServerUrlError ? err.message : '入力が不正です';
+      return;
+    }
+
     connecting = true;
-    const ok = await appMode.connect({
-      external: external.trim(),
-      local: local.trim() || undefined,
-      ssid: ssid.trim() || undefined
-    });
+    const ok = await appMode.connect(
+      {
+        external: external.trim(),
+        local: local.trim() || undefined,
+        ssid: ssid.trim() || undefined,
+        instanceId: existing?.instanceId
+      },
+      confirmInsecureLocal
+    );
     connecting = false;
     if (ok) onConnected();
   }
@@ -39,20 +70,28 @@
     <label>
       外部 URL (external)
       <input type="url" placeholder="https://illumia.example.com" bind:value={external} required />
+      <span class="hint">https のみ使用できます。</span>
     </label>
     <label>
       ローカル URL (local, 任意)
-      <input type="url" placeholder="http://192.168.1.10:2283" bind:value={local} />
+      <input type="url" placeholder="https://192.168.1.10:2283" bind:value={local} />
+      {#if localIsInsecure}
+        <span class="warn">
+          暗号化されていない HTTP です。自動では選択せず、接続のたびに確認します。可能なら https
+          を設定してください。
+        </span>
+      {/if}
     </label>
     <label>
       ローカル用 Wi-Fi SSID (任意)
       <input type="text" placeholder="MyHomeWiFi" bind:value={ssid} />
       <span class="hint">
-        現状 SSID の自動取得プラグインが無いため判定には使いません。到達性プローブ (local→external,
-        各 2 秒) で自動選択します。
+        現状 SSID の自動取得プラグインが無いため判定には使いません。外部 URL を先に試し、
+        サーバー識別子が初回接続時と一致した場合のみ接続します。
       </span>
     </label>
 
+    {#if validationError}<p class="err">{validationError}</p>{/if}
     {#if appMode.error}<p class="err">{appMode.error}</p>{/if}
 
     <button class="primary" type="submit" disabled={connecting || external.trim() === ''}>
@@ -96,6 +135,10 @@
   }
   .hint {
     color: #71717a;
+    font-size: 0.75rem;
+  }
+  .warn {
+    color: #fbbf24;
     font-size: 0.75rem;
   }
   input {

@@ -24,10 +24,20 @@ Immich モバイルアプリを参考にする。
 - 初回セットアップでは、server が `setup_token_required=true` を返した場合だけ
   管理者が別経路で取得した setup token も入力する。setup token は保存しない。
 - **ネットワーク別エンドポイント**: 1 つのサーバー登録に対して複数 URL を持てる。
-  - `external`: 例 `https://illumia.example.com` (既定)
-  - `local`: 例 `http://192.168.1.10:2283` (特定ネットワーク内でのみ有効)
-- 選択ロジック: 接続時に local → external の順で到達性プローブ (`/api/server/info`,
-  timeout 2s) し、最初に成功した方を使う。セッション中に失敗したら再プローブ。
+  - `external`: 例 `https://illumia.example.com` (既定)。**`https` のみ**。平文 HTTP は
+    設定ミスで credential を平文送信する経路になるため例外を設けない。
+  - `local`: 例 `https://192.168.1.10:2283` (特定ネットワーク内でのみ有効)。
+    平文 HTTP はプライベートアドレス宛のみ受理し、**自動選択しない**。
+- 選択ロジック: 接続時に **external → local** の順で到達性プローブ (`/api/server/info`,
+  timeout 2s) し、最初に検証を通った方を使う。セッション中に失敗したら再プローブ。
+  - local を先に試すと、別ネットワーク上の攻撃者が同じ private IP で偽サーバーを
+    立てるだけで採用され、共有パスワード・setup token・device token を奪える
+    (→ docs/12_security.md)。このため **external を先に試す**。
+  - local が平文 HTTP の場合は自動選択せず、接続のたびに利用者の明示確認を取る。
+- **サーバー識別子の pin (TOFU)**: `/api/server/info` は `instance_id` (サーバー初回起動時に
+  生成する乱数) を返す。クライアントは初回接続でこれを pin し、以後 pin と一致しない
+  サーバーへは credential を一切送らない。到達性プローブは 2xx だけでは信用せず、
+  response schema と `instance_id` の一致を確認する。
 - Android では local URL に **Wi-Fi SSID を紐付け**るオプション: 指定 SSID に
   接続中のみ local を試す (位置情報権限が必要な旨を UI で説明)。
   - **M5 時点の縮退動作**: SSID を自動取得する Tauri プラグインが未整備のため、

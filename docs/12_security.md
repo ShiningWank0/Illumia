@@ -51,6 +51,15 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
   token を返さず、JavaScript から保存・参照しない。
 - Cookie 認証の非 safe method は同一 authority の `Origin` を必須とする。
 - ネイティブは Bearer token を使い、OS secure storage に保存する。
+- ネイティブの接続先 URL は保存・読み出し・接続の各時点で検証する。`external` は
+  `https` のみ。credential 埋め込み・query・fragment・path・制御文字を含む URL は拒否する
+  (URL パーサは tab/改行を黙って除去するため、parse 前の生文字列で弾く)。
+- 接続先の選択順は **external → local**。平文 HTTP の `local` は自動選択せず、
+  使用のたびに利用者の明示確認を取る。
+- クライアントは初回接続で server の `instance_id` を pin し、pin と一致しない server へは
+  credential を送らない。到達性プローブは 2xx のみでは信用せず、response schema と
+  `instance_id` を検証する。これは信頼できない Wi-Fi 上で攻撃者が同じ private IP に
+  偽 server を立てる攻撃に対する防御であり、初回登録時のみ TOFU になる。
 - token は URL query、WebSocket URL、HTML、通常ログ、error message に含めない。
 - WS の Cookie 認証でも同一 authority の `Origin` を要求する。
 - login/setup には失敗回数と同時 Argon2 実行数の上限を設ける。edge 側にも送信元 IP

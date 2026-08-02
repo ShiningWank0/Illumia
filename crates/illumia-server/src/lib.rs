@@ -123,6 +123,12 @@ impl AppState {
         }
     }
 
+    /// このサーバーインスタンスの一意識別子 (初回参照時に生成・永続化)。
+    /// ネイティブクライアントの接続先 pin に使う (→ docs/12_security.md, SEC-002)。
+    fn instance_id(&self) -> Result<String, error::ApiError> {
+        Ok(Settings::new(self.database.clone()).instance_id()?)
+    }
+
     fn notify_assets_added(&self, bucket_key: &str) {
         let _ = self.events.send(json!({
             "type": "assets_added",
