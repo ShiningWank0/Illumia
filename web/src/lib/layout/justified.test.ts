@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+
 import { describe, expect, it } from 'vitest';
 import fc from 'fast-check';
 
@@ -164,4 +166,25 @@ describe('justifiedLayout: edge cases', () => {
     }
     expect(rows[rows.length - 1].isLastRow).toBe(true);
   });
+});
+
+// 共有テストベクタ (testdata/justified_layout.json) との一致。
+// egui 版 (crates/illumia-desktop) が同じファイルを読んで検証するため、
+// ここが通り Rust 側も通れば、両実装の結果が一致していることになる (docs/08)。
+describe('共有テストベクタ', () => {
+  const vectors = JSON.parse(
+    readFileSync(new URL('../../../../testdata/justified_layout.json', import.meta.url), 'utf8')
+  ) as {
+    cases: { name: string; items: LayoutItem[]; options: JustifiedOptions; rows: Row[] }[];
+  };
+
+  it('ベクタが生成済みである', () => {
+    expect(vectors.cases.length).toBeGreaterThanOrEqual(8);
+  });
+
+  for (const testCase of vectors.cases) {
+    it(`${testCase.name} が記録済みの結果と一致する`, () => {
+      expect(justifiedLayout(testCase.items, testCase.options)).toEqual(testCase.rows);
+    });
+  }
 });

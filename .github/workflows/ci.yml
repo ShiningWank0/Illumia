@@ -73,6 +73,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      # illumia-desktop (eframe/glow) のビルドに必要な X11/Wayland/GL の開発ヘッダ。
+      - name: install desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev \
+            libxcb-xfixes0-dev libx11-dev libgl1-mesa-dev
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy

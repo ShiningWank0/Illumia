@@ -1,0 +1,34 @@
+[package]
+name = "illumia-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Illumia デスクトップクライアント (egui / eframe, M6)"
+
+[dependencies]
+illumia-core = { path = "../illumia-core" }
+anyhow = "1.0.104"
+eframe = { version = "0.33", default-features = false, features = [
+  "default_fonts",
+  "glow",
+  "wayland",
+  "x11",
+] }
+egui = "0.33"
+egui_extras = { version = "0.33", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["webp"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+# client-only モードのリモート接続用。all-in-one では使わない。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+directories = "6"
+
+[dev-dependencies]
+# 実データ検証用に PNG エンコードが必要 (テストのみ)。
+image = { version = "0.25", default-features = false, features = ["webp", "png"] }
+
+[lints]
+workspace = true

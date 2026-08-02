@@ -79,6 +79,18 @@ Immich のモバイルバックアップ相当。
 
 ## デスクトップ (egui, M6)
 
+- **M6 v1 の実装範囲** (`crates/illumia-desktop`):
+  - client-only / all-in-one の 2 形態を `Backend` trait の実装差で切り替える。
+  - all-in-one は `illumia-core` のサービス層を in-process 直呼びし、HTTP クライアントも
+    listener も持たない。「TCP を一切 bind しない」ことは型構造で保証し、
+    実プロセスに listen 中の TCP ソケットが無いことをテストでも検証する。
+  - justified レイアウトを Rust へ移植。Web 版と共有のテストベクタ
+    (`testdata/justified_layout.json`) で結果一致を検証する。
+  - タイムライン (粒度切替・バケット一覧・justified タイル) とビューア。
+- **M6 v1 の未実装** (→ docs/10): 自動アップロード (notify によるフォルダ監視)、
+  Touch ID / Windows Hello、漫画スタック・Vault・検索・人物クラスタの各画面、
+  ML サイドカーの同梱。これらは Web / Android 側では利用できる。
+
 - 配布形態は 2 種 (同一アプリ名・起動時またはインストール時に選択):
   - **client-only**: リモートサーバーへ HTTP 接続。接続設定は上記共通仕様。
   - **all-in-one**: サーバー機能を同プロセスに内包。**TCP listener を持たず、

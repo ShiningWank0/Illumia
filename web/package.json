@@ -17,7 +17,8 @@
     "format": "prettier --write .",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "gen:layout-vectors": "vite-node scripts/generate-layout-vectors.mts"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",

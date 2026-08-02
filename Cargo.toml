@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/illumia-core", "crates/illumia-server"]
-# crates/illumia-desktop は M6 で追加 (→ docs/01_architecture.md)
+members = ["crates/illumia-core", "crates/illumia-server", "crates/illumia-desktop"]
 
 [workspace.package]
 version = "0.1.0"
