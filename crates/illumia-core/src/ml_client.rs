@@ -1,12 +1,18 @@
 //! Stateless ML sidecar client over a Unix domain socket.
+//!
+//! docs/01 は Windows では named pipe を使うと定めているが未実装で、
+//! Windows ビルドでは ML を利用不可 (`Error::Unavailable`) として扱う。
+//! TCP は開かない (docs/01 の必須要件) ため、代替に TCP を使うことはしない。
 
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
-    os::unix::net::UnixStream,
     path::{Path, PathBuf},
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -223,6 +229,28 @@ impl MlClient {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<Vec<u8>> {
+        #[cfg(not(unix))]
+        {
+            // Windows の named pipe 実装は未了 (docs/01)。TCP へは決してフォールバック
+            // しない。呼び出し側は ML 無効時と同じ経路で扱う。
+            let _ = (method, path, content_type, body);
+            return Err(Error::Unavailable);
+        }
+
+        #[cfg(unix)]
+        {
+            self.request_over_unix_socket(method, path, content_type, body)
+        }
+    }
+
+    #[cfg(unix)]
+    fn request_over_unix_socket(
+        &self,
+        method: &str,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<Vec<u8>> {
         let mut stream = UnixStream::connect(&self.socket_path).map_err(map_io)?;
         stream
             .set_read_timeout(Some(self.timeout))
@@ -284,7 +312,9 @@ fn map_io(error: std::io::Error) -> Error {
     }
 }
 
-fn read_response(stream: &mut UnixStream) -> Result<Vec<u8>> {
+/// HTTP 応答を読む。transport 非依存にして、将来の named pipe 実装でも使える
+/// ようにする。
+fn read_response<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
     let mut response = Vec::new();
     let header_end = loop {
         if response.len() >= MAX_HEADER_BYTES {
