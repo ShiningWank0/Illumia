@@ -1,4 +1,11 @@
-use std::{fs, io::Cursor, path::Path};
+use std::{
+    fs,
+    io::Cursor,
+    path::Path,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use illumia_core::{
     assets::AssetService,
@@ -151,6 +158,30 @@ fn blob_roundtrip_and_aead_tamper_and_aad_checks() -> Result<()> {
 }
 
 #[test]
+fn revoking_one_handle_invalidates_all_key_clones_and_open_readers() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let blob_id = fixture.vault.write_blob(&vec![7_u8; 2 * 1024 * 1024])?;
+    let clone = fixture.vault.clone();
+    let mut reader = clone.blob_reader(&blob_id)?;
+    assert!(reader.next().transpose()?.is_some());
+
+    fixture.vault.revoke();
+    assert!(matches!(
+        clone.ensure_active(),
+        Err(Error::VaultAuthenticationFailed)
+    ));
+    assert!(matches!(
+        reader.next(),
+        Some(Err(Error::VaultAuthenticationFailed))
+    ));
+    assert!(matches!(
+        clone.read_blob(&blob_id),
+        Err(Error::VaultAuthenticationFailed)
+    ));
+    Ok(())
+}
+
+#[test]
 fn vault_database_rejects_keyless_sqlite_access() -> Result<()> {
     let fixture = Fixture::new()?;
     fixture.vault.db.with_connection(|connection| {
@@ -233,6 +264,158 @@ fn import_removes_every_plaintext_trace_and_core_services_use_vault_db() -> Resu
     );
     assert_eq!(fixture.vault.read_blob(&vault_asset.library_path)?, bytes);
     assert_eq!(vault_blob_count(&fixture.vault.db, &asset.id)?, 3);
+    Ok(())
+}
+
+#[test]
+fn import_rejects_partial_duplicate_closure_before_deleting_source_files() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let bytes = png(12);
+    let service = AssetService::new(fixture.main.clone());
+    let canonical = service.ingest(&bytes, "canonical.png", None)?.asset;
+    let duplicate = service.ingest(&bytes, "duplicate.png", None)?.asset;
+    let canonical_path = fixture.root().join(&canonical.library_path);
+    let duplicate_path = fixture.root().join(&duplicate.library_path);
+
+    assert!(matches!(
+        import_assets(
+            &fixture.main,
+            &fixture.vault,
+            std::slice::from_ref(&canonical.id)
+        ),
+        Err(Error::IncompleteVaultTransfer)
+    ));
+    assert!(canonical_path.is_file());
+    assert!(duplicate_path.is_file());
+    assert!(service.get(&canonical.id)?.is_some());
+    assert_eq!(
+        service
+            .get(&duplicate.id)?
+            .and_then(|asset| asset.duplicate_of),
+        Some(canonical.id.clone())
+    );
+    assert!(
+        AssetService::new(fixture.vault.db.clone())
+            .get(&canonical.id)?
+            .is_none()
+    );
+
+    import_assets(
+        &fixture.main,
+        &fixture.vault,
+        &[canonical.id.clone(), duplicate.id.clone()],
+    )?;
+    assert!(service.get(&canonical.id)?.is_none());
+    assert!(service.get(&duplicate.id)?.is_none());
+    assert!(matches!(
+        export_assets(
+            &fixture.vault,
+            &fixture.main,
+            std::slice::from_ref(&canonical.id)
+        ),
+        Err(Error::IncompleteVaultTransfer)
+    ));
+    assert!(
+        AssetService::new(fixture.vault.db.clone())
+            .get(&canonical.id)?
+            .is_some()
+    );
+    Ok(())
+}
+
+#[test]
+fn import_reselects_shared_cluster_cover_without_plaintext_vault_face_id() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let service = AssetService::new(fixture.main.clone());
+    let moved = service.ingest(&png(13), "moved.png", None)?.asset;
+    let remaining = service.ingest(&png(14), "remaining.png", None)?.asset;
+    fixture.main.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO clusters(id, name, cover_face_id, created_by, created_at)
+             VALUES ('shared', 'shared', 'moved-face', 'user', '2026-01-01T00:00:00Z')",
+            [],
+        )?;
+        for (face_id, asset_id) in [
+            ("moved-face", moved.id.as_str()),
+            ("remaining-face", remaining.id.as_str()),
+        ] {
+            connection.execute(
+                "INSERT INTO faces(id, asset_id, kind, bbox, det_conf, model_version,
+                                   cluster_id, state)
+                 VALUES (?1, ?2, 'face', '[0,0,1,1]', 1.0, 'test', 'shared', 'confirmed')",
+                rusqlite::params![face_id, asset_id],
+            )?;
+        }
+        Ok(())
+    })?;
+
+    import_assets(
+        &fixture.main,
+        &fixture.vault,
+        std::slice::from_ref(&moved.id),
+    )?;
+
+    let source_cover = fixture.main.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT cover_face_id FROM clusters WHERE id = 'shared'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(Into::into)
+    })?;
+    assert_eq!(source_cover.as_deref(), Some("remaining-face"));
+    let destination_cover = fixture.vault.db.with_connection(|connection| {
+        connection
+            .query_row(
+                "SELECT cover_face_id FROM clusters WHERE id = 'shared'",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .map_err(Into::into)
+    })?;
+    assert_eq!(destination_cover.as_deref(), Some("moved-face"));
+    Ok(())
+}
+
+#[test]
+fn direct_vault_ingest_never_persists_plaintext_in_main_storage() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let bytes = png(19);
+    let original_name = "直接暗号化作品.png";
+
+    let ingested = fixture.vault.ingest(&bytes, original_name, None)?;
+
+    assert!(
+        AssetService::new(fixture.main.clone())
+            .get(&ingested.asset.id)?
+            .is_none()
+    );
+    assert_eq!(
+        fixture.vault.read_blob(&ingested.asset.library_path)?,
+        bytes
+    );
+    assert!(
+        !fixture.root().join("library").exists()
+            || fs::read_dir(fixture.root().join("library"))?
+                .next()
+                .is_none()
+    );
+    assert!(
+        !fixture.root().join("thumbs").exists()
+            || fs::read_dir(fixture.root().join("thumbs"))?
+                .next()
+                .is_none()
+    );
+    fixture.main.checkpoint_truncate()?;
+    let database_bytes = fs::read(fixture.root().join("illumia.db"))?;
+    assert!(!contains_bytes(
+        &database_bytes,
+        ingested.asset.id.as_bytes()
+    ));
+    assert!(!contains_bytes(&database_bytes, original_name.as_bytes()));
+    let staging = fixture.root().join("vault").join("transfer-staging");
+    assert!(!staging.exists() || fs::read_dir(staging)?.next().is_none());
     Ok(())
 }
 
@@ -327,6 +510,67 @@ fn export_removes_every_vault_trace_and_restores_plaintext_asset() -> Result<()>
     );
     assert_eq!(fts_count(&fixture.vault.db, &asset.id)?, 0);
     Ok(())
+}
+
+#[test]
+fn export_writes_plaintext_before_waiting_for_the_main_database_mutex() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let asset = AssetService::new(fixture.main.clone())
+        .ingest(&png(151), "export-lock-order.png", None)?
+        .asset;
+    import_assets(
+        &fixture.main,
+        &fixture.vault,
+        std::slice::from_ref(&asset.id),
+    )?;
+
+    let locked_database = fixture.main.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let locker = thread::spawn(move || {
+        locked_database.with_connection(|_| {
+            locked_tx.send(()).expect("signal held main database mutex");
+            release_rx.recv().expect("release main database mutex");
+            Ok(())
+        })
+    });
+    locked_rx
+        .recv()
+        .expect("main database mutex should be held");
+
+    let vault = fixture.vault.clone();
+    let main = fixture.main.clone();
+    let id = asset.id.clone();
+    let export = thread::spawn(move || export_assets(&vault, &main, &[id]));
+    let library = fixture.root().join("library");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !contains_regular_file(&library)? {
+        assert!(
+            Instant::now() < deadline,
+            "decrypt/write must finish before export waits for the main SQLite mutex"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    release_tx.send(()).expect("release main database mutex");
+    locker.join().expect("locker thread")?;
+    export.join().expect("export thread")?;
+    Ok(())
+}
+
+fn contains_regular_file(path: &Path) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file()
+            || (entry.file_type()?.is_dir() && contains_regular_file(&entry.path())?)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn assert_plaintext_database_has_no_trace(database: &Database, asset_id: &str) -> Result<()> {

@@ -1,10 +1,22 @@
-use std::{fs, io::Cursor};
+use std::{
+    fs,
+    io::Cursor,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
+    thread,
+};
 
 use illumia_core::{
     assets::AssetService,
     db::{Database, Error, Result},
     search::SearchService,
-    settings::{MAX_CLUSTER_SIZE_VALUE, MAX_JOB_CONCURRENCY, MAX_RETENTION_DAYS, Settings},
+    settings::{
+        MAX_CLUSTER_SIZE_VALUE, MAX_JOB_CONCURRENCY, MAX_ML_CONCURRENCY, MAX_RETENTION_DAYS,
+        Settings,
+    },
     stacks::StackService,
     uuid::Uuid,
     vault::{KdfParams, VaultHandle, import_assets, init_with_kdf, unlock},
@@ -76,6 +88,7 @@ fn settings_reject_resource_exhaustion_values_at_the_core_boundary() -> Result<(
             .set_thumbnail_concurrency(MAX_JOB_CONCURRENCY + 1)
             .is_err()
     );
+    assert!(settings.set_ml_concurrency(MAX_ML_CONCURRENCY + 1).is_err());
     assert!(
         settings
             .set_trash_retention_days(MAX_RETENTION_DAYS + 1)
@@ -183,5 +196,59 @@ fn data_root_databases_and_keyfile_are_owner_only() -> Result<()> {
         assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o600);
     }
     drop(database);
+    Ok(())
+}
+
+#[test]
+fn guarded_database_rechecks_revocation_after_waiting_for_the_mutex() -> Result<()> {
+    let directory = TempDir::new()?;
+    let database = Database::open(directory.path())?;
+    let locked_database = database.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let locker = thread::spawn(move || {
+        locked_database.with_connection(|_| {
+            locked_tx.send(()).expect("signal database mutex");
+            release_rx.recv().expect("release database mutex");
+            Ok(())
+        })
+    });
+    locked_rx.recv().expect("database mutex should be held");
+
+    let active = Arc::new(AtomicBool::new(true));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let (first_check_tx, first_check_rx) = mpsc::channel();
+    let guard_active = Arc::clone(&active);
+    let guard_checks = Arc::clone(&checks);
+    let guarded = database.with_access_guard(move || {
+        if guard_checks.fetch_add(1, Ordering::AcqRel) == 0 {
+            first_check_tx.send(()).expect("signal first guard check");
+        }
+        if guard_active.load(Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(Error::VaultAuthenticationFailed)
+        }
+    });
+    let mutation = thread::spawn(move || {
+        guarded.with_connection(|connection| {
+            connection.execute(
+                "UPDATE settings SET value = '999' WHERE key = 'trash.retention_days'",
+                [],
+            )?;
+            Ok(())
+        })
+    });
+    first_check_rx
+        .recv()
+        .expect("operation should validate before waiting");
+    active.store(false, Ordering::Release);
+    release_tx.send(()).expect("release database mutex");
+    locker.join().expect("locker thread")?;
+    assert!(matches!(
+        mutation.join().expect("mutation thread"),
+        Err(Error::VaultAuthenticationFailed)
+    ));
+    assert_eq!(Settings::new(database).trash_retention_days()?, 30);
     Ok(())
 }

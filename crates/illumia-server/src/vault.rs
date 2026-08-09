@@ -3,7 +3,6 @@
 //! `vault: no-log` — do not log tokens, filenames, asset ids, search terms, or key material.
 
 use std::{
-    path::{Path, PathBuf},
     sync::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
@@ -35,7 +34,7 @@ pub(crate) struct VaultSessionManager {
 
 #[derive(Debug)]
 struct SessionManagerInner {
-    data_root: PathBuf,
+    main: illumia_core::db::Database,
     ttl: Duration,
     session: Mutex<Option<VaultSession>>,
     next_generation: AtomicU64,
@@ -53,6 +52,7 @@ struct VaultSession {
 pub(crate) struct VaultAccess {
     pub(crate) handle: VaultHandle,
     token_hash: [u8; 32],
+    pub(crate) generation: u64,
 }
 
 #[derive(Debug)]
@@ -62,10 +62,10 @@ pub(crate) struct IssuedSession {
 }
 
 impl VaultSessionManager {
-    pub(crate) fn new(data_root: impl AsRef<Path>, ttl: Duration) -> Self {
+    pub(crate) fn new(main: illumia_core::db::Database, ttl: Duration) -> Self {
         Self {
             inner: Arc::new(SessionManagerInner {
-                data_root: data_root.as_ref().to_path_buf(),
+                main,
                 ttl,
                 session: Mutex::new(None),
                 next_generation: AtomicU64::new(1),
@@ -75,7 +75,8 @@ impl VaultSessionManager {
 
     pub(crate) fn initialized(&self) -> bool {
         self.inner
-            .data_root
+            .main
+            .data_root()
             .join("vault")
             .join("vault.keyfile")
             .is_file()
@@ -88,7 +89,8 @@ impl VaultSessionManager {
         &self,
         password: &str,
     ) -> illumia_core::db::Result<IssuedSession> {
-        let handle = VaultHandle::unlock(&self.inner.data_root, password)?;
+        let handle = VaultHandle::unlock(self.inner.main.data_root(), password)?;
+        illumia_core::vault::reconcile_transfers(&self.inner.main, &handle)?;
         Ok(self.issue(handle))
     }
 
@@ -99,7 +101,8 @@ impl VaultSessionManager {
         &self,
         recovery_key: &str,
     ) -> illumia_core::db::Result<IssuedSession> {
-        let handle = VaultHandle::unlock_with_recovery(&self.inner.data_root, recovery_key)?;
+        let handle = VaultHandle::unlock_with_recovery(self.inner.main.data_root(), recovery_key)?;
+        illumia_core::vault::reconcile_transfers(&self.inner.main, &handle)?;
         Ok(self.issue(handle))
     }
 
@@ -113,7 +116,9 @@ impl VaultSessionManager {
             let mut session = self.session();
             let current = session.as_mut()?;
             if current.expires_at <= now {
-                session.take();
+                if let Some(expired) = session.take() {
+                    expired.handle.revoke();
+                }
                 return None;
             }
             if !constant_time_eq(&current.token_hash, &candidate) {
@@ -123,8 +128,31 @@ impl VaultSessionManager {
             Some(VaultAccess {
                 handle: current.handle.clone(),
                 token_hash: current.token_hash,
+                generation: current.generation,
             })
         }
+    }
+
+    /// Returns whether this exact unlock generation is still the active session.
+    ///
+    /// This deliberately does not refresh the TTL: long-running requests must
+    /// observe expiry, lock, or replacement instead of silently extending it.
+    /// `vault: no-log`
+    pub(crate) fn generation_active(&self, generation: u64) -> bool {
+        let now = Instant::now();
+        let mut session = self.session();
+        if session
+            .as_ref()
+            .is_some_and(|current| current.expires_at <= now)
+        {
+            if let Some(expired) = session.take() {
+                expired.handle.revoke();
+            }
+            return false;
+        }
+        session.as_ref().is_some_and(|current| {
+            current.generation == generation && current.handle.ensure_active().is_ok()
+        })
     }
 
     /// Removes the active session only when it is still the authenticated one.
@@ -135,8 +163,9 @@ impl VaultSessionManager {
         if session
             .as_ref()
             .is_some_and(|current| constant_time_eq(&current.token_hash, &access.token_hash))
+            && let Some(locked) = session.take()
         {
-            session.take();
+            locked.handle.revoke();
         }
     }
 
@@ -145,8 +174,9 @@ impl VaultSessionManager {
         if session
             .as_ref()
             .is_some_and(|current| current.expires_at <= Instant::now())
+            && let Some(expired) = session.take()
         {
-            session.take();
+            expired.handle.revoke();
         }
         session.is_some()
     }
@@ -161,12 +191,14 @@ impl VaultSessionManager {
             + illumia_core::chrono::Duration::from_std(self.inner.ttl)
                 .unwrap_or_else(|_| illumia_core::chrono::Duration::minutes(15)))
         .to_rfc3339_opts(SecondsFormat::Micros, true);
-        self.session().replace(VaultSession {
+        if let Some(replaced) = self.session().replace(VaultSession {
             token_hash,
             handle,
             expires_at: expires_at_instant,
             generation,
-        });
+        }) {
+            replaced.handle.revoke();
+        }
         self.arm_expiry(generation);
         IssuedSession { token, expires_at }
     }
@@ -192,8 +224,9 @@ impl VaultSessionManager {
                 let mut session = manager.session();
                 if session.as_ref().is_some_and(|current| {
                     current.generation == generation && current.expires_at <= Instant::now()
-                }) {
-                    session.take();
+                }) && let Some(expired) = session.take()
+                {
+                    expired.handle.revoke();
                 }
                 return;
             }

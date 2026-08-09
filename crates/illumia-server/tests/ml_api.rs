@@ -124,21 +124,28 @@ async fn authenticated_cluster_merge_split_review_and_minimum_filter_flow() {
                 .asset
         })
         .collect::<Vec<_>>();
+    let into_id = Uuid::now_v7().to_string();
+    let into_a_id = Uuid::now_v7().to_string();
+    let accept_id = Uuid::now_v7().to_string();
     let faces = [
         ("from-a", 0, "from", "auto"),
         ("from-b", 1, "from", "auto"),
         ("from-c", 2, "from", "auto"),
         ("reject-me", 3, "from", "candidate"),
-        ("into-a", 4, "into", "auto"),
-        ("into-b", 5, "into", "auto"),
-        ("into-c", 6, "into", "auto"),
-        ("accept-me", 7, "into", "candidate"),
+        (into_a_id.as_str(), 4, into_id.as_str(), "auto"),
+        ("into-b", 5, into_id.as_str(), "auto"),
+        ("into-c", 6, into_id.as_str(), "auto"),
+        (accept_id.as_str(), 7, into_id.as_str(), "candidate"),
         ("small-a", 8, "small", "auto"),
         ("small-b", 9, "small", "auto"),
     ];
     app.database
         .with_connection(|connection| {
-            for (id, name) in [("from", None), ("into", Some("Before")), ("small", None)] {
+            for (id, name) in [
+                ("from", None),
+                (into_id.as_str(), Some("Before")),
+                ("small", None),
+            ] {
                 connection.execute(
                     "INSERT INTO clusters(id, name, created_by, created_at)
                      VALUES (?1, ?2, 'user', '2026-01-01T00:00:00Z')",
@@ -197,7 +204,7 @@ async fn authenticated_cluster_merge_split_review_and_minimum_filter_flow() {
     let (status, accepted) = app
         .json(
             Method::POST,
-            "/api/review/candidates/accept-me",
+            &format!("/api/review/candidates/{accept_id}"),
             Some(&token),
             json!({"action":"accept"}),
         )
@@ -210,17 +217,17 @@ async fn authenticated_cluster_merge_split_review_and_minimum_filter_flow() {
             Method::POST,
             "/api/clusters/merge",
             Some(&token),
-            json!({"from_id":"from", "into_id":"into"}),
+            json!({"from_id":"from", "into_id":into_id}),
         )
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(merged["id"], "into");
+    assert_eq!(merged["id"], into_id);
     assert_eq!(merged["asset_count"], 7);
 
     let (status, renamed) = app
         .json(
             Method::PATCH,
-            "/api/clusters/into",
+            &format!("/api/clusters/{into_id}"),
             Some(&token),
             json!({"name":"Hero Team"}),
         )
@@ -229,21 +236,23 @@ async fn authenticated_cluster_merge_split_review_and_minimum_filter_flow() {
     assert_eq!(renamed["name"], "Hero Team");
     let (status, search) = app.get("/api/search?q=Hero", Some(&token)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(search["clusters"][0]["id"], "into");
+    assert_eq!(search["clusters"][0]["id"], into_id);
 
     let (status, split) = app
         .json(
             Method::POST,
-            "/api/clusters/into/split",
+            &format!("/api/clusters/{into_id}/split"),
             Some(&token),
-            json!({"face_ids":["accept-me", "into-a"]}),
+            json!({"face_ids":[accept_id, into_a_id]}),
         )
         .await;
     assert_eq!(status, StatusCode::CREATED);
-    assert_ne!(split["id"], "into");
+    assert_ne!(split["id"], into_id);
     assert_eq!(split["asset_count"], 2);
 
-    let (status, assets_response) = app.get("/api/clusters/into/assets", Some(&token)).await;
+    let (status, assets_response) = app
+        .get(&format!("/api/clusters/{into_id}/assets"), Some(&token))
+        .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(assets_response.as_array().expect("assets").len(), 5);
 }

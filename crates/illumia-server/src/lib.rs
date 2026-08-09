@@ -10,34 +10,46 @@ mod security_tests;
 mod vault;
 
 use std::{
-    net::SocketAddr,
+    collections::{HashMap, HashSet},
+    future::Future,
+    io,
+    net::IpAddr,
     path::PathBuf,
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
 use axum::{
-    Json, Router,
-    extract::{DefaultBodyLimit, MatchedPath, Request},
+    Extension, Json, Router,
+    extract::{ConnectInfo, DefaultBodyLimit, MatchedPath, Request},
     http::{StatusCode, header::CONTENT_TYPE},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
+};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo, TokioTimer},
+    server::conn::auto::Builder as ConnectionBuilder,
+    service::TowerToHyperService,
 };
 use illumia_core::{
     PurgeService,
     db::Database,
     jobs::JobRunner,
     ml::{ML_ANALYZE_JOB_KIND, ML_RECLUSTER_JOB_KIND, MlService},
-    ml_client::MlClient,
+    ml_client::{Health as MlHealth, MlClient},
     settings::Settings,
     thumbnails::{self, THUMBNAIL_JOB_KIND, ThumbnailPayload},
 };
 use serde_json::{Value, json};
-use tokio::sync::broadcast;
+use tokio::sync::{Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore, broadcast};
 use tower_http::{
     services::{ServeDir, ServeFile},
+    timeout::{RequestBodyTimeoutLayer, ResponseBodyTimeoutLayer},
     trace::TraceLayer,
 };
 
@@ -47,6 +59,76 @@ pub use illumia_core::VERSION;
 const EVENT_BUFFER: usize = 128;
 const JSON_BODY_LIMIT: usize = 256 * 1024;
 const UPLOAD_BODY_LIMIT: usize = 129 * 1024 * 1024;
+const ML_HEALTH_CACHE_TTL: Duration = Duration::from_secs(5);
+const MAX_CONCURRENT_ML_HEALTH_PROBES: usize = 1;
+const MAX_CONCURRENT_BLOCKING_DB_REQUESTS: usize = 8;
+#[cfg(not(test))]
+pub(crate) const MAX_HTTP_CONNECTIONS: usize = 256;
+#[cfg(test)]
+pub(crate) const MAX_HTTP_CONNECTIONS: usize = 8;
+#[cfg(not(test))]
+pub(crate) const MAX_HTTP_CONNECTIONS_PER_IP: usize = 32;
+#[cfg(test)]
+pub(crate) const MAX_HTTP_CONNECTIONS_PER_IP: usize = 2;
+#[cfg(not(test))]
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const HTTP_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(not(test))]
+const HTTP_BODY_PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const HTTP_BODY_PROGRESS_TIMEOUT: Duration = Duration::from_millis(300);
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const HTTP_CONNECTION_MAX_LIFETIME: Duration = Duration::from_secs(10 * 60);
+const HTTP_GRACEFUL_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP2_STREAMS_PER_CONNECTION: u32 = 32;
+
+struct HttpConnectionPermit {
+    _global: OwnedSemaphorePermit,
+    peer: IpAddr,
+    by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl HttpConnectionPermit {
+    fn try_new(
+        global: OwnedSemaphorePermit,
+        peer: IpAddr,
+        by_ip: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ) -> Option<Self> {
+        let mut counts = by_ip.lock().unwrap_or_else(|error| error.into_inner());
+        let active = counts.entry(peer).or_default();
+        if *active >= MAX_HTTP_CONNECTIONS_PER_IP {
+            return None;
+        }
+        *active += 1;
+        drop(counts);
+        Some(Self {
+            _global: global,
+            peer,
+            by_ip,
+        })
+    }
+}
+
+impl Drop for HttpConnectionPermit {
+    fn drop(&mut self) {
+        let mut counts = self.by_ip.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(active) = counts.get_mut(&self.peer) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                counts.remove(&self.peer);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedMlHealth {
+    socket_path: PathBuf,
+    checked_at: tokio::time::Instant,
+    health: Option<MlHealth>,
+}
 
 #[derive(Clone, Debug)]
 struct MlConcurrencyGate {
@@ -99,6 +181,12 @@ pub struct AppState {
     events: broadcast::Sender<Value>,
     security: security::Security,
     vault: vault::VaultSessionManager,
+    job_poller_started: Arc<AtomicBool>,
+    ml_probe_slots: Arc<Semaphore>,
+    ml_health_cache: Arc<AsyncMutex<Option<CachedMlHealth>>>,
+    ml_gate: MlConcurrencyGate,
+    vault_ml_workers: Arc<Mutex<HashSet<u64>>>,
+    blocking_db_slots: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -108,18 +196,30 @@ impl AppState {
         vault_ttl: Duration,
         setup_token_hash: Option<[u8; 32]>,
         secure_cookies: bool,
-        trust_proxy_headers: bool,
+        trusted_proxy_cidrs: Vec<config::TrustedProxy>,
+        ml_gate: Option<MlConcurrencyGate>,
     ) -> Self {
+        let configured_ml_concurrency = Settings::new(database.clone())
+            .ml_concurrency()
+            .ok()
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(1);
         Self {
             auth: auth::AuthService::new(database.clone()),
             security: security::Security::new(
                 setup_token_hash,
                 secure_cookies,
-                trust_proxy_headers,
+                trusted_proxy_cidrs,
             ),
-            vault: vault::VaultSessionManager::new(database.data_root(), vault_ttl),
+            vault: vault::VaultSessionManager::new(database.clone(), vault_ttl),
             database,
             events,
+            job_poller_started: Arc::new(AtomicBool::new(false)),
+            ml_probe_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_ML_HEALTH_PROBES)),
+            ml_health_cache: Arc::new(AsyncMutex::new(None)),
+            ml_gate: ml_gate.unwrap_or_else(|| MlConcurrencyGate::new(configured_ml_concurrency)),
+            vault_ml_workers: Arc::new(Mutex::new(HashSet::new())),
+            blocking_db_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BLOCKING_DB_REQUESTS)),
         }
     }
 
@@ -134,6 +234,106 @@ impl AppState {
             "type": "assets_added",
             "bucket_keys": [bucket_key],
         }));
+    }
+
+    fn ensure_job_event_poller(&self) {
+        if self
+            .job_poller_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let database = self.database.clone();
+        let events = self.events.clone();
+        let started = Arc::clone(&self.job_poller_started);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            let mut previous = HashSet::new();
+            loop {
+                interval.tick().await;
+                if events.receiver_count() == 0 {
+                    started.store(false, Ordering::Release);
+                    if events.receiver_count() == 0
+                        || started
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+                let poll_database = database.clone();
+                let jobs = match tokio::task::spawn_blocking(move || {
+                    illumia_core::jobs::JobQueue::new(poll_database).list()
+                })
+                .await
+                {
+                    Ok(Ok(jobs)) => jobs,
+                    Ok(Err(error)) => {
+                        tracing::warn!(error = %error, "websocket job polling failed");
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "websocket job poll task failed");
+                        continue;
+                    }
+                };
+                let snapshot: HashSet<_> = jobs.iter().map(api::job_snapshot).collect();
+                for job in &jobs {
+                    let current = api::job_snapshot(job);
+                    if !previous.contains(&current) {
+                        let _ = events.send(json!({
+                            "type": "job",
+                            "id": job.id,
+                            "state": api::job_state_name(job.state),
+                            "progress": job.progress,
+                        }));
+                    }
+                }
+                previous = snapshot;
+            }
+        });
+    }
+
+    async fn ml_health(&self, socket_path: PathBuf) -> Option<MlHealth> {
+        {
+            let cache = self.ml_health_cache.lock().await;
+            if let Some(cached) = cache.as_ref()
+                && cached.socket_path == socket_path
+                && cached.checked_at.elapsed() < ML_HEALTH_CACHE_TTL
+            {
+                return cached.health.clone();
+            }
+        }
+        let permit = self.ml_probe_slots.clone().acquire_owned().await.ok()?;
+        {
+            let cache = self.ml_health_cache.lock().await;
+            if let Some(cached) = cache.as_ref()
+                && cached.socket_path == socket_path
+                && cached.checked_at.elapsed() < ML_HEALTH_CACHE_TTL
+            {
+                return cached.health.clone();
+            }
+        }
+        let probe_path = socket_path.clone();
+        let health = tokio::task::spawn_blocking(move || MlClient::new(probe_path).health().ok())
+            .await
+            .ok()
+            .flatten();
+        drop(permit);
+        *self.ml_health_cache.lock().await = Some(CachedMlHealth {
+            socket_path,
+            checked_at: tokio::time::Instant::now(),
+            health: health.clone(),
+        });
+        health
+    }
+
+    fn try_blocking_db_slot(&self) -> Result<OwnedSemaphorePermit, error::ApiError> {
+        self.blocking_db_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| error::ApiError::too_many_requests("database work is temporarily busy"))
     }
 }
 
@@ -154,7 +354,21 @@ pub fn app_with_vault_ttl(
     vault_ttl: Duration,
 ) -> Router {
     let (events, _) = broadcast::channel(EVENT_BUFFER);
-    app_with_events(database, web_dist, events, vault_ttl, None, false, false)
+    app_with_events(
+        database,
+        web_dist,
+        events,
+        vault_ttl,
+        AppBuildOptions::default(),
+    )
+}
+
+#[derive(Default)]
+struct AppBuildOptions {
+    setup_token_hash: Option<[u8; 32]>,
+    secure_cookies: bool,
+    trusted_proxy_cidrs: Vec<config::TrustedProxy>,
+    ml_gate: Option<MlConcurrencyGate>,
 }
 
 fn app_with_events(
@@ -162,23 +376,32 @@ fn app_with_events(
     web_dist: Option<PathBuf>,
     events: broadcast::Sender<Value>,
     vault_ttl: Duration,
-    setup_token_hash: Option<[u8; 32]>,
-    secure_cookies: bool,
-    trust_proxy_headers: bool,
+    options: AppBuildOptions,
 ) -> Router {
+    let AppBuildOptions {
+        setup_token_hash,
+        secure_cookies,
+        trusted_proxy_cidrs,
+        ml_gate,
+    } = options;
     let state = AppState::new(
         database,
         events,
         vault_ttl,
         setup_token_hash,
         secure_cookies,
-        trust_proxy_headers,
+        trusted_proxy_cidrs,
+        ml_gate,
     );
 
     let vault_session = Router::new()
         .route("/vault/lock", post(api::vault_lock))
         .route("/vault/import", post(api::vault_import))
         .route("/vault/export", post(api::vault_export))
+        .route(
+            "/vault/assets",
+            post(api::vault_upload_asset).layer(DefaultBodyLimit::max(UPLOAD_BODY_LIMIT)),
+        )
         .route(
             "/vault/assets/{id}",
             get(api::asset_metadata).delete(api::trash_asset),
@@ -333,6 +556,9 @@ fn app_with_events(
 
     router
         .layer(DefaultBodyLimit::max(JSON_BODY_LIMIT))
+        .layer(RequestBodyTimeoutLayer::new(HTTP_BODY_PROGRESS_TIMEOUT))
+        .layer(ResponseBodyTimeoutLayer::new(HTTP_BODY_PROGRESS_TIMEOUT))
+        .layer(middleware::from_fn(request_deadline))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &Request| {
                 let uri = if request.uri().path().starts_with("/api/vault/") {
@@ -361,6 +587,114 @@ fn app_with_events(
         .layer(middleware::from_fn(normalize_error_response))
 }
 
+async fn request_deadline(request: Request, next: Next) -> Response {
+    match tokio::time::timeout(HTTP_REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => error::ApiError::new(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            "request deadline exceeded",
+        )
+        .into_response(),
+    }
+}
+
+async fn serve_http(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    let slots = Arc::new(Semaphore::new(MAX_HTTP_CONNECTIONS));
+    let by_ip = Arc::new(Mutex::new(HashMap::new()));
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    tokio::pin!(shutdown);
+    loop {
+        let permit = tokio::select! {
+            _ = &mut shutdown => {
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+            permit = slots.clone().acquire_owned() => permit.expect("HTTP admission semaphore closed"),
+        };
+        let accepted = tokio::select! {
+            _ = &mut shutdown => {
+                drop(permit);
+                let _ = shutdown_tx.send(true);
+                break;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                drop(permit);
+                tracing::warn!(error = %error, "HTTP accept failed");
+                continue;
+            }
+        };
+        let Some(permit) = HttpConnectionPermit::try_new(permit, peer.ip(), Arc::clone(&by_ip))
+        else {
+            drop(stream);
+            continue;
+        };
+        let _ = stream.set_nodelay(true);
+        let service = router.clone().layer(Extension(ConnectInfo(peer)));
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let mut builder = ConnectionBuilder::new(TokioExecutor::new());
+            builder
+                .http1()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HTTP_HEADER_TIMEOUT)
+                .max_buf_size(MAX_HTTP_HEADER_BYTES)
+                .keep_alive(true);
+            builder
+                .http2()
+                .timer(TokioTimer::new())
+                .max_header_list_size(MAX_HTTP_HEADER_BYTES as u32)
+                .max_concurrent_streams(MAX_HTTP2_STREAMS_PER_CONNECTION)
+                .keep_alive_interval(Some(HTTP_BODY_PROGRESS_TIMEOUT))
+                .keep_alive_timeout(HTTP_HEADER_TIMEOUT);
+            let io = TokioIo::new(stream);
+            let service = TowerToHyperService::new(service);
+            let connection = builder.serve_connection_with_upgrades(io, service);
+            tokio::pin!(connection);
+            let lifetime = tokio::time::sleep(HTTP_CONNECTION_MAX_LIFETIME);
+            tokio::pin!(lifetime);
+            tokio::select! {
+                result = &mut connection => {
+                    if let Err(error) = result {
+                        tracing::debug!(error = %error, "HTTP connection closed with error");
+                    }
+                }
+                _ = shutdown_rx.changed() => {
+                    connection.as_mut().graceful_shutdown();
+                    let _ = tokio::time::timeout(
+                        HTTP_GRACEFUL_DRAIN_TIMEOUT,
+                        connection.as_mut(),
+                    ).await;
+                }
+                _ = &mut lifetime => {
+                    connection.as_mut().graceful_shutdown();
+                    if tokio::time::timeout(
+                        HTTP_GRACEFUL_DRAIN_TIMEOUT,
+                        connection.as_mut(),
+                    ).await.is_err() {
+                        tracing::debug!("HTTP connection exceeded its hard lifetime");
+                    }
+                }
+            }
+        });
+    }
+    let _ = tokio::time::timeout(
+        Duration::from_secs(30),
+        slots.acquire_many_owned(MAX_HTTP_CONNECTIONS as u32),
+    )
+    .await;
+    Ok(())
+}
+
 /// Opens storage, starts background services, binds the configured listener,
 /// and performs graceful shutdown.
 pub async fn run(config: Config) -> Result<()> {
@@ -370,7 +704,7 @@ pub async fn run(config: Config) -> Result<()> {
         web_dist,
         setup_token_hash,
         secure_cookies,
-        trust_proxy_headers,
+        trusted_proxy_cidrs,
     } = config;
     let database = Database::open(&data_dir).context("open Illumia database")?;
     let setup_completed = auth::AuthService::new(database.clone())
@@ -412,7 +746,7 @@ pub async fn run(config: Config) -> Result<()> {
         Ok(())
     });
     let ml_settings = Settings::new(database.clone());
-    if ml_settings.ml_enabled().context("read ml.enabled")?
+    let ml_gate = if ml_settings.ml_enabled().context("read ml.enabled")?
         && let Some(socket_path) = ml_settings
             .ml_socket_path()
             .context("read ml.socket_path")?
@@ -432,11 +766,15 @@ pub async fn run(config: Config) -> Result<()> {
             MlService::new(database.clone(), analyze_client.clone()).handle_analyze_job(job)
         });
         let recluster_client = MlClient::new(socket_path);
+        let recluster_gate = gate.clone();
         runner.register_handler(ML_RECLUSTER_JOB_KIND, move |database, job| {
-            let _permit = gate.acquire();
+            let _permit = recluster_gate.acquire();
             MlService::new(database.clone(), recluster_client.clone()).handle_recluster_job(job)
         });
-    }
+        Some(gate)
+    } else {
+        None
+    };
     runner.start().context("start job runner")?;
 
     let purge_task = tokio::spawn(run_purge_loop(purge));
@@ -447,16 +785,14 @@ pub async fn run(config: Config) -> Result<()> {
         web_dist,
         events,
         Duration::from_secs(15 * 60),
-        setup_token_hash,
-        secure_cookies,
-        trust_proxy_headers,
+        AppBuildOptions {
+            setup_token_hash,
+            secure_cookies,
+            trusted_proxy_cidrs,
+            ml_gate,
+        },
     );
-    let serve_result = axum::serve(
-        listener,
-        router.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await;
+    let serve_result = serve_http(listener, router, shutdown_signal()).await;
 
     purge_task.abort();
     let _ = purge_task.await;

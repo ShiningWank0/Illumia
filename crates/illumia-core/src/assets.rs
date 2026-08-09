@@ -6,7 +6,6 @@ use std::{
 };
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
-use image::GenericImageView;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use uuid::Uuid;
 
@@ -102,8 +101,7 @@ impl AssetService {
         uploaded_at: DateTime<Utc>,
     ) -> Result<IngestResult> {
         let ext = images::normalized_extension(original_name)?;
-        let image = images::decode(bytes, &ext)?;
-        let (width, height) = image.dimensions();
+        let (width, height) = images::validate_and_dimensions(bytes, &ext)?;
         let hash = blake3::hash(bytes);
         let id = Uuid::now_v7().to_string();
         let taken_at = taken_at.unwrap_or(uploaded_at);
@@ -118,6 +116,9 @@ impl AssetService {
         if let Some(parent) = absolute_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // The UUID path is not visible through the API until the metadata commit. Keep the
+        // potentially 128 MiB filesystem write outside the process-wide SQLite mutex.
+        fs::write(&absolute_path, bytes)?;
 
         let result = self.database.with_connection_mut(|connection| {
             let transaction =
@@ -127,7 +128,11 @@ impl AssetService {
                     "SELECT id FROM assets
                      WHERE hash = ?1
                        AND lifecycle = 'active'
-                       AND duplicate_of IS NULL",
+                       AND duplicate_of IS NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM vault_transfers transfer, json_each(transfer.asset_ids) item
+                         WHERE transfer.role = 'source' AND item.value = assets.id
+                       )",
                     [hash.as_bytes().as_slice()],
                     |row| row.get::<_, String>(0),
                 )
@@ -147,7 +152,6 @@ impl AssetService {
             };
             let visible_in_timeline = i64::from(duplicate_of.is_none());
 
-            fs::write(&absolute_path, bytes)?;
             transaction.execute(
                 "INSERT INTO assets(
                     id, hash, original_name, ext, size, width, height,

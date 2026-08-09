@@ -111,6 +111,9 @@ impl From<illumia_core::db::Error> for ApiError {
             | illumia_core::db::Error::InvalidJobProgress
             | illumia_core::db::Error::InvalidJobState(_) => Self::bad_request(error.to_string()),
             illumia_core::db::Error::InvalidMl(_) => Self::bad_request(error.to_string()),
+            illumia_core::db::Error::JobQueueFull => {
+                Self::too_many_requests("job queue admission limit reached")
+            }
             _ => Self::internal(error),
         }
     }

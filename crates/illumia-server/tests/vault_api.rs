@@ -13,6 +13,9 @@ use http_body_util::BodyExt;
 use illumia_core::{
     assets::AssetService,
     db::Database,
+    jobs::JobQueue,
+    ml::ML_VAULT_ANALYZE_JOB_KIND,
+    settings::Settings,
     uuid::Uuid,
     vault::{KdfParams, VaultHandle, init_with_kdf},
 };
@@ -252,6 +255,32 @@ async fn vault_api_full_transfer_and_visibility_flow() {
     );
     assert!(!original_path.exists());
     assert_plaintext_trace_absent(&app.database, &asset.id, "秘密画像");
+
+    let missing_ml_socket = app.root().join("missing-ml.sock");
+    Settings::new(app.database.clone())
+        .set_ml_socket_path(missing_ml_socket.to_str().expect("UTF-8 test path"))
+        .expect("test ML socket setting should persist");
+    let queued_analysis = app
+        .request(
+            Method::POST,
+            "/api/vault/ml/analyze-all",
+            Some(&auth),
+            Some(&session),
+            None,
+        )
+        .await;
+    assert_eq!(queued_analysis.status, StatusCode::ACCEPTED);
+    assert_eq!(queued_analysis.json()["enqueued"], 1);
+    let queue_view = VaultHandle::unlock(app.root(), "vault password")
+        .expect("vault queue should open for test inspection");
+    assert!(
+        JobQueue::new(queue_view.db)
+            .list()
+            .expect("vault jobs should list")
+            .iter()
+            .any(|job| job.kind == ML_VAULT_ANALYZE_JOB_KIND),
+        "Vault analysis must persist in the Vault DB job queue"
+    );
 
     let buckets = app
         .request(

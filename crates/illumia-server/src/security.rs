@@ -21,7 +21,7 @@ use illumia_core::sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::{AppState, error::ApiError};
+use crate::{AppState, config::TrustedProxy, error::ApiError};
 
 const SESSION_COOKIE: &str = "illumia_session";
 const SETUP_TOKEN_HEADER: &str = "x-illumia-setup-token";
@@ -31,11 +31,13 @@ const AUTH_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const MAX_AUTH_SOURCES: usize = 4096;
 const MAX_ARGON2_CONCURRENCY: usize = 2;
 const MAX_INGEST_CONCURRENCY: usize = 2;
+const MAX_VAULT_STREAMS: usize = 4;
 /// WS の同時接続上限。adversarial test (SEC-010) から参照する。
 pub(crate) const MAX_WEBSOCKETS: usize = 32;
+pub(crate) const MAX_WEBSOCKETS_PER_TOKEN: usize = 4;
 const MIN_SETUP_TOKEN_BYTES: usize = 32;
 const MAX_SETUP_TOKEN_BYTES: usize = 256;
-const OVERFLOW_SOURCE: &str = "<overflow>";
+const MAX_FORWARDED_HOPS: usize = 16;
 const UNKNOWN_SOURCE: &str = "<unknown>";
 
 const CSP: &str = "default-src 'self'; base-uri 'none'; object-src 'none'; \
@@ -68,28 +70,38 @@ pub struct Security {
 struct SecurityInner {
     setup_token_hash: Option<[u8; 32]>,
     secure_cookies: bool,
-    trust_proxy_headers: bool,
+    trusted_proxy_cidrs: Arc<[TrustedProxy]>,
     auth_failures: Mutex<HashMap<String, VecDeque<Instant>>>,
     argon2_slots: Arc<Semaphore>,
     ingest_slots: Arc<Semaphore>,
+    vault_stream_slots: Arc<Semaphore>,
     websocket_slots: Arc<Semaphore>,
+    websocket_by_token: Mutex<HashMap<[u8; 32], usize>>,
+}
+
+pub struct WebSocketPermit {
+    security: Security,
+    token_hash: [u8; 32],
+    _global: OwnedSemaphorePermit,
 }
 
 impl Security {
     pub fn new(
         setup_token_hash: Option<[u8; 32]>,
         secure_cookies: bool,
-        trust_proxy_headers: bool,
+        trusted_proxy_cidrs: Vec<TrustedProxy>,
     ) -> Self {
         Self {
             inner: Arc::new(SecurityInner {
                 setup_token_hash,
                 secure_cookies,
-                trust_proxy_headers,
+                trusted_proxy_cidrs: trusted_proxy_cidrs.into(),
                 auth_failures: Mutex::new(HashMap::new()),
                 argon2_slots: Arc::new(Semaphore::new(MAX_ARGON2_CONCURRENCY)),
                 ingest_slots: Arc::new(Semaphore::new(MAX_INGEST_CONCURRENCY)),
+                vault_stream_slots: Arc::new(Semaphore::new(MAX_VAULT_STREAMS)),
                 websocket_slots: Arc::new(Semaphore::new(MAX_WEBSOCKETS)),
+                websocket_by_token: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -189,12 +201,32 @@ impl Security {
             .map_err(|_| ApiError::too_many_requests("authentication is temporarily busy"))
     }
 
-    pub fn try_websocket_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
-        self.inner
+    pub fn try_websocket_slot(&self, token: &str) -> Result<WebSocketPermit, ApiError> {
+        let global = self
+            .inner
             .websocket_slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| ApiError::too_many_requests("too many websocket connections"))
+            .map_err(|_| ApiError::too_many_requests("too many websocket connections"))?;
+        let token_hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let mut by_token = self
+            .inner
+            .websocket_by_token
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let active = by_token.entry(token_hash).or_default();
+        if *active >= MAX_WEBSOCKETS_PER_TOKEN {
+            return Err(ApiError::too_many_requests(
+                "too many websocket connections for this device",
+            ));
+        }
+        *active += 1;
+        drop(by_token);
+        Ok(WebSocketPermit {
+            security: self.clone(),
+            token_hash,
+            _global: global,
+        })
     }
 
     pub fn try_ingest_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
@@ -205,32 +237,62 @@ impl Security {
             .map_err(|_| ApiError::too_many_requests("too many concurrent image uploads"))
     }
 
+    pub fn try_vault_stream_slot(&self) -> Result<OwnedSemaphorePermit, ApiError> {
+        self.inner
+            .vault_stream_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ApiError::too_many_requests("too many vault streams"))
+    }
+
     fn source_key(&self, request: &Request) -> String {
-        if self.inner.trust_proxy_headers
-            && let Some(address) = request
-                .headers()
-                .get(FORWARDED_FOR_HEADER)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(',').next())
-                .map(str::trim)
-                .and_then(|value| value.parse::<IpAddr>().ok())
+        let peer = request
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(address)| address.ip());
+        if peer.is_some_and(|address| {
+            self.inner
+                .trusted_proxy_cidrs
+                .iter()
+                .any(|network| network.contains(address))
+        }) && let Some(address) = self.forwarded_source(request)
         {
             return address.to_string();
         }
-        request
-            .extensions()
-            .get::<ConnectInfo<SocketAddr>>()
-            .map_or_else(
-                || UNKNOWN_SOURCE.to_owned(),
-                |ConnectInfo(address)| address.ip().to_string(),
-            )
+        peer.map_or_else(|| UNKNOWN_SOURCE.to_owned(), |address| address.to_string())
+    }
+
+    /// X-Forwarded-For は右端から検証する。信頼済みproxyがincoming headerへappendする構成でも、
+    /// 左端の攻撃者指定値ではなく、信頼済みhop直前の最初のuntrusted addressを採用する。
+    fn forwarded_source(&self, request: &Request) -> Option<IpAddr> {
+        let value = request.headers().get(FORWARDED_FOR_HEADER)?.to_str().ok()?;
+        let mut chain = Vec::new();
+        for item in value.split(',') {
+            if chain.len() >= MAX_FORWARDED_HOPS {
+                return None;
+            }
+            chain.push(item.trim().parse::<IpAddr>().ok()?);
+        }
+        let first = *chain.first()?;
+        Some(
+            chain
+                .into_iter()
+                .rev()
+                .find(|address| {
+                    !self
+                        .inner
+                        .trusted_proxy_cidrs
+                        .iter()
+                        .any(|network| network.contains(*address))
+                })
+                .unwrap_or(first),
+        )
     }
 
     fn retry_after(&self, source: &str, now: Instant) -> Option<Duration> {
         let mut failures = self.auth_failures();
         prune_failures(&mut failures, now);
-        let key = bounded_source(&failures, source);
-        let attempts = failures.get(key)?;
+        let attempts = failures.get(source)?;
         if attempts.len() < AUTH_FAILURE_LIMIT {
             return None;
         }
@@ -242,8 +304,19 @@ impl Security {
     fn record_failure(&self, source: &str, now: Instant) {
         let mut failures = self.auth_failures();
         prune_failures(&mut failures, now);
-        let key = bounded_source(&failures, source).to_owned();
-        failures.entry(key).or_default().push_back(now);
+        if !failures.contains_key(source)
+            && failures.len() >= MAX_AUTH_SOURCES
+            && let Some(oldest) = failures
+                .iter()
+                .min_by_key(|(_, attempts)| attempts.back().copied())
+                .map(|(source, _)| source.clone())
+        {
+            failures.remove(&oldest);
+        }
+        failures
+            .entry(source.to_owned())
+            .or_default()
+            .push_back(now);
     }
 
     fn clear_failures(&self, source: &str) {
@@ -255,6 +328,23 @@ impl Security {
             .auth_failures
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for WebSocketPermit {
+    fn drop(&mut self) {
+        let mut by_token = self
+            .security
+            .inner
+            .websocket_by_token
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(active) = by_token.get_mut(&self.token_hash) {
+            *active = active.saturating_sub(1);
+            if *active == 0 {
+                by_token.remove(&self.token_hash);
+            }
+        }
     }
 }
 
@@ -340,13 +430,80 @@ fn prune_failures(failures: &mut HashMap<String, VecDeque<Instant>>, now: Instan
     });
 }
 
-fn bounded_source<'a>(
-    failures: &'a HashMap<String, VecDeque<Instant>>,
-    source: &'a str,
-) -> &'a str {
-    if failures.contains_key(source) || failures.len() < MAX_AUTH_SOURCES {
-        source
-    } else {
-        OVERFLOW_SOURCE
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(peer: &str, forwarded: &str) -> Request {
+        let mut request = Request::builder()
+            .header(FORWARDED_FOR_HEADER, forwarded)
+            .body(axum::body::Body::empty())
+            .expect("request should build");
+        request.extensions_mut().insert(ConnectInfo(
+            peer.parse::<SocketAddr>().expect("peer should parse"),
+        ));
+        request
+    }
+
+    #[test]
+    fn source_churn_never_creates_a_shared_global_lockout_bucket() {
+        let security = Security::new(None, false, Vec::new());
+        let now = Instant::now();
+        for index in 0..MAX_AUTH_SOURCES {
+            security.record_failure(&format!("2001:db8::{index:x}"), now);
+        }
+        for _ in 0..AUTH_FAILURE_LIMIT {
+            security.record_failure("198.51.100.10", now);
+        }
+        assert!(security.retry_after("198.51.100.10", now).is_some());
+        assert!(
+            security.retry_after("198.51.100.11", now).is_none(),
+            "an unrelated new source must not inherit an overflow bucket's failures"
+        );
+        assert!(security.auth_failures().len() <= MAX_AUTH_SOURCES);
+    }
+
+    #[test]
+    fn forwarding_headers_are_used_only_from_configured_proxy_cidrs() {
+        let security = Security::new(
+            None,
+            false,
+            vec!["10.20.0.0/16".parse().expect("CIDR should parse")],
+        );
+        assert_eq!(
+            security.source_key(&request("10.20.1.4:443", "198.51.100.7")),
+            "198.51.100.7"
+        );
+        assert_eq!(
+            security.source_key(&request("10.20.1.4:443", "198.51.100.8")),
+            "198.51.100.8",
+            "separate forwarded clients must not share an auth lockout bucket"
+        );
+        assert_eq!(
+            security.source_key(&request("203.0.113.9:443", "198.51.100.7")),
+            "203.0.113.9",
+            "an untrusted direct peer must not spoof its source with X-Forwarded-For"
+        );
+        assert_eq!(
+            security.source_key(&request(
+                "10.20.1.4:443",
+                "192.0.2.200, 198.51.100.9, 10.20.1.3"
+            )),
+            "198.51.100.9",
+            "an appended forwarding chain must ignore a client-supplied leftmost spoof"
+        );
+        assert_eq!(
+            security.source_key(&request("10.20.1.4:443", "not-an-ip")),
+            "10.20.1.4",
+            "a malformed chain must fail closed to the transport peer"
+        );
+        let oversized_chain = std::iter::repeat_n("198.51.100.9", MAX_FORWARDED_HOPS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            security.source_key(&request("10.20.1.4:443", &oversized_chain)),
+            "10.20.1.4",
+            "an oversized chain must not cause unbounded attribution work"
+        );
     }
 }
