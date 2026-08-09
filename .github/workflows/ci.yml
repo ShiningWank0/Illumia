@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   # event_name を含めないと、release から呼ばれた CI (workflow_call) と
