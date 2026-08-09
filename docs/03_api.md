@@ -146,12 +146,17 @@ API response は既定で `Cache-Control: private, no-store` とし、認証済�
 | GET / PATCH | /api/settings | 設定の取得・変更 (→ docs/02 settings キー一覧) |
 | WS | /api/ws | ジョブ進捗・新規アセット通知 (JSON メッセージ) |
 
+実行中 job の cancel は協調キャンセル要求である。handler が停止するまで job は `running`
+かつ admission/dedup 対象に残り、停止確認後に `cancelled` へ遷移する。
+
 WS メッセージ例: `{"type":"job", "id":..., "state":"running", "progress":0.42}`,
 `{"type":"assets_added", "bucket_keys":["2026-07-30"]}` (クライアントはバケット単位で再取得)。
 
 ブラウザの WS は認証 Cookie、非ブラウザクライアントは WebSocket handshake の
 `Authorization` header で認証する。**device token を URL query に含めてはならない**。
-WS の `Origin`、接続数、frame/message size を検査・制限する。
+WS の `Origin`、接続数、frame/message size を検査・制限する。接続後も token を定期的かつ
+event 送信前にprocess-local revocation cacheで再検証し、接続ごとのDB pollingを行わずに
+logout / device revoke 後の接続を閉じる。送信にも有限 deadline を設ける。
 
 ## 共通の入力・資源制限
 
@@ -161,6 +166,8 @@ WS の `Origin`、接続数、frame/message size を検査・制限する。
 - 設定値: concurrency は 1〜64 の範囲など、実行時の資源量へ直結する値を server/core の
   両境界で検証する。
 - CPU・メモリ・DB を長時間占有する処理は同時実行数を制限し、重い処理はジョブキューへ送る。
+- 大規模 stack/cluster mutation・list/search 等の同期 SQLite 処理は Tokio worker 上で直接
+  実行せず、bounded blocking admission の内側へ隔離する。
 - API の 404/405/413/429/5xx も JSON error envelope で返す。
 
 ## Vault (→ docs/06)
@@ -172,6 +179,7 @@ WS の `Origin`、接続数、frame/message size を検査・制限する。
 | POST | /api/vault/unlock | `{password}` → `{vault_session, expires_at}` |
 | POST | /api/vault/lock | セッション破棄 |
 | GET | /api/vault/status | ロック状態 (これは認証済なら 200 で返す) |
+| POST | /api/vault/assets | checksum 付き multipart image を main 非経由で直接暗号化 ingest |
 | POST | /api/vault/import | `{asset_ids[]}` メイン → vault 移動 |
 | POST | /api/vault/export | `{asset_ids[]}` vault → メイン移動 |
 

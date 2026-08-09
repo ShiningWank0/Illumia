@@ -68,6 +68,12 @@
 - `ci.yml`: push / PR で実行。paths-filter により変更のあったコンポーネントのみ
   lint + test を走らせる (docs のみの変更でも全体は green になる)。
   集約ジョブ `ci-ok` をブランチ保護の必須チェックにする。
+- `apps/android/**` は独立 Rust workspace / npm lockfile として専用 job で
+  `cargo metadata --locked`、fmt、clippy、test、Android target に絞った `cargo audit`、
+  `npm audit` を行う。Android-only 変更でもこの job と `ci-ok` を必ず通し、release の
+  APK は同一 lockfile に対する full CI 成功後だけ build する。依存packageとGradle pluginを
+  実行するbuild jobには署名鍵を渡さず、repositoryをcheckoutしない専用jobがunsigned artifact
+  だけを `apksigner` で署名・検証する。
 - Rust は `cargo audit`、Web は `npm audit`、Python は `uv export` + `pip-audit` を
   品質ゲートに含める。`cargo audit` の例外は `.cargo/audit.toml` に限定し、
   **修正版が存在せず、かつ脆弱性ではない勧告 (unmaintained 等) のみ**許可する。
@@ -81,3 +87,5 @@
   残す。DependabotでCargo/npm/pip/Docker/GitHub Actionsを週次更新する。
 - release workflowのwrite権限はpackage push / release作成jobだけに付与する。
   containerにはSBOMとprovenanceを添付し、手動dev buildで `latest` を上書きしない。
+- production Compose/TrueNAS 手順は release が記録した `image@sha256:<digest>` を必須とし、
+  mutable tag へ暗黙 fallback させない。CI の Compose validation では test 用 digest を明示する。

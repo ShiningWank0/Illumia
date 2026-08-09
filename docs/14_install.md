@@ -35,12 +35,16 @@ echo "<あなたのPAT>" | docker login ghcr.io -u <GitHubユーザー名> --pas
 
 ```bash
 git clone https://github.com/ShiningWank0/Illumia.git
-cd Illumia/docker
-cp .env.example .env
+cd Illumia
+cp docker/.env.example docker/.env
 ```
 
-`.env` を編集し、`ILLUMIA_SETUP_TOKEN` に 32 文字以上のランダム値を設定する
+`docker/.env` を編集し、`ILLUMIA_SETUP_TOKEN` に 32 文字以上のランダム値を設定する
 (初回セットアップの横取りを防ぐため → docs/12)。
+さらに Release notes に記載された server/ML の immutable digest を
+`ILLUMIA_SERVER_DIGEST` / `ILLUMIA_ML_DIGEST` へ Release notes の64桁 digest 本体を設定する。
+repository と `@sha256:` は production Compose 内で固定し、環境変数から変更できない。
+`.env.example` の zero digest は安全な placeholder であり、そのままでは pull に失敗する。
 
 ```bash
 # 十分にランダムな setup token を生成する例
@@ -50,13 +54,13 @@ openssl rand -hex 32
 **権限を必ず絞る** (docs/12 が要求。世界読み取り可のままにしない):
 
 ```bash
-chmod 600 .env
+chmod 600 docker/.env
 ```
 
 ### 1-3. 起動する
 
 ```bash
-docker compose --profile ml up -d
+./docker/compose-prod.sh --profile ml up -d
 ```
 
 ML (キャラクター認識) を使わない場合は `--profile ml` を外す。
@@ -70,18 +74,19 @@ ML (キャラクター認識) を使わない場合は `--profile ml` を外す�
 ブラウザで `http://127.0.0.1:2283` を開き、パスワードを設定する。
 `ILLUMIA_SETUP_TOKEN` を設定した場合は、その値も入力する。
 
-セットアップ完了後は `.env` から setup token を削除するか rotate し、
+セットアップ完了後は `docker/.env` から setup token を削除するか rotate し、
 コンテナを再作成する。
 
 ### 1-5. 更新する
 
 ```bash
-docker compose pull
-docker compose --profile ml up -d
+./docker/compose-prod.sh --profile ml pull
+./docker/compose-prod.sh --profile ml up -d
 ```
 
-再現性を重視するなら、`latest` ではなく Release notes に載っている
-**digest 指定**を使う (例: `ghcr.io/shiningwank0/illumia-server@sha256:...`)。
+更新時は Release notes の server/ML digest を確認し、`docker/.env` の両値を明示的に更新してから
+pull する。mutable tag や `latest` は production 手順では使用しない。
+wrapper は digest 形式を検証し、`--no-build` で production Compose を起動する。
 
 ---
 
@@ -244,11 +249,21 @@ ILLUMIA_DATA_DIR=~/Illumia ./target/release/illumia-desktop
 ```bash
 ILLUMIA_DESKTOP_MODE=client-only \
 ILLUMIA_SERVER_URL=https://illumia.example.com \
-ILLUMIA_DEVICE_TOKEN=<device token> \
 ./target/release/illumia-desktop
 ```
 
-`ILLUMIA_SERVER_URL` は `https` のみ (平文はループバックのみ許可)。
+初回は terminal で password を echo 無しで入力する。発行された device token と
+`instance_id` は macOS Keychain / Windows Credential Manager に保存され、以後は
+password の再入力なしで利用できる。token を環境変数やコマンドラインへ書かない。
+
+`ILLUMIA_SERVER_URL` は HTTPS を推奨する。平文 HTTP は loopback のみ指定できるが、起動の
+たびに警告への明示確認が必要で、Bearer token を送る前に unauthenticated
+`/api/server/info` の identity を secure storage の pin と照合する。初回 TOFU の pin も
+利用者が表示値を確認して承認するまで password を送らない。
+
+旧手順で `ILLUMIA_DEVICE_TOKEN` を shell に直接書いたことがある場合は、shell history から
+削除したうえで device 管理 API (`GET/DELETE /api/auth/devices`) から古い desktop token を
+失効し、新しい interactive login に移行する。
 
 ### 4-4. M6 v1 の制限
 

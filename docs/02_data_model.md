@@ -114,9 +114,13 @@ CREATE TABLE jobs (
   error       TEXT,
   created_at  TEXT NOT NULL,
   started_at  TEXT,
-  finished_at TEXT
+  finished_at TEXT,
+  cancel_requested INTEGER NOT NULL DEFAULT 0 CHECK (cancel_requested IN (0,1))
 );
 CREATE INDEX ix_jobs_queue ON jobs(state, priority DESC, created_at);
+
+-- running job の cancel は cancel_requested=1 とし、handler が協調停止して worker が
+-- terminal transition を commit するまで running/admission/dedup 対象に残す。
 
 CREATE TABLE settings ( key TEXT PRIMARY KEY, value TEXT NOT NULL );
 -- 主なキー: trash.retention_days (既定 30) / dedup.retention_days (既定 30)
@@ -131,6 +135,23 @@ CREATE TABLE auth_tokens (
   created_at  TEXT NOT NULL,
   last_used   TEXT
 );
+
+-- Vault import/export/direct ingest の durable reconciliation journal (→ docs/06)。
+-- import/export は source DB と destination DB に同じ id の行を持ち、
+-- destination commit の有無を境界として rollback / roll-forward を決定する。
+CREATE TABLE vault_transfers (
+  id          TEXT PRIMARY KEY,                    -- transfer UUIDv7
+  direction   TEXT NOT NULL
+              CHECK (direction IN ('import','export','direct_ingest')),
+  role        TEXT NOT NULL CHECK (role IN ('source','destination')),
+  asset_ids   TEXT NOT NULL CHECK (json_valid(asset_ids)),
+  state       TEXT NOT NULL
+              CHECK (state IN ('preparing','destination_ready',
+                               'source_files_deleted','source_database_deleted')),
+  created_at  TEXT NOT NULL
+);
+CREATE INDEX ix_vault_transfers_direction_role
+  ON vault_transfers(direction, role, created_at);
 
 -- 検索 (日本語対応必須): trigram tokenizer
 CREATE VIRTUAL TABLE search_fts USING fts5(

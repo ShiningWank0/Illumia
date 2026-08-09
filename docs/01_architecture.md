@@ -48,7 +48,7 @@ Illumia/
   web/                  # SvelteKit SPA (adapter-static, SPA モード)
   apps/android/         # Tauri 2 プロジェクト (web/ のビルド成果物を取り込む)
   ml/                   # Python サイドカー (uv 管理)
-  docker/               # Dockerfile.server / Dockerfile.ml / compose.yaml
+  docker/               # Dockerfile.*, production compose + digest wrapper, dev build overlay
   docs/                 # 本設計ドキュメント群
   .github/workflows/    # CI / 本番ビルド
 ```
@@ -89,8 +89,12 @@ Illumia/
   library/<yyyy>/<mm>/<asset_id>.<ext>   # オリジナル画像 (asset 毎に 1 ファイル所有)
   thumbs/<asset_id>_t.webp               # 240px サムネイル
   thumbs/<asset_id>_p.webp               # 1440px プレビュー
-  models/               # ML モデルバンドルキャッシュ
 ```
+
+ML モデルは application data と同じ tree に置かない。Docker では独立した
+`illumia_models` volume を ML container の `/models` へ read-only mount し、desktop でも
+`<data_root>` 外の明示した model root を使う。ML sidecar に `<data_root>` を mount しては
+ならない。
 
 - ファイルは **asset 行が 1 対 1 で所有**する。重複アップロードでも物理ファイルを共有しない
   (refcount 事故で本体を失うリスクを排除。ディスク増は重複保持期間で自然回収。→ docs/11)。

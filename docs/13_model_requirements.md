@@ -14,16 +14,24 @@ ACR リポジトリの「モデルバンドル契約」(ACR docs/04) と整合�
   crop_encoder.onnx
   thresholds.yaml
   tag_vocab.json                      # 属性タガー同梱時のみ (v1 では任意)
-  checksums.sha256
+  checksums.sha256                       # corruption 検査用
 ```
 
-- サイドカー (illumia-ml) は起動時に `ILLUMIA_MODEL_DIR` (既定 `<data_root>/models`) から
+- サイドカー (illumia-ml) は起動時に `ILLUMIA_MODEL_DIR` (Docker 既定 `/models`) から
   バンドルを探索する。**checksums.sha256 の全ファイル検証に失敗したバンドルはロードせず**、
   mock バックエンドへフォールバックして health に `backend: "mock"` を報告する。
+- `checksums.sha256` と同じ配布物を信頼してはならない。raw checksum manifest の SHA-256 を
+  bundle 外の `ILLUMIA_TRUSTED_MODEL_DIGESTS` (comma-separated 64 hex allowlist) で pin する。
+  allowlist 未設定・不一致は fail closed で mock にする。
+- `manifest.yaml` は raw `checksums.sha256` の外部 pin と manifest entry 自体の checksum が
+  両方一致した bytes だけを YAML parse する。未信頼 YAML は parser へ渡さず、depth/recursion
+  error を含む parse 失敗は候補単位で fail closed にする。
 - バンドルが存在しない間も全 API は mock で動作する (開発・テスト用の決定的出力)。
   `GET /ml/v1/health` の `backend` (`"onnx"` / `"mock"`) が唯一の判定点で、
   サーバーはこれを settings UI に表示する (「モデル未設定」バナー)。
-- 複数バンドルがある場合は manifest の `version` が最大のものを使う。
+- 複数バンドルがある場合は、外部 pin と manifest entry checksum の検証だけで
+  `version` 順の候補を作り、高い版から 1 件ずつ完全検証する。有効な最初の 1 件だけを保持し、
+  複数候補の ONNX bytes を同時にメモリ上へ残さない。
 
 ## manifest.yaml 必須スキーマ
 
@@ -58,6 +66,11 @@ providers: [CPUExecutionProvider]   # 必須対応 EP。CoreML/OpenVINO は任�
   モデル差し替え時に前処理がズレる事故を構造的に防ぐ (ACR 契約と同思想)。
 - 検出クラスは `person/head/face` の 3 種 (DB の faces.kind と対応)。不足があれば
   faces.kind の CHECK 制約と docs/02 を先に改訂すること。
+- detector/encoder の input 各辺は 1〜4096、総画素は最大 16,777,216、encoder `dim` は
+  1〜4096 とする。trusted bundle でも巨大 allocation を起こせないよう manifest load 時に
+  hard limit を適用する。
+- checksum 対象の bundle 総量は 512 MiB を hard limit とする。検証済み ONNX bytes は path を
+  reopen せず ORT session constructor へ渡し、両 session の生成成功後に Python 側の保持を解放する。
 
 ## thresholds.yaml 必須スキーマ (較正済み値)
 
@@ -79,13 +92,16 @@ min_cluster_size: 3
 
 | 項目 | 要件 |
 |---|---|
-| opset / 形式 | onnxruntime (CPU EP) でロード可能な単一 .onnx。外部データファイル可 (同ディレクトリ) |
+| opset / 形式 | onnxruntime (CPU EP) で bytes からロード可能な単一 .onnx。v1 は TOCTOU を避けるため外部データファイル不可 |
 | 実行環境 | **CPUExecutionProvider で動作することが必須要件** (CUDA 前提禁止)。CoreML/OpenVINO は任意 |
 | detector | 画像 1 枚 → 可変数の {bbox, score, class}。バッチ 1 固定でよい |
 | crop_encoder | crop 1 枚 → 固定次元 float32 埋め込み。dim は manifest 宣言と一致 |
 | 性能予算 (4C CPU) | 検出 ≤ 500ms/画像、埋め込み ≤ 300ms/crop (v1)。超える場合は ml.concurrency=1 の直列動作でも UI を阻害しないが、スループット目標 (1 画像/秒) を下回る旨を README に明記する |
 | メモリ | サイドカーのピーク RSS ≤ 4GB。モデルは遅延ロード・アイドル時アンロード可能であること |
 | 決定性 | 同一入力 → 同一出力 (許容誤差 1e-4)。較正値の再現性のため |
+
+detector 出力は confidence 上位 4096 件だけを NMS に渡し、最終 instance は最大 256 件とする。
+この上限を超える model output をそのまま二乗時間 NMS や response 生成へ渡してはならない。
 
 ## クラスタリング要件 (サイドカーの `cluster` API が実装する側)
 
@@ -97,14 +113,15 @@ min_cluster_size: 3
 
 ## モデル到着時の手順 (チェックリスト)
 
-1. バンドルを `<data_root>/models/` に配置 (Docker はボリューム内。デスクトップ all-in-one は
+1. バンドルを application data と分離した model root に配置 (Docker は model-only volume。デスクトップ all-in-one は
    設定画面の「モデルフォルダを開く」から)
-2. サイドカー再起動 → `GET /ml/v1/health` で `backend: "onnx"`・`bundle.version` を確認
-3. 設定画面で ML を有効化 → 全アセットの解析ジョブを実行
-4. 手元データでクラスタ精度を確認し、必要なら `ml.tau_high_override` /
+2. `shasum -a 256 checksums.sha256` を trusted digest として deployment 設定へ pin する
+3. サイドカー再起動 → `GET /ml/v1/health` で `backend: "onnx"`・`bundle.version` を確認
+4. 設定画面で ML を有効化 → 全アセットの解析ジョブを実行
+5. 手元データでクラスタ精度を確認し、必要なら `ml.tau_high_override` /
    `ml.tau_low_override` / `ml.min_cluster_size` を調整 (bundle 本体は書き換えない)
-5. 誤統合が出る場合は quality_gate を `strict` に変更
-6. モデル更新時: 新バンドル配置 → `model_version` が変わるため全再解析ジョブが走る。
+6. 誤統合が出る場合は quality_gate を `strict` に変更
+7. モデル更新時: 新バンドル配置と trusted digest 更新 → `model_version` が変わるため全再解析ジョブが走る。
    旧バージョンの埋め込みと混在させない (docs/07)
 
 ## 互換性テスト (ACR 側へ依頼する成果物)

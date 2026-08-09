@@ -55,15 +55,20 @@ M5 (apps/android, Tauri 2) では以下を**縮退実装**した。将来タス�
   (起動時 + 手動トリガ) に限定した。将来は WorkManager の定期ジョブ + MediaStore 差分
   クエリを Tauri プラグインとして実装し、Wi-Fi のみ / 充電中のみ・指数バックオフに対応する
   (→ docs/08)。送信済み台帳も localStorage からローカル SQLite へ移す。
-- **秘密の OS セキュアストレージ保存**: device token / vault パスワードは、汎用 Keystore
-  プラグインが無いため v1 はプロセスメモリ内保持 (再起動で失効 → 再ログイン / 再アンロック)。
-  将来は Android Keystore に「ラップ済み MK」/ device token を保存する専用プラグインを作り、
+- **秘密の OS セキュアストレージ保存**: device token は、汎用 Keystore plugin が無いため
+  M5ではWebViewへ返さずRust process memory内だけに保持する (再起動で失効 → 再ログイン)。
+  Vault passwordの保存と生体認証unlockは提供せず、JavaScript Mapによる代替も禁止する。
+  将来は Android Keystore に「ラップ済み MK」/ device token を保存する専用pluginを作り、
   生体認証成功時のみ復号する (→ docs/06 / docs/08)。
 - **Wi-Fi SSID 紐付け**: local URL を特定 SSID にのみ試す最適化。現状 SSID 取得プラグインが
   無いため、UI と設定スキーマ (ssid フィールド) だけ用意し、判定は到達性プローブ
-  (local→external, 各 2 秒) で代替している (→ docs/08)。SSID 自動取得プラグイン導入後に
+  (external→local, 各 2 秒) で代替している (→ docs/08)。SSID 自動取得プラグイン導入後に
   「指定 SSID 接続時のみ local を試す」を有効化する (位置情報権限の説明が必要)。
 - **共有インテント (「Illumia へ送る」)**: 下記「その他の候補」にも記載。
+- **Android大容量uploadのnative streaming**: M5の汎用bridgeはBase64 IPC増幅によるOOMを
+  防ぐためmultipart requestを17 MiBで制限する。通常のWeb/server上限128 MiBをAndroidでも
+  利用するには、Storage Access Frameworkのcontent URI/file descriptorをnative commandへ渡し、
+  Rust側でchecksum計算とmultipart uploadを固定長chunkで行う専用経路を実装する。
 
 ## その他の候補 (優先度低)
 
