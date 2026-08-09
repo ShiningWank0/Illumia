@@ -3,5 +3,5 @@
   "description": "Illumia Android の既定ケーパビリティ (SPA + ネイティブプラグイン)",
   "windows": ["main"],
   "platforms": ["android"],
-  "permissions": ["core:default", "biometric:default", "dialog:default", "fs:default"]
+  "permissions": ["core:default", "dialog:default", "fs:default"]
 }

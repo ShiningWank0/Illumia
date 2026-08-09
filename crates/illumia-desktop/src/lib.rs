@@ -11,4 +11,5 @@
 
 pub mod app;
 pub mod backend;
+pub mod credential_store;
 pub mod layout;

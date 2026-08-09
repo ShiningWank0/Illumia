@@ -1,6 +1,7 @@
 # Android APK 署名キーの作成と登録
 
-APK は GitHub Actions で署名ビルドする (→ `.github/workflows/release.yml`)。
+APK は GitHub Actions でunsigned buildと署名を別jobに分ける
+(→ `.github/workflows/release.yml`)。
 署名キーと そのパスワードは**あなただけが保持する秘密**なので、以下は必ず
 あなた自身の端末で実行すること。生成物と入力値を第三者 (AI エージェントを含む) へ
 渡さないこと。
@@ -15,9 +16,8 @@ APK は GitHub Actions で署名ビルドする (→ `.github/workflows/release.
 
 `keytool` は JDK に付属する (Android Studio か `brew install openjdk` で入る)。
 
-**注意**: `inject-signing.py` が生成する Gradle 設定は、ストアパスワードと
-キーパスワードに**同じ値**を使う。したがって `-storepass` と `-keypass` は
-同一にすること。
+**注意**: 専用署名jobはストアパスワードをキーパスワードにも使用するため、
+`-storepass` と `-keypass` は同一にすること。
 
 ```bash
 keytool -genkeypair -v \
@@ -79,8 +79,9 @@ rm illumia-keystore.b64
 ## 5. リリース
 
 Secrets が揃った状態で `vX.Y.Z` タグを push すると、release workflow が
-署名 APK をビルドし、SHA-256 と署名証明書の fingerprint を release notes へ
-記録する (docs/12: SEC-007)。
+依存buildを秘密なしで完了した後、repositoryをcheckoutしない別jobでAPKを署名する。
+署名jobはSHA-256と署名証明書のfingerprintを検証・記録し、unsigned APKはReleaseへ
+添付しない (docs/12: SEC-007)。
 
 タグを打つ前に、公開しない経路で全ジョブが通ることを確認できる:
 

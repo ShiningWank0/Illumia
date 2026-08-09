@@ -12,7 +12,7 @@
 //    サーバーへは credential を一切送らない。
 //  - プロファイルは load / save の双方で URL を検証する。
 
-import { nativeFetch } from './tauri';
+import { bindNativeServer, probeNativeServer } from './tauri';
 import { parseServerUrl, ServerUrlError } from './serverUrl';
 
 const STORAGE_KEY = 'illumia.connection';
@@ -140,9 +140,7 @@ async function probe(
   const attempt = (async (): Promise<ProbeOutcome> => {
     let body: unknown;
     try {
-      const response = await nativeFetch(`${url}/api/server/info`, { method: 'GET' });
-      if (!response.ok) return { ok: false, reason: 'unreachable' };
-      body = await response.json();
+      body = await probeNativeServer(url);
     } catch {
       return { ok: false, reason: 'unreachable' };
     }
@@ -202,6 +200,13 @@ export async function probeAndSelect(
     }
     const outcome = await probe(candidate.url, pinned);
     if (outcome.ok) {
+      try {
+        // Rust 側でも同じ identity を再 probe してから origin をプロセス中固定する。
+        await bindNativeServer(candidate.url, outcome.instanceId);
+      } catch {
+        identityMismatch = true;
+        continue;
+      }
       activeBaseUrl = candidate.url;
       return {
         baseUrl: candidate.url,

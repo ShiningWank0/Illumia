@@ -25,6 +25,15 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 # client-only モードのリモート接続用。all-in-one では使わない。
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 directories = "6"
+url = "2"
+zeroize = "1.8"
+rpassword = "7.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
 
 [dev-dependencies]
 # 実データ検証用に PNG エンコードが必要 (テストのみ)。

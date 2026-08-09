@@ -28,15 +28,12 @@ serde_json = "1"
 # (src/bridge.rs) から直接 reqwest を使う。OS の CA ストア差異による検証の緩みを
 # 避けるため rustls + webpki roots を使う。
 reqwest = { version = "0.12", default-features = false, features = [
+  "blocking",
   "rustls-tls-webpki-roots",
 ] }
 base64 = "0.22"
 url = "2"
-
-# biometric はモバイル専用プラグイン。desktop (dev ビルド・単体テスト) では
-# そもそも解決できないため、モバイルターゲットのみで依存する。
-[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-tauri-plugin-biometric = "2"
+zeroize = "1"
 
 [features]
 # tauri の dev 時に devtools を有効化する用のプレースホルダ。

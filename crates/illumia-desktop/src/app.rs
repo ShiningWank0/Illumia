@@ -22,6 +22,10 @@ const GAP: f32 = 4.0;
 const TARGET_ROW_HEIGHT: f32 = 200.0;
 /// 同時に保持するテクスチャの上限 (メモリ上限 → docs/12)。
 const MAX_TEXTURES: usize = 512;
+/// server の派生画像仕様 (最大 1440px) に十分な余裕を持たせた decode dimension 上限。
+const MAX_IMAGE_DIMENSION: u32 = 4096;
+/// decoder の出力・中間 allocation 合計上限。
+const MAX_IMAGE_DECODE_ALLOC: u64 = 96 * 1024 * 1024;
 
 pub struct IllumiaApp {
     backend: Arc<dyn Backend>,
@@ -294,7 +298,39 @@ impl IllumiaApp {
 
 /// サーバーが生成した WebP サムネイルを egui の画像へ変換する。
 fn decode_webp(bytes: &[u8]) -> Option<ColorImage> {
-    let decoded = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_ALLOC);
+    // response は WebP と仕様で固定されるため sniffing で別 decoder へ迂回させない。
+    let mut reader =
+        image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::WebP);
+    reader.limits(limits);
+    let decoded = reader.decode().ok()?.to_rgba8();
     let size = [decoded.width() as usize, decoded.height() as usize];
     Some(ColorImage::from_rgba_unmultiplied(size, decoded.as_raw()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn webp(width: u32, height: u32) -> Vec<u8> {
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut bytes, image::ImageFormat::WebP)
+            .expect("WebP を生成できる");
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn webp_decode_accepts_normal_thumbnail() {
+        assert!(decode_webp(&webp(240, 180)).is_some());
+    }
+
+    #[test]
+    fn webp_decode_rejects_oversized_dimensions_before_rgba_allocation() {
+        assert!(decode_webp(&webp(MAX_IMAGE_DIMENSION + 1, 1)).is_none());
+    }
 }

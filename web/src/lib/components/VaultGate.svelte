@@ -2,20 +2,10 @@
   // Vault の初期化 / アンロック UI。
   //  - 未初期化 → パスワード設定 → recovery_key を 1 度だけ表示 → 「保存した」で先へ
   //  - ロック中 → パスワード or リカバリーキーでアンロック
-  import { onMount } from 'svelte';
   import { vaultSession } from '$lib/vaultSession.svelte';
   import { getVaultLifecycle } from '$lib/api/vault';
-  import {
-    isTauri,
-    biometricStatus,
-    biometricAuthenticate,
-    secureGet,
-    secureSet
-  } from '$lib/platform/tauri';
 
   const lifecycle = getVaultLifecycle();
-  // 生体認証成功時に取り出す vault パスワードの secure storage キー (現状メモリ内)。
-  const VAULT_PW_KEY = 'illumia.vault_password';
 
   // 初期化フォーム
   let initPassword = $state('');
@@ -27,40 +17,9 @@
   let useRecovery = $state(false);
   let unlockPassword = $state('');
   let unlockRecovery = $state('');
-  let enableBiometric = $state(false);
 
-  let biometricAvailable = $state(false);
-  let hasStoredCredential = $state(false);
   let submitting = $state(false);
   let formError = $state<string | null>(null);
-
-  onMount(async () => {
-    if (!isTauri()) return;
-    biometricAvailable = (await biometricStatus()).available;
-    hasStoredCredential = secureGet(VAULT_PW_KEY) !== null;
-  });
-
-  async function biometricUnlock() {
-    formError = null;
-    submitting = true;
-    try {
-      if (!(await biometricAuthenticate('Vault をアンロック'))) {
-        formError = '生体認証に失敗しました';
-        return;
-      }
-      const pw = secureGet(VAULT_PW_KEY);
-      if (!pw) {
-        formError = '保存された認証情報がありません。パスワードで開いてください。';
-        return;
-      }
-      const res = await lifecycle.unlock({ password: pw });
-      vaultSession.setUnlocked(res.vault_session, res.expires_at);
-    } catch (err) {
-      formError = err instanceof Error ? err.message : 'アンロックに失敗しました';
-    } finally {
-      submitting = false;
-    }
-  }
 
   async function doInit(e: SubmitEvent) {
     e.preventDefault();
@@ -102,11 +61,6 @@
         ? { recovery_key: unlockRecovery.trim() }
         : { password: unlockPassword };
       const res = await lifecycle.unlock(payload);
-      // 生体認証を有効化する場合、パスワードを secure storage に保存する。
-      if (enableBiometric && !useRecovery && isTauri() && unlockPassword) {
-        secureSet(VAULT_PW_KEY, unlockPassword);
-        hasStoredCredential = true;
-      }
       vaultSession.setUnlocked(res.vault_session, res.expires_at);
       unlockPassword = '';
       unlockRecovery = '';
@@ -173,22 +127,11 @@
             required
           />
         </label>
-        {#if biometricAvailable}
-          <label class="check">
-            <input type="checkbox" bind:checked={enableBiometric} />
-            この端末で次回から生体認証を使う
-          </label>
-        {/if}
       {/if}
       {#if formError}<p class="err">{formError}</p>{/if}
       <button class="primary" type="submit" disabled={submitting}>
         {submitting ? '確認中…' : 'アンロック'}
       </button>
-      {#if biometricAvailable && hasStoredCredential}
-        <button type="button" class="link" disabled={submitting} onclick={biometricUnlock}>
-          🔓 生体認証でアンロック
-        </button>
-      {/if}
       <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
         {useRecovery ? 'パスワードで開く' : 'リカバリーキーで開く'}
       </button>
