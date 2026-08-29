@@ -41,7 +41,7 @@
     "svelte": "^5.53.10",
     "svelte-check": "^4.0.0",
     "thumbhash": "^0.1.1",
-    "typescript": "^5.5.4",
+    "typescript": "^7.0.2",
     "vite": "^8.2.0",
     "vitest": "^4.1.10"
   }
