@@ -45,7 +45,8 @@ SELECT id FROM assets
 WHERE lifecycle IN ('duplicate','trashed')
   AND purge_after IS NOT NULL
   AND purge_after < :now
-  AND NOT EXISTS (SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id);
+  AND NOT EXISTS (SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id)
+  AND NOT EXISTS (SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id);
 ```
 
 削除手順 (クラッシュ耐性):
@@ -55,6 +56,9 @@ WHERE lifecycle IN ('duplicate','trashed')
 3. DB 行削除 (faces / FTS 等は FK CASCADE とトリガで同時に消える)
 
 起動時に `purging` の残骸があれば手順 2 から再開する。
+旧版が `duplicate_of` の参照先を `purging` にして残していた場合は、物理 file を
+削除せず `trashed` / `duplicate` へ安全に戻す。物理削除の直前にも逆参照を再確認し、
+参照先を消す順序へは進まない。
 **手順 2 で削除するパスは必ず自 asset 行の `library_path` / 自 id 由来のサムネパスのみ**。
 他の行のパスを計算・削除するコードを書いてはならない。
 
@@ -79,3 +83,13 @@ WHERE lifecycle IN ('duplicate','trashed')
   (照合は vault 内の hash とのみ行う。平文側 hash とは突合しない — 存在秘匿のため)。
 - メイン ⇄ vault の移動 (→ docs/06) は本ドキュメントのライフサイクルとは別の
   「DB 間移動」であり、パージジョブの対象選定に影響しない。
+- transfer reconciliation が削除できるのは journal に記録した source asset 自身の
+  `library_path`、自身の id から生成した thumbnail/preview、または transfer UUID 専用 staging
+  directory のみ。通常 purge の対象 SQL・I1〜I6 を再利用・迂回してはならず、reconciliation
+  後にも I1〜I6 の統合テストを全て通す。
+- transfer の source journal 作成と同じ transaction で `duplicate_of` の逆参照閉包を検証する。
+  参照元を source 集合へ含めない部分 transfer は file を 1 byte も消す前に拒否する。
+  file 削除直前にも同じ transaction で閉包を再検証して source rows を `purging` に lease する。
+  journal 中・lease 中の asset は新規 dedup の参照先に選ばない。旧版 journal が不完全な閉包のまま
+  source file 削除済みなら、残存 duplicate を transaction 内で新しい本体へ昇格・再親子付けして
+  DB を収束させる。

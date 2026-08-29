@@ -5,8 +5,12 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt, fs,
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    },
 };
 
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -14,18 +18,19 @@ use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305, XNonce,
     aead::{Aead, Payload},
 };
+use chrono::{DateTime, Utc};
 use hkdf::Hkdf;
 use rand::{TryRng, rngs::SysRng};
 use rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use uuid::Uuid;
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
-    assets::{Asset, AssetService, Lifecycle},
+    assets::{Asset, AssetService, IngestResult, Lifecycle, add_days, timestamp},
     db::{Database, Error, Result, create_private_dir_all, set_private_file_permissions},
-    images, thumbnails,
+    images, settings, thumbnails,
 };
 
 const KEYFILE_VERSION: u32 = 1;
@@ -36,7 +41,10 @@ const TAG_LEN: usize = 16;
 const MAGIC: &[u8; 5] = b"ILMV1";
 const NONCE_PREFIX_LEN: usize = 16;
 const BLOB_HEADER_LEN: usize = MAGIC.len() + NONCE_PREFIX_LEN + 4;
-const CHUNK_SIZE: usize = 1024 * 1024;
+/// Vault blob の暗号化・復号 API が一度に保持する最大平文 chunk サイズ。
+pub const VAULT_BLOB_CHUNK_SIZE: usize = 1024 * 1024;
+const CHUNK_SIZE: usize = VAULT_BLOB_CHUNK_SIZE;
+const TRANSFER_STAGING_DIR: &str = "transfer-staging";
 const MAX_KEYFILE_BYTES: u64 = 64 * 1024;
 const MAX_ENCRYPTED_BLOB_BYTES: u64 = images::MAX_ASSET_BYTES as u64 + 1024 * 1024;
 pub const MAX_VAULT_TRANSFER_ASSETS: usize = 100;
@@ -92,9 +100,14 @@ struct KeyFile {
 }
 
 /// メモリ破棄時に master key をゼロ化する Vault 鍵。
-#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[derive(Clone)]
 pub struct VaultKey {
-    master_key: [u8; KEY_LEN],
+    inner: Arc<VaultKeyInner>,
+}
+
+struct VaultKeyInner {
+    master_key: Mutex<Zeroizing<[u8; KEY_LEN]>>,
+    revoked: AtomicBool,
 }
 
 impl fmt::Debug for VaultKey {
@@ -105,15 +118,48 @@ impl fmt::Debug for VaultKey {
 
 impl VaultKey {
     fn new(master_key: [u8; KEY_LEN]) -> Self {
-        Self { master_key }
+        Self {
+            inner: Arc::new(VaultKeyInner {
+                master_key: Mutex::new(Zeroizing::new(master_key)),
+                revoked: AtomicBool::new(false),
+            }),
+        }
     }
 
     fn derive(&self, info: &[u8]) -> Result<[u8; KEY_LEN]> {
-        let hkdf = Hkdf::<Sha256>::new(None, &self.master_key);
-        let mut output = [0_u8; KEY_LEN];
-        hkdf.expand(info, &mut output)
+        self.with_master_key(|master_key| {
+            let hkdf = Hkdf::<Sha256>::new(None, master_key);
+            let mut output = [0_u8; KEY_LEN];
+            hkdf.expand(info, &mut output)
+                .map_err(|_| Error::VaultCrypto)?;
+            Ok(output)
+        })
+    }
+
+    fn with_master_key<T>(&self, operation: impl FnOnce(&[u8; KEY_LEN]) -> Result<T>) -> Result<T> {
+        self.ensure_active()?;
+        let master_key = self
+            .inner
+            .master_key
+            .lock()
             .map_err(|_| Error::VaultCrypto)?;
-        Ok(output)
+        self.ensure_active()?;
+        operation(&master_key)
+    }
+
+    fn ensure_active(&self) -> Result<()> {
+        if self.inner.revoked.load(AtomicOrdering::Acquire) {
+            Err(Error::VaultAuthenticationFailed)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn revoke(&self) {
+        self.inner.revoked.store(true, AtomicOrdering::Release);
+        if let Ok(mut master_key) = self.inner.master_key.lock() {
+            master_key.zeroize();
+        }
     }
 }
 
@@ -137,16 +183,30 @@ pub struct VaultBlobReader {
     plaintext_total: usize,
     index: usize,
     finished: bool,
+    key: VaultKey,
 }
 
 impl VaultHandle {
+    /// Revokes this handle and every clone sharing its in-memory master key.
+    pub fn revoke(&self) {
+        self.key.revoke();
+    }
+
+    /// Fails after the unlock session owning this handle has been revoked.
+    pub fn ensure_active(&self) -> Result<()> {
+        self.key.ensure_active()
+    }
+
     /// unlock 済み鍵で vault DB を開く。
     ///
     /// `vault: no-log`
     pub fn open(data_root: impl AsRef<Path>, key: VaultKey) -> Result<Self> {
         let sqlcipher_key = Zeroizing::new(key.derive(b"vault-db")?);
         let db = Database::open_vault(data_root.as_ref(), &sqlcipher_key)?;
-        Ok(Self { db, key })
+        let handle = Self { db, key };
+        handle.reconcile_direct_ingests()?;
+        handle.cleanup_orphan_staging()?;
+        Ok(handle)
     }
 
     /// password unlock と DB open をまとめて行う。
@@ -172,6 +232,146 @@ impl VaultHandle {
         self.write_blob_for(bytes, BlobKind::Standalone, None)
     }
 
+    /// main library を経由せず、最初の persistent write を暗号化 blob として取り込む。
+    ///
+    /// `vault: no-log`
+    pub fn ingest(
+        &self,
+        bytes: &[u8],
+        original_name: &str,
+        taken_at: Option<DateTime<Utc>>,
+    ) -> Result<IngestResult> {
+        self.ingest_at(bytes, original_name, taken_at, Utc::now())
+    }
+
+    /// 時刻を固定できる direct encrypted ingest。テストと migration 用。
+    ///
+    /// `vault: no-log`
+    pub fn ingest_at(
+        &self,
+        bytes: &[u8],
+        original_name: &str,
+        taken_at: Option<DateTime<Utc>>,
+        uploaded_at: DateTime<Utc>,
+    ) -> Result<IngestResult> {
+        self.ensure_active()?;
+        let ext = images::normalized_extension(original_name)?;
+        let (width, height) = images::validate_and_dimensions(bytes, &ext)?;
+        let hash = blake3::hash(bytes);
+        let asset_id = Uuid::now_v7().to_string();
+        let transfer_id = Uuid::now_v7().to_string();
+        let taken_at = taken_at.unwrap_or(uploaded_at);
+        let staging_dir = transfer_staging_dir(self.db.data_root(), &transfer_id)?;
+        create_private_dir_all(&staging_dir)?;
+        let mut reader = Cursor::new(bytes);
+        let prepared_blob = prepare_reader_blob(
+            self,
+            &mut reader,
+            bytes.len(),
+            BlobKind::Original,
+            &asset_id,
+            &staging_dir,
+            Some((
+                i64::try_from(bytes.len()).map_err(|_| Error::InvalidVaultBlob)?,
+                hash.as_bytes(),
+            )),
+        )?;
+        self.ensure_active()?;
+        let blob_id = prepared_blob.id.clone();
+        let result = self.db.with_connection_mut(|connection| {
+            let transaction = connection.transaction()?;
+            let duplicate_of = transaction
+                .query_row(
+                    "SELECT id FROM assets
+                     WHERE hash = ?1 AND lifecycle = 'active' AND duplicate_of IS NULL
+                       AND NOT EXISTS (
+                         SELECT 1 FROM vault_transfers transfer, json_each(transfer.asset_ids) item
+                         WHERE transfer.role = 'source' AND item.value = assets.id
+                       )",
+                    [hash.as_bytes().as_slice()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            let lifecycle = if duplicate_of.is_some() {
+                "duplicate"
+            } else {
+                "active"
+            };
+            let purge_after = if duplicate_of.is_some() {
+                Some(add_days(
+                    uploaded_at,
+                    settings::dedup_retention_days(&transaction)?,
+                ))
+            } else {
+                None
+            };
+            transaction.execute(
+                "INSERT INTO assets(
+                   id, hash, original_name, ext, size, width, height,
+                   taken_at, taken_at_local_date, uploaded_at, thumbhash,
+                   in_timeline, visible_in_timeline, lifecycle, duplicate_of,
+                   trashed_at, purge_after, library_path
+                 ) VALUES (
+                   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL,
+                   1, ?11, ?12, ?13, NULL, ?14, ?15
+                 )",
+                params![
+                    asset_id,
+                    hash.as_bytes().as_slice(),
+                    original_name,
+                    ext,
+                    i64::try_from(bytes.len()).map_err(|_| Error::InvalidVaultBlob)?,
+                    i64::from(width),
+                    i64::from(height),
+                    timestamp(taken_at),
+                    taken_at.format("%Y-%m-%d").to_string(),
+                    timestamp(uploaded_at),
+                    i64::from(duplicate_of.is_none()),
+                    lifecycle,
+                    duplicate_of,
+                    purge_after,
+                    blob_id,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO vault_blobs(blob_id, wrapped_key, kind, asset_id)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    prepared_blob.id,
+                    prepared_blob.wrapped_key,
+                    prepared_blob.kind.as_str(),
+                    prepared_blob.asset_id,
+                ],
+            )?;
+            insert_transfer_record(
+                &transaction,
+                &transfer_id,
+                TransferDirection::DirectIngest,
+                "destination",
+                std::slice::from_ref(&asset_id),
+                TransferState::DestinationReady,
+            )?;
+            transaction.commit()?;
+            Ok(duplicate_of)
+        });
+        let duplicate_of = match result {
+            Ok(value) => value,
+            Err(error) => {
+                remove_transfer_staging(self.db.data_root(), &transfer_id)?;
+                return Err(error);
+            }
+        };
+        self.complete_direct_ingest(&transfer_id, std::slice::from_ref(&asset_id))?;
+        self.ensure_active()?;
+        let asset = AssetService::new(self.db.clone())
+            .get(&asset_id)?
+            .ok_or(Error::IncompleteVaultTransfer)?;
+        Ok(IngestResult {
+            asset,
+            duplicate_of,
+        })
+    }
+
     /// blob を逐次復号する reader を開く。
     ///
     /// `vault: no-log`
@@ -195,7 +395,10 @@ impl VaultHandle {
                 .ok_or(Error::VaultBlobNotFound)
         })?;
         let aad = blob_key_aad(blob_id, &kind, asset_id.as_deref());
-        let file_key = Zeroizing::new(unwrap_bytes(&self.key.master_key, &wrapped_key, &aad)?);
+        let file_key = Zeroizing::new(
+            self.key
+                .with_master_key(|master_key| unwrap_bytes(master_key, &wrapped_key, &aad))?,
+        );
         let mut file = fs::File::open(path)?;
         let encrypted_len = file.metadata()?.len();
         let minimum_len =
@@ -233,6 +436,7 @@ impl VaultHandle {
             plaintext_total: 0,
             index: 0,
             finished: false,
+            key: self.key.clone(),
         })
     }
 
@@ -251,6 +455,7 @@ impl VaultHandle {
     ///
     /// `vault: no-log`
     pub fn generate_thumbnails(&self, asset_id: &str) -> Result<()> {
+        self.ensure_active()?;
         let extension = AssetService::new(self.db.clone())
             .get(asset_id)?
             .ok_or(Error::AssetNotFound)?
@@ -267,6 +472,7 @@ impl VaultHandle {
         if self.blob_id_for(asset_id, BlobKind::Preview)?.is_none() {
             self.write_blob_for(&variants.preview, BlobKind::Preview, Some(asset_id))?;
         }
+        self.ensure_active()?;
         self.db.with_connection(|connection| {
             connection.execute(
                 "UPDATE assets SET thumbhash = ?2 WHERE id = ?1",
@@ -301,11 +507,22 @@ impl VaultHandle {
         }
         let blob_id = Uuid::now_v7().to_string();
         let file_key = Zeroizing::new(random_array()?);
-        let encrypted = encrypt_blob(&blob_id, &file_key, bytes)?;
         let aad = blob_key_aad(&blob_id, kind.as_str(), asset_id);
-        let wrapped_key = wrap_bytes(&self.key.master_key, file_key.as_slice(), &aad)?;
+        let wrapped_key = self
+            .key
+            .with_master_key(|master_key| wrap_bytes(master_key, file_key.as_slice(), &aad))?;
         let path = self.blob_path(&blob_id)?;
-        fs::write(&path, encrypted)?;
+        let mut output = create_new_private_file(&path)?;
+        let mut input = Cursor::new(bytes);
+        encrypt_reader_to_writer(
+            &blob_id,
+            &file_key,
+            &mut input,
+            &mut output,
+            bytes.len(),
+            Some(&self.key),
+        )?;
+        output.sync_all()?;
         let inserted = self.db.with_connection(|connection| {
             connection.execute(
                 "INSERT INTO vault_blobs(blob_id, wrapped_key, kind, asset_id)
@@ -321,6 +538,49 @@ impl VaultHandle {
         Ok(blob_id)
     }
 
+    fn complete_direct_ingest(&self, transfer_id: &str, asset_ids: &[String]) -> Result<()> {
+        self.ensure_active()?;
+        finalize_import_files(self, transfer_id, asset_ids)?;
+        self.ensure_active()?;
+        validate_import_destination(self, asset_ids)?;
+        delete_transfer_record(&self.db, transfer_id)?;
+        self.db.checkpoint_truncate()?;
+        remove_transfer_staging(self.db.data_root(), transfer_id)
+    }
+
+    fn reconcile_direct_ingests(&self) -> Result<()> {
+        for journal in destination_transfers(&self.db, TransferDirection::DirectIngest)? {
+            self.complete_direct_ingest(&journal.id, &journal.asset_ids)?;
+        }
+        Ok(())
+    }
+
+    fn cleanup_orphan_staging(&self) -> Result<()> {
+        let referenced = transfer_ids(&self.db)?;
+        let root = self.db.data_root().join("vault").join(TRANSFER_STAGING_DIR);
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let transfer_id = entry
+                .file_name()
+                .to_str()
+                .ok_or(Error::InvalidAssetPath)?
+                .to_owned();
+            Uuid::parse_str(&transfer_id).map_err(|_| Error::InvalidAssetPath)?;
+            if !entry.file_type()?.is_dir() {
+                return Err(Error::InvalidAssetPath);
+            }
+            if !referenced.contains(&transfer_id) {
+                remove_transfer_staging(self.db.data_root(), &transfer_id)?;
+            }
+        }
+        Ok(())
+    }
+
     fn blob_path(&self, blob_id: &str) -> Result<PathBuf> {
         Uuid::parse_str(blob_id).map_err(|_| Error::InvalidVaultBlob)?;
         Ok(self
@@ -334,6 +594,7 @@ impl VaultHandle {
 
 impl VaultBlobReader {
     fn read_chunk(&mut self) -> Result<Vec<u8>> {
+        self.key.ensure_active()?;
         if self.encrypted_remaining < 5 {
             return Err(Error::InvalidVaultBlob);
         }
@@ -410,9 +671,14 @@ impl Iterator for VaultBlobReader {
 
 struct PreparedAsset {
     asset: Asset,
-    original: Zeroizing<Vec<u8>>,
-    thumbnail: Option<Zeroizing<Vec<u8>>>,
-    preview: Option<Zeroizing<Vec<u8>>>,
+    original: PreparedSource,
+    thumbnail: Option<PreparedSource>,
+    preview: Option<PreparedSource>,
+}
+
+enum PreparedSource {
+    PlainFile(PathBuf),
+    VaultBlob(String),
 }
 
 #[derive(Clone)]
@@ -484,15 +750,71 @@ struct Relations {
 struct PreparedBlob {
     id: String,
     wrapped_key: Vec<u8>,
-    encrypted: Vec<u8>,
     kind: BlobKind,
     asset_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferDirection {
+    Import,
+    Export,
+    DirectIngest,
+}
+
+impl TransferDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Import => "import",
+            Self::Export => "export",
+            Self::DirectIngest => "direct_ingest",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum TransferState {
+    Preparing,
+    DestinationReady,
+    SourceFilesDeleted,
+    SourceDatabaseDeleted,
+}
+
+impl TransferState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Preparing => "preparing",
+            Self::DestinationReady => "destination_ready",
+            Self::SourceFilesDeleted => "source_files_deleted",
+            Self::SourceDatabaseDeleted => "source_database_deleted",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "preparing" => Ok(Self::Preparing),
+            "destination_ready" => Ok(Self::DestinationReady),
+            "source_files_deleted" => Ok(Self::SourceFilesDeleted),
+            "source_database_deleted" => Ok(Self::SourceDatabaseDeleted),
+            _ => Err(Error::IncompleteVaultTransfer),
+        }
+    }
+}
+
+struct TransferJournal {
+    id: String,
+    asset_ids: Vec<String>,
+    state: TransferState,
 }
 
 /// メイン DB の指定 asset を Vault へ完全移動する。
 ///
 /// `vault: no-log`
 pub fn import_assets(main_db: &Database, vault: &VaultHandle, asset_ids: &[String]) -> Result<()> {
+    vault.ensure_active()?;
+    reconcile_transfers(main_db, vault)?;
+    if assets_moved(main_db, &vault.db, asset_ids)? {
+        return Ok(());
+    }
     import_assets_inner(main_db, vault, asset_ids, &mut |_| Ok(()))
 }
 
@@ -514,34 +836,25 @@ fn import_assets_inner(
     validate_transfer_ids(asset_ids)?;
     let assets = prepare_main_assets(main_db, asset_ids)?;
     let relations = collect_relations(main_db, asset_ids)?;
-    observer(ImportPhase::SourcePrepared)?;
-    stage_vault_import(vault, &assets, &relations, observer)?;
-    observer(ImportPhase::VaultCommitted)?;
-
-    // Vault が完全な状態になった後だけ平文ファイルと行を消す。
-    for prepared in &assets {
-        remove_if_exists(
-            &main_db
-                .data_root()
-                .join(checked_relative_path(&prepared.asset.library_path)?),
-        )?;
-        remove_if_exists(
-            &main_db
-                .data_root()
-                .join("thumbs")
-                .join(format!("{}_t.webp", prepared.asset.id)),
-        )?;
-        remove_if_exists(
-            &main_db
-                .data_root()
-                .join("thumbs")
-                .join(format!("{}_p.webp", prepared.asset.id)),
-        )?;
+    let transfer_id = Uuid::now_v7().to_string();
+    insert_source_transfer(main_db, &transfer_id, TransferDirection::Import, asset_ids)?;
+    if let Err(error) = observer(ImportPhase::SourcePrepared) {
+        delete_transfer_record(main_db, &transfer_id)?;
+        return Err(error);
     }
-    observer(ImportPhase::PlainFilesDeleted)?;
-    delete_assets_from_database(main_db, asset_ids)?;
-    observer(ImportPhase::PlainDatabaseDeleted)?;
-    main_db.checkpoint_truncate()
+    if let Err(error) = stage_vault_import(vault, &assets, &relations, &transfer_id, observer) {
+        remove_transfer_staging(vault.db.data_root(), &transfer_id)?;
+        delete_transfer_record(main_db, &transfer_id)?;
+        return Err(error);
+    }
+    vault.ensure_active()?;
+    observer(ImportPhase::VaultCommitted)?;
+    let journal = TransferJournal {
+        id: transfer_id,
+        asset_ids: asset_ids.to_vec(),
+        state: TransferState::Preparing,
+    };
+    complete_import_transfer(main_db, vault, &journal, observer)
 }
 
 /// 漫画スタックと全ページをまとめて Vault へ移動する。
@@ -559,6 +872,24 @@ pub fn import_stack(main_db: &Database, vault: &VaultHandle, stack_id: &str) -> 
 ///
 /// `vault: no-log`
 pub fn export_assets(vault: &VaultHandle, main_db: &Database, asset_ids: &[String]) -> Result<()> {
+    vault.ensure_active()?;
+    validate_transfer_ids(asset_ids)?;
+    // A normal export must be able to decrypt/write UUID-owned files before contending on the
+    // process-wide main SQLite mutex. Only an interrupted prior export needs reconciliation first.
+    if !source_transfers(&vault.db, TransferDirection::Export)?.is_empty() {
+        reconcile_transfers(main_db, vault)?;
+    }
+    let source_present = asset_ids.iter().all(|asset_id| {
+        AssetService::new(vault.db.clone())
+            .get(asset_id)
+            .is_ok_and(|asset| asset.is_some())
+    });
+    if source_present {
+        return export_assets_inner(vault, main_db, asset_ids, &mut |_| Ok(()));
+    }
+    if assets_moved(&vault.db, main_db, asset_ids)? {
+        return Ok(());
+    }
     export_assets_inner(vault, main_db, asset_ids, &mut |_| Ok(()))
 }
 
@@ -580,18 +911,363 @@ fn export_assets_inner(
     validate_transfer_ids(asset_ids)?;
     let assets = prepare_vault_assets(vault, asset_ids)?;
     let relations = collect_relations(&vault.db, asset_ids)?;
-    observer(ExportPhase::SourcePrepared)?;
-    stage_main_export(main_db, &assets, &relations, observer)?;
+    let transfer_id = Uuid::now_v7().to_string();
+    insert_source_transfer(
+        &vault.db,
+        &transfer_id,
+        TransferDirection::Export,
+        asset_ids,
+    )?;
+    if let Err(error) = observer(ExportPhase::SourcePrepared) {
+        delete_transfer_record(&vault.db, &transfer_id)?;
+        return Err(error);
+    }
+    if let Err(error) =
+        stage_main_export(vault, main_db, &assets, &relations, &transfer_id, observer)
+    {
+        delete_transfer_record(&vault.db, &transfer_id)?;
+        return Err(error);
+    }
+    vault.ensure_active()?;
     observer(ExportPhase::MainCommitted)?;
+    let journal = TransferJournal {
+        id: transfer_id,
+        asset_ids: asset_ids.to_vec(),
+        state: TransferState::Preparing,
+    };
+    complete_export_transfer(vault, main_db, &journal, observer)
+}
 
-    let blob_ids = vault_blob_ids(&vault.db, asset_ids)?;
-    for blob_id in &blob_ids {
-        remove_if_exists(&vault.blob_path(blob_id)?)?;
+/// Durable journal を照合し、commit 済み transfer は destination へ収束させる。
+///
+/// Vault unlock 後と import/export 再試行前に呼ぶ。`vault: no-log`
+pub fn reconcile_transfers(main_db: &Database, vault: &VaultHandle) -> Result<()> {
+    for journal in source_transfers(main_db, TransferDirection::Import)? {
+        if destination_transfer_exists(&vault.db, &journal.id, TransferDirection::Import)? {
+            complete_import_transfer(main_db, vault, &journal, &mut |_| Ok(()))?;
+        } else {
+            remove_transfer_staging(vault.db.data_root(), &journal.id)?;
+            delete_transfer_record(main_db, &journal.id)?;
+        }
+    }
+    for journal in source_transfers(&vault.db, TransferDirection::Export)? {
+        if destination_transfer_exists(main_db, &journal.id, TransferDirection::Export)? {
+            complete_export_transfer(vault, main_db, &journal, &mut |_| Ok(()))?;
+        } else {
+            rollback_export_files(vault, main_db, &journal.asset_ids)?;
+            delete_transfer_record(&vault.db, &journal.id)?;
+        }
+    }
+    vault.reconcile_direct_ingests()?;
+    Ok(())
+}
+
+fn complete_import_transfer(
+    main_db: &Database,
+    vault: &VaultHandle,
+    journal: &TransferJournal,
+    observer: &mut impl FnMut(ImportPhase) -> Result<()>,
+) -> Result<()> {
+    vault.ensure_active()?;
+    if !destination_transfer_exists(&vault.db, &journal.id, TransferDirection::Import)? {
+        return Err(Error::IncompleteVaultTransfer);
+    }
+    finalize_import_files(vault, &journal.id, &journal.asset_ids)?;
+    vault.ensure_active()?;
+    validate_import_destination(vault, &journal.asset_ids)?;
+    if journal.state < TransferState::DestinationReady {
+        update_transfer_state(main_db, &journal.id, TransferState::DestinationReady)?;
+    }
+
+    if journal.state < TransferState::SourceFilesDeleted {
+        vault.ensure_active()?;
+        lease_transfer_source_deletion(main_db, &journal.asset_ids)?;
+        vault.ensure_active()?;
+        delete_plain_source_files(main_db, &vault.db, &journal.asset_ids)?;
+        update_transfer_state(main_db, &journal.id, TransferState::SourceFilesDeleted)?;
+    }
+    observer(ImportPhase::PlainFilesDeleted)?;
+
+    if journal.state < TransferState::SourceDatabaseDeleted {
+        vault.ensure_active()?;
+        delete_assets_from_database_idempotent(main_db, &journal.asset_ids)?;
+        update_transfer_state(main_db, &journal.id, TransferState::SourceDatabaseDeleted)?;
+    }
+    observer(ImportPhase::PlainDatabaseDeleted)?;
+    main_db.checkpoint_truncate()?;
+    delete_transfer_record(&vault.db, &journal.id)?;
+    vault.db.checkpoint_truncate()?;
+    delete_transfer_record(main_db, &journal.id)?;
+    main_db.checkpoint_truncate()?;
+    remove_transfer_staging(vault.db.data_root(), &journal.id)
+}
+
+fn complete_export_transfer(
+    vault: &VaultHandle,
+    main_db: &Database,
+    journal: &TransferJournal,
+    observer: &mut impl FnMut(ExportPhase) -> Result<()>,
+) -> Result<()> {
+    vault.ensure_active()?;
+    if !destination_transfer_exists(main_db, &journal.id, TransferDirection::Export)? {
+        return Err(Error::IncompleteVaultTransfer);
+    }
+    validate_export_destination(main_db, &journal.asset_ids)?;
+    if journal.state < TransferState::DestinationReady {
+        update_transfer_state(&vault.db, &journal.id, TransferState::DestinationReady)?;
+    }
+
+    if journal.state < TransferState::SourceFilesDeleted {
+        vault.ensure_active()?;
+        lease_transfer_source_deletion(&vault.db, &journal.asset_ids)?;
+        for blob_id in vault_blob_ids(&vault.db, &journal.asset_ids)? {
+            vault.ensure_active()?;
+            remove_if_exists(&vault.blob_path(&blob_id)?)?;
+        }
+        update_transfer_state(&vault.db, &journal.id, TransferState::SourceFilesDeleted)?;
     }
     observer(ExportPhase::VaultFilesDeleted)?;
-    delete_assets_from_database(&vault.db, asset_ids)?;
+
+    if journal.state < TransferState::SourceDatabaseDeleted {
+        vault.ensure_active()?;
+        delete_assets_from_database_idempotent(&vault.db, &journal.asset_ids)?;
+        update_transfer_state(&vault.db, &journal.id, TransferState::SourceDatabaseDeleted)?;
+    }
     observer(ExportPhase::VaultDatabaseDeleted)?;
+    vault.db.checkpoint_truncate()?;
+    delete_transfer_record(main_db, &journal.id)?;
+    main_db.checkpoint_truncate()?;
+    delete_transfer_record(&vault.db, &journal.id)?;
     vault.db.checkpoint_truncate()
+}
+
+fn insert_source_transfer(
+    database: &Database,
+    transfer_id: &str,
+    direction: TransferDirection,
+    asset_ids: &[String],
+) -> Result<()> {
+    database.with_connection_mut(|connection| {
+        let transaction = connection.transaction()?;
+        validate_duplicate_closure(&transaction, asset_ids)?;
+        transaction.execute(
+            "INSERT INTO vault_transfers(id, direction, role, asset_ids, state, created_at)
+             VALUES (?1, ?2, 'source', ?3, ?4, ?5)",
+            params![
+                transfer_id,
+                direction.as_str(),
+                serde_json::to_string(asset_ids)?,
+                TransferState::Preparing.as_str(),
+                timestamp(Utc::now()),
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn validate_duplicate_closure(
+    connection: &rusqlite::Connection,
+    asset_ids: &[String],
+) -> Result<()> {
+    let selected = serde_json::to_string(asset_ids)?;
+    let outside_reference = connection
+        .query_row(
+            "SELECT 1
+             FROM assets dependent
+             WHERE dependent.duplicate_of IN (SELECT value FROM json_each(?1))
+               AND dependent.id NOT IN (SELECT value FROM json_each(?1))
+             LIMIT 1",
+            [&selected],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if outside_reference {
+        return Err(Error::IncompleteVaultTransfer);
+    }
+    Ok(())
+}
+
+/// Atomically revalidates the duplicate closure and hides every source row before
+/// physical deletion starts. Application writes cannot choose a `purging` row as
+/// a new duplicate target, closing the check-to-file-delete race.
+fn lease_transfer_source_deletion(database: &Database, asset_ids: &[String]) -> Result<()> {
+    database.with_connection_mut(|connection| {
+        let transaction = connection.transaction()?;
+        validate_duplicate_closure(&transaction, asset_ids)?;
+        let sql = format!(
+            "UPDATE assets SET lifecycle = 'purging', visible_in_timeline = 0
+             WHERE id IN ({})",
+            sql_placeholders(asset_ids.len())
+        );
+        transaction.execute(&sql, params_from_iter(asset_ids.iter()))?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
+fn insert_transfer_record(
+    transaction: &Transaction<'_>,
+    transfer_id: &str,
+    direction: TransferDirection,
+    role: &str,
+    asset_ids: &[String],
+    state: TransferState,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO vault_transfers(id, direction, role, asset_ids, state, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            transfer_id,
+            direction.as_str(),
+            role,
+            serde_json::to_string(asset_ids)?,
+            state.as_str(),
+            timestamp(Utc::now()),
+        ],
+    )?;
+    Ok(())
+}
+
+fn source_transfers(
+    database: &Database,
+    direction: TransferDirection,
+) -> Result<Vec<TransferJournal>> {
+    database.with_connection(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT id, asset_ids, state FROM vault_transfers
+             WHERE direction = ?1 AND role = 'source' ORDER BY created_at, id",
+        )?;
+        statement
+            .query_map([direction.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, asset_ids, state) = row?;
+                Uuid::parse_str(&id).map_err(|_| Error::IncompleteVaultTransfer)?;
+                let asset_ids: Vec<String> = serde_json::from_str(&asset_ids)?;
+                validate_transfer_ids(&asset_ids)?;
+                Ok(TransferJournal {
+                    id,
+                    asset_ids,
+                    state: TransferState::from_str(&state)?,
+                })
+            })
+            .collect()
+    })
+}
+
+fn destination_transfers(
+    database: &Database,
+    direction: TransferDirection,
+) -> Result<Vec<TransferJournal>> {
+    database.with_connection(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT id, asset_ids, state FROM vault_transfers
+             WHERE direction = ?1 AND role = 'destination' ORDER BY created_at, id",
+        )?;
+        statement
+            .query_map([direction.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .map(|row| {
+                let (id, asset_ids, state) = row?;
+                Uuid::parse_str(&id).map_err(|_| Error::IncompleteVaultTransfer)?;
+                let asset_ids: Vec<String> = serde_json::from_str(&asset_ids)?;
+                validate_transfer_ids(&asset_ids)?;
+                Ok(TransferJournal {
+                    id,
+                    asset_ids,
+                    state: TransferState::from_str(&state)?,
+                })
+            })
+            .collect()
+    })
+}
+
+fn transfer_ids(database: &Database) -> Result<HashSet<String>> {
+    database.with_connection(|connection| {
+        let mut statement = connection.prepare("SELECT id FROM vault_transfers")?;
+        statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|row| {
+                let transfer_id = row?;
+                Uuid::parse_str(&transfer_id).map_err(|_| Error::IncompleteVaultTransfer)?;
+                Ok(transfer_id)
+            })
+            .collect()
+    })
+}
+
+fn destination_transfer_exists(
+    database: &Database,
+    transfer_id: &str,
+    direction: TransferDirection,
+) -> Result<bool> {
+    database.with_connection(|connection| {
+        Ok(connection
+            .query_row(
+                "SELECT 1 FROM vault_transfers
+                 WHERE id = ?1 AND direction = ?2 AND role = 'destination'",
+                params![transfer_id, direction.as_str()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    })
+}
+
+fn update_transfer_state(
+    database: &Database,
+    transfer_id: &str,
+    state: TransferState,
+) -> Result<()> {
+    let changed = database.with_connection(|connection| {
+        Ok(connection.execute(
+            "UPDATE vault_transfers SET state = ?2 WHERE id = ?1 AND role = 'source'",
+            params![transfer_id, state.as_str()],
+        )?)
+    })?;
+    if changed != 1 {
+        return Err(Error::IncompleteVaultTransfer);
+    }
+    Ok(())
+}
+
+fn delete_transfer_record(database: &Database, transfer_id: &str) -> Result<()> {
+    database.with_connection(|connection| {
+        connection.execute("DELETE FROM vault_transfers WHERE id = ?1", [transfer_id])?;
+        Ok(())
+    })
+}
+
+fn assets_moved(source: &Database, destination: &Database, asset_ids: &[String]) -> Result<bool> {
+    validate_transfer_ids(asset_ids)?;
+    let source_count = asset_count(source, asset_ids)?;
+    let destination_count = asset_count(destination, asset_ids)?;
+    Ok(source_count == 0 && destination_count == asset_ids.len())
+}
+
+fn asset_count(database: &Database, asset_ids: &[String]) -> Result<usize> {
+    database.with_connection(|connection| {
+        let sql = format!(
+            "SELECT count(*) FROM assets WHERE id IN ({})",
+            sql_placeholders(asset_ids.len())
+        );
+        let count = connection.query_row(&sql, params_from_iter(asset_ids.iter()), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        usize::try_from(count).map_err(|_| Error::IncompleteVaultTransfer)
+    })
 }
 
 /// Vault 内漫画スタックと全ページをまとめてメインへ戻す。
@@ -626,28 +1302,25 @@ fn prepare_main_assets(database: &Database, asset_ids: &[String]) -> Result<Vec<
     for asset_id in asset_ids {
         let asset = service.get(asset_id)?.ok_or(Error::AssetNotFound)?;
         reserve_transfer_bytes(&mut total_bytes, asset.size)?;
-        let source_path = database
+        let original = database
             .data_root()
             .join(checked_relative_path(&asset.library_path)?);
-        let original = Zeroizing::new(fs::read(source_path)?);
-        validate_original(&asset, &original)?;
-        let thumbnail = read_optional(
-            &database
+        validate_plain_source_size(&original, Some(asset.size))?;
+        let thumbnail = optional_plain_source(
+            database
                 .data_root()
                 .join("thumbs")
                 .join(format!("{asset_id}_t.webp")),
-        )?
-        .map(Zeroizing::new);
-        let preview = read_optional(
-            &database
+        )?;
+        let preview = optional_plain_source(
+            database
                 .data_root()
                 .join("thumbs")
                 .join(format!("{asset_id}_p.webp")),
-        )?
-        .map(Zeroizing::new);
+        )?;
         output.push(PreparedAsset {
             asset,
-            original,
+            original: PreparedSource::PlainFile(original),
             thumbnail,
             preview,
         });
@@ -665,19 +1338,16 @@ fn prepare_vault_assets(vault: &VaultHandle, asset_ids: &[String]) -> Result<Vec
         let original_id = vault
             .blob_id_for(asset_id, BlobKind::Original)?
             .ok_or(Error::IncompleteVaultTransfer)?;
-        let original = Zeroizing::new(vault.read_blob(&original_id)?);
-        validate_original(&asset, &original)?;
+        validate_vault_original(vault, &asset, &original_id)?;
         let thumbnail = vault
             .blob_id_for(asset_id, BlobKind::Thumbnail)?
-            .map(|blob_id| vault.read_blob(&blob_id).map(Zeroizing::new))
-            .transpose()?;
+            .map(PreparedSource::VaultBlob);
         let preview = vault
             .blob_id_for(asset_id, BlobKind::Preview)?
-            .map(|blob_id| vault.read_blob(&blob_id).map(Zeroizing::new))
-            .transpose()?;
+            .map(PreparedSource::VaultBlob);
         output.push(PreparedAsset {
             asset,
-            original,
+            original: PreparedSource::VaultBlob(original_id),
             thumbnail,
             preview,
         });
@@ -689,36 +1359,44 @@ fn stage_vault_import(
     vault: &VaultHandle,
     assets: &[PreparedAsset],
     relations: &Relations,
+    transfer_id: &str,
     observer: &mut impl FnMut(ImportPhase) -> Result<()>,
 ) -> Result<()> {
+    let staging_dir = transfer_staging_dir(vault.db.data_root(), transfer_id)?;
+    create_private_dir_all(&staging_dir)?;
     let mut prepared_blobs = HashMap::<String, Vec<PreparedBlob>>::new();
     for prepared in assets {
-        let mut blobs = vec![prepare_blob(
+        let mut blobs = vec![prepare_plain_file_blob(
             vault,
-            &prepared.original,
+            plain_source(&prepared.original)?,
             BlobKind::Original,
             &prepared.asset.id,
+            &staging_dir,
+            Some(&prepared.asset),
         )?];
-        if let Some(bytes) = &prepared.thumbnail {
-            blobs.push(prepare_blob(
+        if let Some(source) = &prepared.thumbnail {
+            blobs.push(prepare_plain_file_blob(
                 vault,
-                bytes,
+                plain_source(source)?,
                 BlobKind::Thumbnail,
                 &prepared.asset.id,
+                &staging_dir,
+                None,
             )?);
         }
-        if let Some(bytes) = &prepared.preview {
-            blobs.push(prepare_blob(
+        if let Some(source) = &prepared.preview {
+            blobs.push(prepare_plain_file_blob(
                 vault,
-                bytes,
+                plain_source(source)?,
                 BlobKind::Preview,
                 &prepared.asset.id,
+                &staging_dir,
+                None,
             )?);
         }
         prepared_blobs.insert(prepared.asset.id.clone(), blobs);
     }
 
-    let mut written = Vec::new();
     let result = vault.db.with_connection_mut(|connection| {
         let transaction = connection.transaction()?;
         for prepared in assets {
@@ -731,9 +1409,6 @@ fn stage_vault_import(
                 .ok_or(Error::IncompleteVaultTransfer)?;
             insert_asset(&transaction, &prepared.asset, &original.id)?;
             for blob in blobs {
-                let path = vault.blob_path(&blob.id)?;
-                fs::write(&path, &blob.encrypted)?;
-                written.push(path);
                 transaction.execute(
                     "INSERT INTO vault_blobs(blob_id, wrapped_key, kind, asset_id)
                      VALUES (?1, ?2, ?3, ?4)",
@@ -742,75 +1417,161 @@ fn stage_vault_import(
             }
         }
         insert_relations(&transaction, relations, assets)?;
+        insert_transfer_record(
+            &transaction,
+            transfer_id,
+            TransferDirection::Import,
+            "destination",
+            &assets
+                .iter()
+                .map(|prepared| prepared.asset.id.clone())
+                .collect::<Vec<_>>(),
+            TransferState::DestinationReady,
+        )?;
         observer(ImportPhase::VaultStaged)?;
         transaction.commit()?;
         Ok(())
     });
     if result.is_err() {
-        for path in written {
-            remove_if_exists(&path)?;
-        }
+        remove_transfer_staging(vault.db.data_root(), transfer_id)?;
     }
     result
 }
 
-fn prepare_blob(
+fn prepare_plain_file_blob(
     vault: &VaultHandle,
-    bytes: &[u8],
+    source: &Path,
     kind: BlobKind,
     asset_id: &str,
+    staging_dir: &Path,
+    expected_asset: Option<&Asset>,
+) -> Result<PreparedBlob> {
+    let plaintext_len = validate_plain_source_size(source, expected_asset.map(|asset| asset.size))?;
+    let mut input = fs::File::open(source)?;
+    let expected = expected_asset.map(|asset| (asset.size, asset.hash.as_slice()));
+    prepare_reader_blob(
+        vault,
+        &mut input,
+        plaintext_len,
+        kind,
+        asset_id,
+        staging_dir,
+        expected,
+    )
+}
+
+fn prepare_reader_blob(
+    vault: &VaultHandle,
+    input: &mut impl Read,
+    plaintext_len: usize,
+    kind: BlobKind,
+    asset_id: &str,
+    staging_dir: &Path,
+    expected: Option<(i64, &[u8])>,
 ) -> Result<PreparedBlob> {
     let id = Uuid::now_v7().to_string();
     let file_key = Zeroizing::new(random_array()?);
-    let encrypted = encrypt_blob(&id, &file_key, bytes)?;
     let aad = blob_key_aad(&id, kind.as_str(), Some(asset_id));
-    let wrapped_key = wrap_bytes(&vault.key.master_key, file_key.as_slice(), &aad)?;
+    let wrapped_key = vault
+        .key
+        .with_master_key(|master_key| wrap_bytes(master_key, file_key.as_slice(), &aad))?;
+    let output_path = staging_dir.join(&id);
+    let mut output = create_new_private_file(&output_path)?;
+    let digest = encrypt_reader_to_writer(
+        &id,
+        &file_key,
+        input,
+        &mut output,
+        plaintext_len,
+        Some(&vault.key),
+    )?;
+    output.sync_all()?;
+    if let Some((expected_len, expected_digest)) = expected {
+        validate_original_parts(expected_len, expected_digest, plaintext_len, &digest)?;
+    }
     Ok(PreparedBlob {
         id,
         wrapped_key,
-        encrypted,
         kind,
         asset_id: asset_id.to_owned(),
     })
 }
 
 fn stage_main_export(
+    vault: &VaultHandle,
     database: &Database,
     assets: &[PreparedAsset],
     relations: &Relations,
+    transfer_id: &str,
     observer: &mut impl FnMut(ExportPhase) -> Result<()>,
 ) -> Result<()> {
     let mut written = Vec::new();
-    let result = database.with_connection_mut(|connection| {
-        let transaction = connection.transaction()?;
+    let prepared_paths = (|| {
+        let mut relative_paths = Vec::with_capacity(assets.len());
         for prepared in assets {
             let relative_path = export_library_path(&prepared.asset)?;
             let original_path = database.data_root().join(&relative_path);
-            write_new_file(&original_path, &prepared.original)?;
+            write_vault_blob_to_new_file(
+                vault,
+                vault_source(&prepared.original)?,
+                &original_path,
+                Some(&prepared.asset),
+            )?;
             written.push(original_path);
-            if let Some(bytes) = &prepared.thumbnail {
+            if let Some(source) = &prepared.thumbnail {
                 let path = database
                     .data_root()
                     .join("thumbs")
                     .join(format!("{}_t.webp", prepared.asset.id));
-                write_new_file(&path, bytes)?;
+                write_vault_blob_to_new_file(vault, vault_source(source)?, &path, None)?;
                 written.push(path);
             }
-            if let Some(bytes) = &prepared.preview {
+            if let Some(source) = &prepared.preview {
                 let path = database
                     .data_root()
                     .join("thumbs")
                     .join(format!("{}_p.webp", prepared.asset.id));
-                write_new_file(&path, bytes)?;
+                write_vault_blob_to_new_file(vault, vault_source(source)?, &path, None)?;
                 written.push(path);
             }
-            let relative_path = relative_path
-                .to_str()
-                .ok_or(Error::InvalidAssetPath)?
-                .to_owned();
-            insert_asset(&transaction, &prepared.asset, &relative_path)?;
+            relative_paths.push(
+                relative_path
+                    .to_str()
+                    .ok_or(Error::InvalidAssetPath)?
+                    .to_owned(),
+            );
+        }
+        Ok(relative_paths)
+    })();
+    let relative_paths = match prepared_paths {
+        Ok(paths) => paths,
+        Err(error) => {
+            for path in written {
+                remove_if_exists(&path)?;
+            }
+            return Err(error);
+        }
+    };
+
+    // File decryption, writes, hashing and fsync complete before taking the single main DB mutex.
+    // Until this short transaction commits the UUID paths are unreachable through API metadata.
+    let result = database.with_connection_mut(|connection| {
+        let transaction = connection.transaction()?;
+        for (prepared, relative_path) in assets.iter().zip(&relative_paths) {
+            insert_asset(&transaction, &prepared.asset, relative_path)?;
         }
         insert_relations(&transaction, relations, assets)?;
+        insert_transfer_record(
+            &transaction,
+            transfer_id,
+            TransferDirection::Export,
+            "destination",
+            &assets
+                .iter()
+                .map(|prepared| prepared.asset.id.clone())
+                .collect::<Vec<_>>(),
+            TransferState::DestinationReady,
+        )?;
         observer(ExportPhase::MainStaged)?;
         transaction.commit()?;
         Ok(())
@@ -831,7 +1592,11 @@ fn insert_asset(transaction: &Transaction<'_>, asset: &Asset, library_path: &str
     let primary = transaction
         .query_row(
             "SELECT id FROM assets
-                 WHERE hash = ?1 AND lifecycle = 'active' AND duplicate_of IS NULL",
+                 WHERE hash = ?1 AND lifecycle = 'active' AND duplicate_of IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM vault_transfers transfer, json_each(transfer.asset_ids) item
+                     WHERE transfer.role = 'source' AND item.value = assets.id
+                   )",
             [&asset.hash],
             |row| row.get::<_, String>(0),
         )
@@ -1002,6 +1767,12 @@ fn insert_relations(
             params![rejection.face_id, rejection.cluster_id],
         )?;
     }
+    let cluster_ids = relations
+        .clusters
+        .iter()
+        .map(|cluster| cluster.id.clone())
+        .collect::<Vec<_>>();
+    refresh_cluster_covers(transaction, &cluster_ids)?;
     Ok(())
 }
 
@@ -1145,10 +1916,11 @@ fn collect_relations(database: &Database, asset_ids: &[String]) -> Result<Relati
     })
 }
 
-fn delete_assets_from_database(database: &Database, asset_ids: &[String]) -> Result<()> {
+fn delete_assets_from_database_idempotent(database: &Database, asset_ids: &[String]) -> Result<()> {
     database.with_connection_mut(|connection| {
         let transaction = connection.transaction()?;
         let placeholders = sql_placeholders(asset_ids.len());
+        reparent_legacy_external_duplicates(&transaction, asset_ids)?;
         let affected_sql =
             format!("SELECT id FROM manga_stacks WHERE cover_asset_id IN ({placeholders})");
         let affected: Vec<String> = transaction
@@ -1169,10 +1941,7 @@ fn delete_assets_from_database(database: &Database, asset_ids: &[String]) -> Res
         );
         transaction.execute(&clear_sql, params_from_iter(asset_ids.iter()))?;
         let delete_sql = format!("DELETE FROM assets WHERE id IN ({placeholders})");
-        let changed = transaction.execute(&delete_sql, params_from_iter(asset_ids.iter()))?;
-        if changed != asset_ids.len() {
-            return Err(Error::IncompleteVaultTransfer);
-        }
+        transaction.execute(&delete_sql, params_from_iter(asset_ids.iter()))?;
         let delete_jobs_sql = format!(
             "DELETE FROM jobs
              WHERE json_valid(payload)
@@ -1208,6 +1977,7 @@ fn delete_assets_from_database(database: &Database, asset_ids: &[String]) -> Res
             )?;
         }
         for cluster_id in affected_clusters {
+            refresh_cluster_covers(&transaction, std::slice::from_ref(&cluster_id))?;
             transaction.execute(
                 "DELETE FROM clusters
                  WHERE id = ?1
@@ -1220,6 +1990,86 @@ fn delete_assets_from_database(database: &Database, asset_ids: &[String]) -> Res
         transaction.commit()?;
         Ok(())
     })
+}
+
+/// Last-resort recovery for journals created by versions that allowed a canonical
+/// asset to move without all reverse duplicate references. New transfers reject
+/// this before writing a journal; this path exists so a source-files-deleted journal
+/// can still converge without losing the surviving duplicate files.
+fn reparent_legacy_external_duplicates(
+    transaction: &Transaction<'_>,
+    asset_ids: &[String],
+) -> Result<()> {
+    let selected = serde_json::to_string(asset_ids)?;
+    let mark_sql = format!(
+        "UPDATE assets SET lifecycle = 'purging', visible_in_timeline = 0
+         WHERE id IN ({})",
+        sql_placeholders(asset_ids.len())
+    );
+    transaction.execute(&mark_sql, params_from_iter(asset_ids.iter()))?;
+
+    for source_id in asset_ids {
+        let replacement = transaction
+            .query_row(
+                "SELECT id FROM assets
+                 WHERE duplicate_of = ?1
+                   AND id NOT IN (SELECT value FROM json_each(?2))
+                 ORDER BY lifecycle = 'active' DESC,
+                          trashed_at IS NULL DESC, uploaded_at, id
+                 LIMIT 1",
+                params![source_id, selected],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(replacement) = replacement else {
+            continue;
+        };
+        transaction.execute(
+            "UPDATE assets
+             SET duplicate_of = ?2
+             WHERE duplicate_of = ?1
+               AND id != ?2
+               AND id NOT IN (SELECT value FROM json_each(?3))",
+            params![source_id, replacement, selected],
+        )?;
+        transaction.execute(
+            "UPDATE assets
+             SET duplicate_of = NULL,
+                 lifecycle = 'active',
+                 trashed_at = NULL,
+                 purge_after = NULL,
+                 visible_in_timeline = CASE
+                   WHEN in_timeline = 1 AND NOT EXISTS (
+                     SELECT 1 FROM stack_pages sp
+                     WHERE sp.asset_id = assets.id AND sp.show_in_timeline = 0
+                   ) THEN 1 ELSE 0 END
+             WHERE id = ?1",
+            [&replacement],
+        )?;
+    }
+    Ok(())
+}
+
+fn refresh_cluster_covers(transaction: &Transaction<'_>, cluster_ids: &[String]) -> Result<()> {
+    for cluster_id in cluster_ids {
+        transaction.execute(
+            "UPDATE clusters
+             SET cover_face_id = (
+               SELECT id FROM faces
+               WHERE cluster_id = ?1
+               ORDER BY state = 'confirmed' DESC, id
+               LIMIT 1
+             )
+             WHERE id = ?1
+               AND (cover_face_id IS NULL OR NOT EXISTS (
+                 SELECT 1 FROM faces cover
+                 WHERE cover.id = clusters.cover_face_id
+                   AND cover.cluster_id = clusters.id
+               ))",
+            [cluster_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn stack_asset_ids(database: &Database, stack_id: &str) -> Result<Vec<String>> {
@@ -1304,31 +2154,297 @@ fn export_library_path(asset: &Asset) -> Result<PathBuf> {
     )
 }
 
-fn write_new_file(path: &Path, bytes: &[u8]) -> Result<()> {
+fn create_new_private_file(path: &Path) -> Result<fs::File> {
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+        create_private_dir_all(parent)?;
     }
-    let mut file = fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    Ok(())
+    set_private_file_permissions(path)?;
+    Ok(file)
 }
 
-fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
+fn optional_plain_source(path: PathBuf) -> Result<Option<PreparedSource>> {
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(PreparedSource::PlainFile(path))),
+        Ok(_) => Err(Error::InvalidAssetPath),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
 }
 
-fn validate_original(asset: &Asset, bytes: &[u8]) -> Result<()> {
-    let size = i64::try_from(bytes.len()).map_err(|_| Error::IncompleteVaultTransfer)?;
-    if size != asset.size || blake3::hash(bytes).as_bytes().as_slice() != asset.hash {
+fn validate_plain_source_size(path: &Path, expected: Option<i64>) -> Result<usize> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::InvalidAssetPath);
+    }
+    let size = usize::try_from(metadata.len()).map_err(|_| Error::IncompleteVaultTransfer)?;
+    if size > images::MAX_ASSET_BYTES
+        || expected.is_some_and(|value| usize::try_from(value).ok() != Some(size))
+    {
         return Err(Error::IncompleteVaultTransfer);
+    }
+    Ok(size)
+}
+
+fn plain_source(source: &PreparedSource) -> Result<&Path> {
+    match source {
+        PreparedSource::PlainFile(path) => Ok(path),
+        PreparedSource::VaultBlob(_) => Err(Error::IncompleteVaultTransfer),
+    }
+}
+
+fn vault_source(source: &PreparedSource) -> Result<&str> {
+    match source {
+        PreparedSource::VaultBlob(blob_id) => Ok(blob_id),
+        PreparedSource::PlainFile(_) => Err(Error::IncompleteVaultTransfer),
+    }
+}
+
+fn validate_original_parts(
+    expected_len: i64,
+    expected_digest: &[u8],
+    actual_len: usize,
+    actual_digest: &[u8; 32],
+) -> Result<()> {
+    if i64::try_from(actual_len).map_err(|_| Error::IncompleteVaultTransfer)? != expected_len
+        || actual_digest.as_slice() != expected_digest
+    {
+        return Err(Error::IncompleteVaultTransfer);
+    }
+    Ok(())
+}
+
+fn validate_original_digest(
+    asset: &Asset,
+    actual_len: usize,
+    actual_digest: &[u8; 32],
+) -> Result<()> {
+    validate_original_parts(asset.size, &asset.hash, actual_len, actual_digest)
+}
+
+fn validate_vault_original(vault: &VaultHandle, asset: &Asset, blob_id: &str) -> Result<()> {
+    let mut total = 0_usize;
+    let mut digest = blake3::Hasher::new();
+    for chunk in vault.blob_reader(blob_id)? {
+        let chunk = Zeroizing::new(chunk?);
+        total = total
+            .checked_add(chunk.len())
+            .ok_or(Error::IncompleteVaultTransfer)?;
+        digest.update(&chunk);
+    }
+    validate_original_digest(asset, total, digest.finalize().as_bytes())
+}
+
+fn write_vault_blob_to_new_file(
+    vault: &VaultHandle,
+    blob_id: &str,
+    path: &Path,
+    expected_asset: Option<&Asset>,
+) -> Result<()> {
+    let result = (|| {
+        let mut output = create_new_private_file(path)?;
+        let mut total = 0_usize;
+        let mut digest = blake3::Hasher::new();
+        for chunk in vault.blob_reader(blob_id)? {
+            let chunk = Zeroizing::new(chunk?);
+            total = total
+                .checked_add(chunk.len())
+                .ok_or(Error::IncompleteVaultTransfer)?;
+            if total > images::MAX_ASSET_BYTES {
+                return Err(Error::IncompleteVaultTransfer);
+            }
+            digest.update(&chunk);
+            output.write_all(&chunk)?;
+        }
+        if let Some(asset) = expected_asset {
+            validate_original_digest(asset, total, digest.finalize().as_bytes())?;
+        }
+        output.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        remove_if_exists(path)?;
+    }
+    result
+}
+
+fn validate_plain_original(path: &Path, asset: &Asset) -> Result<()> {
+    let mut input = fs::File::open(path)?;
+    let mut buffer = Zeroizing::new(vec![0_u8; CHUNK_SIZE]);
+    let mut total = 0_usize;
+    let mut digest = blake3::Hasher::new();
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count)
+            .ok_or(Error::IncompleteVaultTransfer)?;
+        if total > images::MAX_ASSET_BYTES {
+            return Err(Error::IncompleteVaultTransfer);
+        }
+        digest.update(&buffer[..count]);
+    }
+    validate_original_digest(asset, total, digest.finalize().as_bytes())
+}
+
+fn validate_import_destination(vault: &VaultHandle, asset_ids: &[String]) -> Result<()> {
+    let service = AssetService::new(vault.db.clone());
+    for asset_id in asset_ids {
+        let asset = service
+            .get(asset_id)?
+            .ok_or(Error::IncompleteVaultTransfer)?;
+        let blob_id = vault
+            .blob_id_for(asset_id, BlobKind::Original)?
+            .ok_or(Error::IncompleteVaultTransfer)?;
+        validate_vault_original(vault, &asset, &blob_id)?;
+    }
+    Ok(())
+}
+
+fn validate_export_destination(database: &Database, asset_ids: &[String]) -> Result<()> {
+    let service = AssetService::new(database.clone());
+    for asset_id in asset_ids {
+        let asset = service
+            .get(asset_id)?
+            .ok_or(Error::IncompleteVaultTransfer)?;
+        let path = database
+            .data_root()
+            .join(checked_relative_path(&asset.library_path)?);
+        validate_plain_original(&path, &asset)?;
+    }
+    Ok(())
+}
+
+fn transfer_staging_dir(data_root: &Path, transfer_id: &str) -> Result<PathBuf> {
+    Uuid::parse_str(transfer_id).map_err(|_| Error::IncompleteVaultTransfer)?;
+    Ok(data_root
+        .join("vault")
+        .join(TRANSFER_STAGING_DIR)
+        .join(transfer_id))
+}
+
+fn finalize_import_files(
+    vault: &VaultHandle,
+    transfer_id: &str,
+    asset_ids: &[String],
+) -> Result<()> {
+    let staging_dir = transfer_staging_dir(vault.db.data_root(), transfer_id)?;
+    for blob_id in vault_blob_ids(&vault.db, asset_ids)? {
+        let staged = staging_dir.join(&blob_id);
+        let destination = vault.blob_path(&blob_id)?;
+        if destination.is_file() {
+            remove_if_exists(&staged)?;
+            continue;
+        }
+        if !staged.is_file() {
+            return Err(Error::IncompleteVaultTransfer);
+        }
+        fs::rename(&staged, &destination)?;
+        set_private_file_permissions(&destination)?;
+    }
+    remove_transfer_staging(vault.db.data_root(), transfer_id)
+}
+
+fn remove_transfer_staging(data_root: &Path, transfer_id: &str) -> Result<()> {
+    let directory = transfer_staging_dir(data_root, transfer_id)?;
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.file_type().is_dir() {
+        return Err(Error::InvalidAssetPath);
+    }
+    for entry in fs::read_dir(&directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or(Error::InvalidAssetPath)?;
+        Uuid::parse_str(name).map_err(|_| Error::InvalidAssetPath)?;
+        if !entry.file_type()?.is_file() {
+            return Err(Error::InvalidAssetPath);
+        }
+        remove_if_exists(&entry.path())?;
+    }
+    fs::remove_dir(directory)?;
+    Ok(())
+}
+
+fn delete_plain_source_files(
+    source: &Database,
+    destination: &Database,
+    asset_ids: &[String],
+) -> Result<()> {
+    let destination_service = AssetService::new(destination.clone());
+    for asset_id in asset_ids {
+        let source_library_path = source.with_connection(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT library_path FROM assets WHERE id = ?1",
+                    [asset_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?)
+        })?;
+        let relative = if let Some(library_path) = source_library_path {
+            checked_relative_path(&library_path)?
+        } else {
+            let asset = destination_service
+                .get(asset_id)?
+                .ok_or(Error::IncompleteVaultTransfer)?;
+            export_library_path(&asset)?
+        };
+        remove_if_exists(&source.data_root().join(relative))?;
+        remove_if_exists(
+            &source
+                .data_root()
+                .join("thumbs")
+                .join(format!("{asset_id}_t.webp")),
+        )?;
+        remove_if_exists(
+            &source
+                .data_root()
+                .join("thumbs")
+                .join(format!("{asset_id}_p.webp")),
+        )?;
+    }
+    Ok(())
+}
+
+fn rollback_export_files(
+    vault: &VaultHandle,
+    main_db: &Database,
+    asset_ids: &[String],
+) -> Result<()> {
+    let vault_service = AssetService::new(vault.db.clone());
+    let main_service = AssetService::new(main_db.clone());
+    for asset_id in asset_ids {
+        if main_service.get(asset_id)?.is_some() {
+            continue;
+        }
+        let asset = vault_service
+            .get(asset_id)?
+            .ok_or(Error::IncompleteVaultTransfer)?;
+        let original = main_db.data_root().join(export_library_path(&asset)?);
+        if original.is_file() && validate_plain_original(&original, &asset).is_ok() {
+            remove_if_exists(&original)?;
+        }
+        remove_if_exists(
+            &main_db
+                .data_root()
+                .join("thumbs")
+                .join(format!("{asset_id}_t.webp")),
+        )?;
+        remove_if_exists(
+            &main_db
+                .data_root()
+                .join("thumbs")
+                .join(format!("{asset_id}_p.webp")),
+        )?;
     }
     Ok(())
 }
@@ -1460,11 +2576,9 @@ pub fn change_password_with_kdf(
     let password_key = Zeroizing::new(derive_password_key(new_password, &salt, kdf)?);
     keyfile.kdf = kdf;
     keyfile.salt = hex::encode(salt);
-    keyfile.password = wrap_record(
-        &password_key,
-        &master_key.master_key,
-        b"illumia-keyfile-password",
-    )?;
+    keyfile.password = master_key.with_master_key(|master_key| {
+        wrap_record(&password_key, master_key, b"illumia-keyfile-password")
+    })?;
     write_keyfile(&keyfile_path, &keyfile, false)
 }
 
@@ -1647,6 +2761,7 @@ fn aead_decrypt(
         .map_err(|_| Error::VaultAuthenticationFailed)
 }
 
+#[cfg(test)]
 fn encrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<Vec<u8>> {
     if plaintext.len() > images::MAX_ASSET_BYTES {
         return Err(Error::InvalidVaultBlob);
@@ -1682,6 +2797,67 @@ fn encrypt_blob(blob_id: &str, key: &[u8; KEY_LEN], plaintext: &[u8]) -> Result<
         output.extend_from_slice(&ciphertext);
     }
     Ok(output)
+}
+
+fn encrypt_reader_to_writer(
+    blob_id: &str,
+    key: &[u8; KEY_LEN],
+    reader: &mut impl Read,
+    writer: &mut impl Write,
+    plaintext_len: usize,
+    revocation: Option<&VaultKey>,
+) -> Result<[u8; 32]> {
+    if let Some(key) = revocation {
+        key.ensure_active()?;
+    }
+    if plaintext_len > images::MAX_ASSET_BYTES {
+        return Err(Error::InvalidVaultBlob);
+    }
+    let nonce_prefix: [u8; NONCE_PREFIX_LEN] = random_array()?;
+    let mut header = [0_u8; BLOB_HEADER_LEN];
+    header[..MAGIC.len()].copy_from_slice(MAGIC);
+    header[MAGIC.len()..MAGIC.len() + NONCE_PREFIX_LEN].copy_from_slice(&nonce_prefix);
+    header[MAGIC.len() + NONCE_PREFIX_LEN..].copy_from_slice(
+        &u32::try_from(CHUNK_SIZE)
+            .map_err(|_| Error::InvalidVaultBlob)?
+            .to_be_bytes(),
+    );
+    writer.write_all(&header)?;
+
+    let chunk_count = plaintext_len.div_ceil(CHUNK_SIZE).max(1);
+    let mut remaining = plaintext_len;
+    let mut plaintext = Zeroizing::new(vec![0_u8; CHUNK_SIZE]);
+    let mut digest = blake3::Hasher::new();
+    for index in 0..chunk_count {
+        if let Some(key) = revocation {
+            key.ensure_active()?;
+        }
+        let chunk_len = remaining.min(CHUNK_SIZE);
+        if chunk_len != 0 {
+            reader.read_exact(&mut plaintext[..chunk_len])?;
+            digest.update(&plaintext[..chunk_len]);
+        }
+        remaining -= chunk_len;
+        let final_chunk = index + 1 == chunk_count;
+        let nonce = chunk_nonce(&nonce_prefix, index)?;
+        let aad = chunk_aad(blob_id, &header, index, final_chunk)?;
+        let ciphertext = aead_encrypt(key, &nonce, &plaintext[..chunk_len], &aad)?;
+        writer.write_all(&[u8::from(final_chunk)])?;
+        writer.write_all(
+            &u32::try_from(ciphertext.len())
+                .map_err(|_| Error::InvalidVaultBlob)?
+                .to_be_bytes(),
+        )?;
+        writer.write_all(&ciphertext)?;
+    }
+    if let Some(key) = revocation {
+        key.ensure_active()?;
+    }
+    let mut extra = [0_u8; 1];
+    if reader.read(&mut extra)? != 0 {
+        return Err(Error::InvalidVaultBlob);
+    }
+    Ok(*digest.finalize().as_bytes())
 }
 
 #[cfg(test)]
@@ -1956,6 +3132,7 @@ mod tests {
 
             let main = Database::open(directory.path())?;
             let vault = VaultHandle::open(directory.path(), unlock(directory.path(), "password")?)?;
+            reconcile_transfers(&main, &vault)?;
             let main_complete =
                 if let Some(main_asset) = AssetService::new(main.clone()).get(&asset_id)? {
                     fs::read(main.data_root().join(main_asset.library_path))
@@ -1971,7 +3148,13 @@ mod tests {
                 } else {
                     false
                 };
-            assert!(main_complete || vault_complete);
+            let destination_committed = matches!(
+                failed_phase,
+                "vault-committed" | "plain-files-deleted" | "plain-database-deleted"
+            );
+            assert_eq!(vault_complete, destination_committed);
+            assert_eq!(main_complete, !destination_committed);
+            assert_transfer_artifacts_clean(&main, &vault)?;
         }
         Ok(())
     }
@@ -2042,6 +3225,8 @@ mod tests {
             assert!(injected);
             assert!(result.is_err());
 
+            reconcile_transfers(&main, &vault)?;
+
             let main_complete = AssetService::new(main.clone()).get(&asset.id)?.is_some()
                 && fs::read(&source_path).is_ok_and(|content| content == bytes);
             let vault_complete =
@@ -2052,7 +3237,15 @@ mod tests {
                 } else {
                     false
                 };
-            assert!(main_complete || vault_complete);
+            let destination_committed = matches!(
+                failed_phase,
+                ImportPhase::VaultCommitted
+                    | ImportPhase::PlainFilesDeleted
+                    | ImportPhase::PlainDatabaseDeleted
+            );
+            assert_eq!(vault_complete, destination_committed);
+            assert_eq!(main_complete, !destination_committed);
+            assert_transfer_artifacts_clean(&main, &vault)?;
         }
         Ok(())
     }
@@ -2093,6 +3286,8 @@ mod tests {
             assert!(injected);
             assert!(result.is_err());
 
+            reconcile_transfers(&main, &vault)?;
+
             let main_complete =
                 if let Some(main_asset) = AssetService::new(main.clone()).get(&asset.id)? {
                     fs::read(main.data_root().join(main_asset.library_path))
@@ -2108,8 +3303,36 @@ mod tests {
                 } else {
                     false
                 };
-            assert!(main_complete || vault_complete);
+            let destination_committed = matches!(
+                failed_phase,
+                ExportPhase::MainCommitted
+                    | ExportPhase::VaultFilesDeleted
+                    | ExportPhase::VaultDatabaseDeleted
+            );
+            assert_eq!(main_complete, destination_committed);
+            assert_eq!(vault_complete, !destination_committed);
+            assert_transfer_artifacts_clean(&main, &vault)?;
         }
+        Ok(())
+    }
+
+    fn assert_transfer_artifacts_clean(main: &Database, vault: &VaultHandle) -> Result<()> {
+        for database in [main, &vault.db] {
+            database.with_connection(|connection| {
+                let count =
+                    connection.query_row("SELECT count(*) FROM vault_transfers", [], |row| {
+                        row.get::<_, i64>(0)
+                    })?;
+                assert_eq!(count, 0);
+                Ok(())
+            })?;
+        }
+        let staging = vault
+            .db
+            .data_root()
+            .join("vault")
+            .join(TRANSFER_STAGING_DIR);
+        assert!(!staging.exists() || fs::read_dir(staging)?.next().is_none());
         Ok(())
     }
 }

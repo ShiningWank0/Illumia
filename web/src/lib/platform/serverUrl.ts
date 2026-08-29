@@ -24,12 +24,12 @@ export class ServerUrlError extends Error {}
 const FORBIDDEN_CHARS = /[\u0000-\u0020\u007f-\u009f\s]/;
 
 /**
- * IPv4 / IPv6 / .local のプライベート宛先か。
+ * IPv4 / IPv6 literal または RFC localhost 名か。
  * 平文 HTTP を条件付きで許すのはこの範囲だけに限定する。
  */
 export function isPrivateHost(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) return true;
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host === '::1') return true;
   // fc00::/7 (ULA) と fe80::/10 (link-local)
   if (/^f[cd][0-9a-f]{2}:/.test(host)) return true;

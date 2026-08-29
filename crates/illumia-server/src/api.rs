@@ -1,22 +1,30 @@
 use std::{
     collections::BTreeMap,
+    io,
     path::{Component, Path as FsPath, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use axum::{
     Json,
-    body::Body,
+    body::{Body, Bytes},
     extract::{
         Extension, Multipart, Path, Query, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{
         HeaderMap, HeaderValue, StatusCode,
-        header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, ETAG, IF_NONE_MATCH},
+        header::{
+            CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_NONE_MATCH,
+        },
     },
     response::{IntoResponse, Response},
 };
+use futures_util::stream;
 use illumia_core::{
     PurgeService,
     assets::{Asset, AssetService, DuplicatePair, Lifecycle},
@@ -25,14 +33,15 @@ use illumia_core::{
     db::Database,
     jobs::{Job, JobQueue, JobState},
     ml::{
-        ClusterAssetFace, ClusterSummary, FaceRecord, MlService, enqueue_analyze_all,
-        enqueue_recluster,
+        ClusterAssetFace, ClusterSummary, FaceRecord, ML_RECLUSTER_JOB_KIND,
+        ML_VAULT_ANALYZE_JOB_KIND, MlAnalyzePayload, MlService, enqueue_analyze_all_for_model,
+        enqueue_recluster, enqueue_vault_analyze_all,
     },
     ml_client::MlClient,
     search::SearchService,
     settings::{
-        MAX_CLUSTER_SIZE_VALUE, MAX_JOB_CONCURRENCY, MAX_RETENTION_DAYS, MIN_CLUSTER_SIZE_VALUE,
-        MIN_JOB_CONCURRENCY, QualityGate, Settings,
+        MAX_CLUSTER_SIZE_VALUE, MAX_JOB_CONCURRENCY, MAX_ML_CONCURRENCY, MAX_RETENTION_DAYS,
+        MIN_CLUSTER_SIZE_VALUE, MIN_JOB_CONCURRENCY, QualityGate, Settings,
     },
     stacks::{ChapterInput, MangaStack, StackChapter, StackPage, StackService, StackSummary},
     thumbnails,
@@ -47,6 +56,7 @@ use tower_http::services::ServeFile;
 use crate::{
     AppState,
     error::{ApiError, ApiResult},
+    security::Authenticated,
     vault::VaultAccess,
 };
 
@@ -56,6 +66,12 @@ const MAX_EXISTS_HASHES: usize = 4096;
 const MIN_NEW_VAULT_PASSWORD_CHARS: usize = 12;
 const MAX_VAULT_PASSWORD_BYTES: usize = 1024;
 const RECOVERY_KEY_CHARS: usize = 52;
+const VAULT_STREAM_CHANNEL_CAPACITY: usize = 2;
+#[cfg(not(test))]
+const VAULT_STREAM_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const VAULT_STREAM_BACKPRESSURE_TIMEOUT: Duration = Duration::from_millis(100);
+const VAULT_STREAM_BACKPRESSURE_RETRY: Duration = Duration::from_millis(10);
 
 #[derive(Serialize)]
 pub struct AssetResponse {
@@ -409,6 +425,7 @@ pub struct JobResponse {
     created_at: String,
     started_at: Option<String>,
     finished_at: Option<String>,
+    cancel_requested: bool,
 }
 
 impl From<Job> for JobResponse {
@@ -424,6 +441,7 @@ impl From<Job> for JobResponse {
             created_at: job.created_at,
             started_at: job.started_at,
             finished_at: job.finished_at,
+            cancel_requested: job.cancel_requested,
         }
     }
 }
@@ -433,8 +451,8 @@ pub struct CancelResponse {
     cancelled: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct JobSnapshot {
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct JobSnapshot {
     id: String,
     state: &'static str,
     progress_bits: u64,
@@ -444,30 +462,130 @@ struct JobSnapshot {
 struct SelectedDatabase {
     database: Database,
     vault: Option<VaultHandle>,
+    vault_generation: Option<u64>,
+    vault_sessions: Option<crate::vault::VaultSessionManager>,
 }
 
 impl SelectedDatabase {
     fn from_request(state: &AppState, access: Option<Extension<VaultAccess>>) -> Self {
         match access {
-            Some(Extension(access)) => Self {
-                database: access.handle.db.clone(),
-                vault: Some(access.handle),
-            },
+            Some(Extension(access)) => {
+                let guard_handle = access.handle.clone();
+                let guard_sessions = state.vault.clone();
+                let generation = access.generation;
+                Self {
+                    database: access.handle.db.with_access_guard(move || {
+                        ensure_active_vault_session(&guard_handle, &guard_sessions, generation)
+                    }),
+                    vault: Some(access.handle),
+                    vault_generation: Some(generation),
+                    vault_sessions: Some(state.vault.clone()),
+                }
+            }
             None => Self {
                 database: state.database.clone(),
                 vault: None,
+                vault_generation: None,
+                vault_sessions: None,
             },
         }
     }
 
-    fn result<T>(&self, result: illumia_core::db::Result<T>) -> ApiResult<T> {
-        result.map_err(|error| {
-            if self.vault.is_none() {
-                return ApiError::from(error);
-            }
-            vault_core_error(error)
+    async fn run_blocking<T>(
+        &self,
+        state: &AppState,
+        operation: impl FnOnce(Database) -> illumia_core::db::Result<T> + Send + 'static,
+    ) -> ApiResult<T>
+    where
+        T: Send + 'static,
+    {
+        let permit = state.try_blocking_db_slot()?;
+        let database = self.database.clone();
+        let vault = self.vault.clone();
+        let vault_generation = self.vault_generation;
+        let vault_sessions = self.vault_sessions.clone();
+        let is_vault = vault.is_some();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            ensure_vault_generation(&vault, &vault_sessions, vault_generation)?;
+            let result = operation(database);
+            ensure_vault_generation(&vault, &vault_sessions, vault_generation)?;
+            result
         })
+        .await
+        .map_err(ApiError::internal)?;
+        selected_result(is_vault, result)
     }
+}
+
+fn ensure_vault_generation(
+    vault: &Option<VaultHandle>,
+    sessions: &Option<crate::vault::VaultSessionManager>,
+    generation: Option<u64>,
+) -> illumia_core::db::Result<()> {
+    let Some(handle) = vault else {
+        return Ok(());
+    };
+    let Some((sessions, generation)) = sessions.as_ref().zip(generation) else {
+        return Err(illumia_core::db::Error::VaultAuthenticationFailed);
+    };
+    ensure_active_vault_session(handle, sessions, generation)
+}
+
+fn ensure_active_vault_session(
+    handle: &VaultHandle,
+    sessions: &crate::vault::VaultSessionManager,
+    generation: u64,
+) -> illumia_core::db::Result<()> {
+    handle.ensure_active()?;
+    if sessions.generation_active(generation) {
+        Ok(())
+    } else {
+        Err(illumia_core::db::Error::VaultAuthenticationFailed)
+    }
+}
+
+fn selected_result<T>(vault: bool, result: illumia_core::db::Result<T>) -> ApiResult<T> {
+    if vault {
+        result.map_err(vault_core_error)
+    } else {
+        result.map_err(ApiError::from)
+    }
+}
+
+async fn run_main_blocking<T>(
+    state: &AppState,
+    operation: impl FnOnce(Database) -> illumia_core::db::Result<T> + Send + 'static,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+{
+    let permit = state.try_blocking_db_slot()?;
+    let database = state.database.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(database)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::from)
+}
+
+async fn run_main_api_blocking<T>(
+    state: &AppState,
+    operation: impl FnOnce(Database) -> ApiResult<T> + Send + 'static,
+) -> ApiResult<T>
+where
+    T: Send + 'static,
+{
+    let permit = state.try_blocking_db_slot()?;
+    let database = state.database.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation(database)
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 /// Initializes vault key material without exposing whether it exists to unauthenticated callers.
@@ -564,8 +682,11 @@ pub async fn vault_import(
     validate_vault_transfer_request(&request)?;
     let _permit = state.security.try_ingest_slot()?;
     let main = state.database;
+    let sessions = state.vault;
+    let generation = access.generation;
     let vault = access.handle;
     tokio::task::spawn_blocking(move || -> illumia_core::db::Result<()> {
+        ensure_active_vault_session(&vault, &sessions, generation)?;
         let imported_ids = match (request.asset_ids, request.stack_id) {
             (Some(asset_ids), None) => {
                 core_vault::import_assets(&main, &vault, &asset_ids)?;
@@ -578,8 +699,10 @@ pub async fn vault_import(
             _ => return Err(illumia_core::db::Error::EmptyVaultTransfer),
         };
         for asset_id in imported_ids {
+            ensure_active_vault_session(&vault, &sessions, generation)?;
             vault.generate_thumbnails(&asset_id)?;
         }
+        ensure_active_vault_session(&vault, &sessions, generation)?;
         Ok(())
     })
     .await
@@ -599,11 +722,17 @@ pub async fn vault_export(
     validate_vault_transfer_request(&request)?;
     let _permit = state.security.try_ingest_slot()?;
     let main = state.database;
+    let sessions = state.vault;
+    let generation = access.generation;
     let vault = access.handle;
-    tokio::task::spawn_blocking(move || match (request.asset_ids, request.stack_id) {
-        (Some(asset_ids), None) => core_vault::export_assets(&vault, &main, &asset_ids),
-        (None, Some(stack_id)) => core_vault::export_stack(&vault, &main, &stack_id),
-        _ => Err(illumia_core::db::Error::EmptyVaultTransfer),
+    tokio::task::spawn_blocking(move || {
+        ensure_active_vault_session(&vault, &sessions, generation)?;
+        match (request.asset_ids, request.stack_id) {
+            (Some(asset_ids), None) => core_vault::export_assets(&vault, &main, &asset_ids)?,
+            (None, Some(stack_id)) => core_vault::export_stack(&vault, &main, &stack_id)?,
+            _ => return Err(illumia_core::db::Error::EmptyVaultTransfer),
+        }
+        ensure_active_vault_session(&vault, &sessions, generation)
     })
     .await
     .map_err(|_| ApiError::internal_silent())?
@@ -614,9 +743,58 @@ pub async fn vault_export(
 pub async fn upload_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> ApiResult<Response> {
     let _permit = state.security.try_ingest_slot()?;
+    let (filename, bytes, taken_at) = receive_upload(headers, multipart).await?;
+
+    let database = state.database.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let result = AssetService::new(database.clone()).ingest(&bytes, &filename, taken_at)?;
+        thumbnails::enqueue_thumbnail(&database, &result.asset.id)?;
+        Ok::<_, illumia_core::db::Error>(result)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::from)?;
+    state.notify_assets_added(&result.asset.taken_at_local_date);
+
+    upload_response(result)
+}
+
+/// Main libraryへ平文を書かず、unlock済みVaultへ直接暗号化して取り込む。
+///
+/// `vault: no-log`
+pub async fn vault_upload_asset(
+    State(state): State<AppState>,
+    Extension(access): Extension<VaultAccess>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> ApiResult<Response> {
+    let _permit = state.security.try_ingest_slot()?;
+    let (filename, bytes, taken_at) = receive_upload(headers, multipart).await?;
+    let sessions = state.vault;
+    let generation = access.generation;
+    let handle = access.handle;
+    let result = tokio::task::spawn_blocking(move || {
+        ensure_active_vault_session(&handle, &sessions, generation)?;
+        let result = handle.ingest(&bytes, &filename, taken_at)?;
+        drop(bytes);
+        ensure_active_vault_session(&handle, &sessions, generation)?;
+        handle.generate_thumbnails(&result.asset.id)?;
+        ensure_active_vault_session(&handle, &sessions, generation)?;
+        Ok::<_, illumia_core::db::Error>(result)
+    })
+    .await
+    .map_err(|_| ApiError::internal_silent())?
+    .map_err(vault_core_error)?;
+    upload_response(result)
+}
+
+async fn receive_upload(
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> ApiResult<(String, Bytes, Option<DateTime<Utc>>)> {
     let expected_hash = headers
         .get("X-Illumia-Checksum")
         .and_then(|value| value.to_str().ok())
@@ -672,15 +850,10 @@ pub async fn upload_asset(
     if blake3::hash(&bytes).as_bytes() != expected_bytes.as_slice() {
         return Err(ApiError::bad_request("checksum mismatch"));
     }
+    Ok((filename, bytes, taken_at))
+}
 
-    let service = AssetService::new(state.database.clone());
-    let result = tokio::task::spawn_blocking(move || service.ingest(&bytes, &filename, taken_at))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::from)?;
-    thumbnails::enqueue_thumbnail(&state.database, &result.asset.id)?;
-    state.notify_assets_added(&result.asset.taken_at_local_date);
-
+fn upload_response(result: illumia_core::assets::IngestResult) -> ApiResult<Response> {
     let duplicate_of = result.duplicate_of;
     let status = if duplicate_of.is_some() {
         StatusCode::OK
@@ -714,9 +887,8 @@ pub async fn assets_exist(
         let normalized = hash.to_ascii_lowercase();
         decoded.push((normalized.clone(), decode_hash(&normalized)?));
     }
-    let exists = state
-        .database
-        .with_connection(|connection| {
+    let exists = run_main_blocking(&state, move |database| {
+        database.with_connection(|connection| {
             let mut found = BTreeMap::new();
             let mut statement = connection.prepare(
                 "SELECT id FROM assets
@@ -732,7 +904,8 @@ pub async fn assets_exist(
             }
             Ok(found)
         })
-        .map_err(ApiError::from)?;
+    })
+    .await?;
     Ok(Json(ExistsResponse { exists }))
 }
 
@@ -743,7 +916,8 @@ pub async fn asset_metadata(
 ) -> ApiResult<Json<AssetResponse>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let asset = selected
-        .result(AssetService::new(selected.database.clone()).get(&id))?
+        .run_blocking(&state, move |database| AssetService::new(database).get(&id))
+        .await?
         .ok_or_else(|| ApiError::not_found("asset not found"))?;
     Ok(Json(asset.into()))
 }
@@ -756,13 +930,11 @@ pub async fn original(
 ) -> ApiResult<Response> {
     let selected = SelectedDatabase::from_request(&state, access);
     let asset = selected
-        .result(AssetService::new(selected.database.clone()).get(&id))?
+        .run_blocking(&state, move |database| AssetService::new(database).get(&id))
+        .await?
         .ok_or_else(|| ApiError::not_found("asset not found"))?;
     let mut response = if let Some(vault) = &selected.vault {
-        let bytes = vault
-            .read_blob(&asset.library_path)
-            .map_err(vault_core_error)?;
-        let mut response = Body::from(bytes).into_response();
+        let mut response = vault_blob_response(&state, vault, &asset.library_path).await?;
         response.headers_mut().insert(
             CONTENT_TYPE,
             HeaderValue::from_static(content_type_for_extension(&asset.ext)),
@@ -770,6 +942,10 @@ pub async fn original(
         response
             .headers_mut()
             .insert(CACHE_CONTROL, HeaderValue::from_static(NO_STORE));
+        response.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&asset.size.to_string()).map_err(ApiError::internal)?,
+        );
         response
     } else {
         let path = asset_path(&selected.database, &asset.library_path)?;
@@ -815,7 +991,11 @@ pub async fn trash_asset(
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<AssetResponse>> {
     let selected = SelectedDatabase::from_request(&state, access);
-    let asset = selected.result(AssetService::new(selected.database.clone()).trash(&id))?;
+    let asset = selected
+        .run_blocking(&state, move |database| {
+            AssetService::new(database).trash(&id)
+        })
+        .await?;
     Ok(Json(asset.into()))
 }
 
@@ -825,9 +1005,14 @@ pub async fn restore_asset(
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<AssetResponse>> {
     let selected = SelectedDatabase::from_request(&state, access);
-    let asset = selected.result(AssetService::new(selected.database.clone()).restore(&id))?;
+    let main_database = selected.vault.is_none();
+    let asset = selected
+        .run_blocking(&state, move |database| {
+            AssetService::new(database).restore(&id)
+        })
+        .await?;
     // vault 側の復元はバケットキー (日付) を WS に流さない (docs/06 ログ抑制)
-    if selected.vault.is_none() {
+    if main_database {
         state.notify_assets_added(&asset.taken_at_local_date);
     }
     Ok(Json(asset.into()))
@@ -840,10 +1025,10 @@ pub async fn timeline_buckets(
 ) -> ApiResult<Json<Vec<BucketResponse>>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let buckets = selected
-        .result(
-            TimelineService::new(selected.database.clone())
-                .bucket_records(query.granularity.into()),
-        )?
+        .run_blocking(&state, move |database| {
+            TimelineService::new(database).bucket_records(query.granularity.into())
+        })
+        .await?
         .into_iter()
         .map(|bucket| BucketResponse {
             key: bucket.key,
@@ -863,7 +1048,10 @@ pub async fn timeline_bucket(
     validate_bucket_granularity(&key, query.granularity)?;
     let selected = SelectedDatabase::from_request(&state, access);
     let items: Vec<_> = selected
-        .result(TimelineService::new(selected.database.clone()).bucket_items(&key))?
+        .run_blocking(&state, move |database| {
+            TimelineService::new(database).bucket_items(&key)
+        })
+        .await?
         .into_iter()
         .map(BucketItemResponse::from)
         .collect();
@@ -895,7 +1083,10 @@ pub async fn trash(
 ) -> ApiResult<Json<Vec<AssetResponse>>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let assets = selected
-        .result(AssetService::new(selected.database.clone()).list_trash())?
+        .run_blocking(&state, move |database| {
+            AssetService::new(database).list_trash()
+        })
+        .await?
         .into_iter()
         .map(AssetResponse::from)
         .collect();
@@ -908,7 +1099,10 @@ pub async fn duplicates(
 ) -> ApiResult<Json<Vec<DuplicateResponse>>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let duplicates = selected
-        .result(AssetService::new(selected.database.clone()).list_duplicates())?
+        .run_blocking(&state, move |database| {
+            AssetService::new(database).list_duplicates()
+        })
+        .await?
         .into_iter()
         .map(DuplicateResponse::from)
         .collect();
@@ -921,7 +1115,11 @@ pub async fn purge_now(
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<StatusCode> {
     let selected = SelectedDatabase::from_request(&state, access);
-    selected.result(PurgeService::new(selected.database.clone()).purge_now(&id))?;
+    selected
+        .run_blocking(&state, move |database| {
+            PurgeService::new(database).purge_now(&id)
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -931,9 +1129,11 @@ pub async fn create_stack(
     Json(request): Json<CreateStackRequest>,
 ) -> ApiResult<(StatusCode, Json<StackResponse>)> {
     let selected = SelectedDatabase::from_request(&state, access);
-    let stack = selected.result(
-        StackService::new(selected.database.clone()).create(&request.title, &request.asset_ids),
-    )?;
+    let stack = selected
+        .run_blocking(&state, move |database| {
+            StackService::new(database).create(&request.title, &request.asset_ids)
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(stack.into())))
 }
 
@@ -943,7 +1143,8 @@ pub async fn list_stacks(
 ) -> ApiResult<Json<Vec<StackSummaryResponse>>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let stacks = selected
-        .result(StackService::new(selected.database.clone()).list())?
+        .run_blocking(&state, |database| StackService::new(database).list())
+        .await?
         .into_iter()
         .map(StackSummaryResponse::from)
         .collect();
@@ -957,7 +1158,8 @@ pub async fn get_stack(
 ) -> ApiResult<Json<StackResponse>> {
     let selected = SelectedDatabase::from_request(&state, access);
     let stack = selected
-        .result(StackService::new(selected.database.clone()).get(&id))?
+        .run_blocking(&state, move |database| StackService::new(database).get(&id))
+        .await?
         .ok_or_else(|| ApiError::not_found("manga stack not found"))?;
     Ok(Json(stack.into()))
 }
@@ -974,13 +1176,15 @@ pub async fn patch_stack(
         ));
     }
     let selected = SelectedDatabase::from_request(&state, access);
-    let stack = selected.result(
-        StackService::new(selected.database.clone()).update_metadata(
-            &id,
-            request.title.as_deref(),
-            request.cover_asset_id.as_deref(),
-        ),
-    )?;
+    let stack = selected
+        .run_blocking(&state, move |database| {
+            StackService::new(database).update_metadata(
+                &id,
+                request.title.as_deref(),
+                request.cover_asset_id.as_deref(),
+            )
+        })
+        .await?;
     Ok(Json(stack.into()))
 }
 
@@ -990,7 +1194,11 @@ pub async fn delete_stack(
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<StatusCode> {
     let selected = SelectedDatabase::from_request(&state, access);
-    selected.result(StackService::new(selected.database.clone()).delete_stack(&id))?;
+    selected
+        .run_blocking(&state, move |database| {
+            StackService::new(database).delete_stack(&id)
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1010,7 +1218,10 @@ pub async fn replace_stack_structure(
         .collect::<Vec<_>>();
     let selected = SelectedDatabase::from_request(&state, access);
     let stack = selected
-        .result(StackService::new(selected.database.clone()).replace_structure(&id, &chapters))?;
+        .run_blocking(&state, move |database| {
+            StackService::new(database).replace_structure(&id, &chapters)
+        })
+        .await?;
     Ok(Json(stack.into()))
 }
 
@@ -1021,11 +1232,15 @@ pub async fn add_stack_pages(
     Json(request): Json<AddStackPagesRequest>,
 ) -> ApiResult<Json<StackResponse>> {
     let selected = SelectedDatabase::from_request(&state, access);
-    let stack = selected.result(StackService::new(selected.database.clone()).add_pages(
-        &id,
-        &request.asset_ids,
-        request.chapter_id.as_deref(),
-    ))?;
+    let stack = selected
+        .run_blocking(&state, move |database| {
+            StackService::new(database).add_pages(
+                &id,
+                &request.asset_ids,
+                request.chapter_id.as_deref(),
+            )
+        })
+        .await?;
     Ok(Json(stack.into()))
 }
 
@@ -1035,7 +1250,11 @@ pub async fn remove_stack_page(
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<StatusCode> {
     let selected = SelectedDatabase::from_request(&state, access);
-    selected.result(StackService::new(selected.database.clone()).remove_page(&id, &asset_id))?;
+    selected
+        .run_blocking(&state, move |database| {
+            StackService::new(database).remove_page(&id, &asset_id)
+        })
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1046,11 +1265,11 @@ pub async fn patch_stack_page(
     Json(request): Json<PatchStackPageRequest>,
 ) -> ApiResult<Json<StackResponse>> {
     let selected = SelectedDatabase::from_request(&state, access);
-    let stack = selected.result(StackService::new(selected.database.clone()).set_page_flag(
-        &id,
-        &asset_id,
-        request.show_in_timeline,
-    ))?;
+    let stack = selected
+        .run_blocking(&state, move |database| {
+            StackService::new(database).set_page_flag(&id, &asset_id, request.show_in_timeline)
+        })
+        .await?;
     Ok(Json(stack.into()))
 }
 
@@ -1073,7 +1292,11 @@ pub async fn search(
             clusters: Vec::new(),
         }));
     }
-    let result = selected.result(SearchService::new(selected.database.clone()).search(&query))?;
+    let result = selected
+        .run_blocking(&state, move |database| {
+            SearchService::new(database).search(&query)
+        })
+        .await?;
     let stacks = result
         .stacks
         .into_iter()
@@ -1088,12 +1311,13 @@ pub async fn search(
 }
 
 pub async fn ml_status(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    let settings = Settings::new(state.database);
-    let enabled = settings.ml_enabled()?;
+    let (enabled, socket_path) = ml_configuration(&state).await?;
     let sidecar = if enabled {
-        settings
-            .ml_socket_path()?
-            .and_then(|path| MlClient::new(path).health().ok())
+        if let Some(path) = socket_path {
+            state.ml_health(path).await
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -1101,14 +1325,21 @@ pub async fn ml_status(State(state): State<AppState>) -> ApiResult<Json<Value>> 
 }
 
 pub async fn analyze_all(State(state): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
-    require_ml_configured(&state)?;
-    let jobs = enqueue_analyze_all(&state.database)?;
+    let socket_path = require_ml_configured(&state).await?;
+    let model_version = state
+        .ml_health(socket_path)
+        .await
+        .and_then(|health| health.model_bundle.map(|bundle| bundle.version));
+    let jobs = run_main_blocking(&state, move |database| {
+        enqueue_analyze_all_for_model(&database, model_version.as_deref())
+    })
+    .await?;
     Ok((StatusCode::ACCEPTED, Json(json!({"enqueued": jobs.len()}))))
 }
 
 pub async fn recluster(State(state): State<AppState>) -> ApiResult<(StatusCode, Json<Value>)> {
-    require_ml_configured(&state)?;
-    let job = enqueue_recluster(&state.database)?;
+    require_ml_configured(&state).await?;
+    let job = run_main_blocking(&state, move |database| enqueue_recluster(&database)).await?;
     Ok((StatusCode::ACCEPTED, Json(json!({"job_id": job.id}))))
 }
 
@@ -1116,9 +1347,15 @@ pub async fn list_clusters(
     State(state): State<AppState>,
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<Vec<ClusterSummary>>> {
+    let socket_path = PathBuf::from("/dev/null");
     let selected = SelectedDatabase::from_request(&state, access);
-    let service = ml_service(&state, selected.database.clone())?;
-    Ok(Json(selected.result(service.list_clusters())?))
+    Ok(Json(
+        selected
+            .run_blocking(&state, move |database| {
+                MlService::new(database, MlClient::new(socket_path)).list_clusters()
+            })
+            .await?,
+    ))
 }
 
 pub async fn cluster_assets(
@@ -1126,10 +1363,13 @@ pub async fn cluster_assets(
     Path(id): Path<String>,
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<Vec<ClusterAssetResponse>>> {
+    let socket_path = PathBuf::from("/dev/null");
     let selected = SelectedDatabase::from_request(&state, access);
-    let service = ml_service(&state, selected.database.clone())?;
     let assets = selected
-        .result(service.cluster_assets(&id))?
+        .run_blocking(&state, move |database| {
+            MlService::new(database, MlClient::new(socket_path)).cluster_assets(&id)
+        })
+        .await?
         .into_iter()
         .map(|item| ClusterAssetResponse {
             asset: item.asset.into(),
@@ -1145,10 +1385,15 @@ pub async fn rename_cluster(
     access: Option<Extension<VaultAccess>>,
     Json(request): Json<RenameClusterRequest>,
 ) -> ApiResult<Json<ClusterSummary>> {
+    let socket_path = PathBuf::from("/dev/null");
     let selected = SelectedDatabase::from_request(&state, access);
-    let service = ml_service(&state, selected.database.clone())?;
     Ok(Json(
-        selected.result(service.rename_cluster(&id, &request.name))?,
+        selected
+            .run_blocking(&state, move |database| {
+                MlService::new(database, MlClient::new(socket_path))
+                    .rename_cluster(&id, &request.name)
+            })
+            .await?,
     ))
 }
 
@@ -1157,11 +1402,16 @@ pub async fn merge_clusters(
     access: Option<Extension<VaultAccess>>,
     Json(request): Json<MergeClustersRequest>,
 ) -> ApiResult<Json<ClusterSummary>> {
+    let socket_path = PathBuf::from("/dev/null");
     let selected = SelectedDatabase::from_request(&state, access);
-    let service = ml_service(&state, selected.database.clone())?;
-    Ok(Json(selected.result(
-        service.merge_clusters(&request.from_id, &request.into_id),
-    )?))
+    Ok(Json(
+        selected
+            .run_blocking(&state, move |database| {
+                MlService::new(database, MlClient::new(socket_path))
+                    .merge_clusters(&request.from_id, &request.into_id)
+            })
+            .await?,
+    ))
 }
 
 pub async fn split_cluster(
@@ -1170,9 +1420,14 @@ pub async fn split_cluster(
     access: Option<Extension<VaultAccess>>,
     Json(request): Json<SplitClusterRequest>,
 ) -> ApiResult<(StatusCode, Json<ClusterSummary>)> {
+    let socket_path = PathBuf::from("/dev/null");
     let selected = SelectedDatabase::from_request(&state, access);
-    let service = ml_service(&state, selected.database.clone())?;
-    let cluster = selected.result(service.split_cluster(&id, &request.face_ids))?;
+    let cluster = selected
+        .run_blocking(&state, move |database| {
+            MlService::new(database, MlClient::new(socket_path))
+                .split_cluster(&id, &request.face_ids)
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(cluster)))
 }
 
@@ -1180,10 +1435,13 @@ pub async fn review_candidates(
     State(state): State<AppState>,
     access: Option<Extension<VaultAccess>>,
 ) -> ApiResult<Json<Vec<ReviewCandidateResponse>>> {
+    let socket_path = PathBuf::from("/dev/null");
     let selected = SelectedDatabase::from_request(&state, access);
-    let service = ml_service(&state, selected.database.clone())?;
     let candidates = selected
-        .result(service.review_candidates())?
+        .run_blocking(&state, move |database| {
+            MlService::new(database, MlClient::new(socket_path)).review_candidates()
+        })
+        .await?
         .into_iter()
         .map(|candidate| ReviewCandidateResponse {
             face: candidate.face,
@@ -1199,11 +1457,16 @@ pub async fn review_candidate(
     access: Option<Extension<VaultAccess>>,
     Json(request): Json<ReviewCandidateRequest>,
 ) -> ApiResult<Json<FaceRecord>> {
+    let socket_path = PathBuf::from("/dev/null");
     let selected = SelectedDatabase::from_request(&state, access);
-    let service = ml_service(&state, selected.database.clone())?;
     let accept = matches!(request.action, ReviewAction::Accept);
     Ok(Json(
-        selected.result(service.review_candidate(&face_id, accept))?,
+        selected
+            .run_blocking(&state, move |database| {
+                MlService::new(database, MlClient::new(socket_path))
+                    .review_candidate(&face_id, accept)
+            })
+            .await?,
     ))
 }
 
@@ -1213,39 +1476,115 @@ pub async fn review_candidate(
 pub async fn vault_analyze_all(
     State(state): State<AppState>,
     Extension(access): Extension<VaultAccess>,
-) -> ApiResult<Json<Value>> {
-    let socket_path = require_ml_configured(&state)?;
-    let handle = access.handle;
-    let analyzed = tokio::task::spawn_blocking(move || -> illumia_core::db::Result<usize> {
-        let ids = handle.db.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT id, library_path FROM assets a
-                 WHERE lifecycle IN ('active','duplicate')
-                   AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.asset_id = a.id)
-                 ORDER BY id LIMIT 10000",
-            )?;
-            Ok(statement
-                .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()?)
-        })?;
-        let service = MlService::new(handle.db.clone(), MlClient::new(socket_path));
-        let mut count = 0;
-        for (asset_id, blob_id) in ids {
-            let bytes = handle.read_blob(&blob_id)?;
-            service.analyze_bytes(&asset_id, &bytes)?;
-            count += 1;
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    let socket_path = require_ml_configured(&state).await?;
+    if !state.vault.generation_active(access.generation) {
+        return Err(ApiError::not_found("vault session not found"));
+    }
+    let permit = state.try_blocking_db_slot()?;
+    let handle = access.handle.clone();
+    let jobs = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        handle.ensure_active()?;
+        let jobs = enqueue_vault_analyze_all(&handle.db)?;
+        if !jobs.is_empty() {
+            enqueue_recluster(&handle.db)?;
         }
-        if count != 0 {
-            service.recluster()?;
-        }
-        Ok(count)
+        handle.ensure_active()?;
+        Ok::<_, illumia_core::db::Error>(jobs)
     })
     .await
     .map_err(|_| ApiError::internal_silent())?
-    .map_err(|_| ApiError::internal_silent())?;
-    Ok(Json(json!({"analyzed": analyzed})))
+    .map_err(vault_core_error)?;
+    if !state.vault.generation_active(access.generation) {
+        return Err(ApiError::not_found("vault session not found"));
+    }
+    ensure_vault_ml_worker(&state, access, socket_path);
+    Ok((StatusCode::ACCEPTED, Json(json!({"enqueued": jobs.len()}))))
+}
+
+fn ensure_vault_ml_worker(state: &AppState, access: VaultAccess, socket_path: PathBuf) {
+    let generation = access.generation;
+    {
+        let mut workers = state
+            .vault_ml_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !workers.insert(generation) {
+            return;
+        }
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        while state.vault.generation_active(generation) {
+            let handle = access.handle.clone();
+            let sessions = state.vault.clone();
+            let gate = state.ml_gate.clone();
+            let socket_path = socket_path.clone();
+            let processed = tokio::task::spawn_blocking(move || {
+                process_one_vault_ml_job(handle, sessions, generation, gate, socket_path)
+            })
+            .await;
+            match processed {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        state
+            .vault_ml_workers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&generation);
+    });
+}
+
+/// Processes at most one Vault ML job. No identifier or filename may be logged.
+/// `vault: no-log`
+fn process_one_vault_ml_job(
+    handle: VaultHandle,
+    sessions: crate::vault::VaultSessionManager,
+    generation: u64,
+    gate: crate::MlConcurrencyGate,
+    socket_path: PathBuf,
+) -> illumia_core::db::Result<bool> {
+    let queue = JobQueue::new(handle.db.clone());
+    let Some(job) = queue.claim_kinds(&[ML_VAULT_ANALYZE_JOB_KIND, ML_RECLUSTER_JOB_KIND])? else {
+        return Ok(false);
+    };
+    let active = || handle.ensure_active().is_ok() && sessions.generation_active(generation);
+    if !active() {
+        let _ = queue.cancel(&job.id)?;
+        let _ = queue.complete(&job.id)?;
+        return Ok(true);
+    }
+
+    let _permit = gate.acquire();
+    let service = MlService::new(handle.db.clone(), MlClient::new(socket_path));
+    let result = (|| match job.kind.as_str() {
+        ML_VAULT_ANALYZE_JOB_KIND => {
+            let payload: MlAnalyzePayload = serde_json::from_str(&job.payload)?;
+            let blob_id = vault_blob_id(&handle.db, &payload.asset_id, "original")?
+                .ok_or(illumia_core::db::Error::VaultBlobNotFound)?;
+            let bytes = handle.read_blob(&blob_id)?;
+            service.analyze_bytes_cancellable(&payload.asset_id, &bytes, || {
+                Ok(queue.cancellation_requested(&job.id)? || !active())
+            })
+        }
+        ML_RECLUSTER_JOB_KIND => service
+            .recluster_cancellable(|| Ok(queue.cancellation_requested(&job.id)? || !active())),
+        _ => unreachable!("claim_kinds restricts Vault ML kinds"),
+    })();
+
+    if !active() {
+        let _ = queue.cancel(&job.id)?;
+        let _ = queue.complete(&job.id)?;
+    } else if let Err(error) = result {
+        let _ = queue.fail(&job.id, &error.to_string())?;
+    } else {
+        let _ = queue.complete(&job.id)?;
+    }
+    Ok(true)
 }
 
 pub async fn jobs(
@@ -1253,8 +1592,8 @@ pub async fn jobs(
     Query(query): Query<JobsQuery>,
 ) -> ApiResult<Json<Vec<JobResponse>>> {
     let state_filter = query.state.as_deref().map(parse_job_state).transpose()?;
-    let jobs = JobQueue::new(state.database)
-        .list()?
+    let jobs = run_main_blocking(&state, move |database| JobQueue::new(database).list())
+        .await?
         .into_iter()
         .filter(|job| state_filter.is_none_or(|filter| job.state == filter))
         .map(JobResponse::from)
@@ -1266,7 +1605,8 @@ pub async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<CancelResponse>> {
-    let cancelled = JobQueue::new(state.database).cancel(&id)?;
+    let cancelled =
+        run_main_blocking(&state, move |database| JobQueue::new(database).cancel(&id)).await?;
     if !cancelled {
         return Err(ApiError::not_found("cancellable job not found"));
     }
@@ -1274,7 +1614,12 @@ pub async fn cancel_job(
 }
 
 pub async fn get_settings(State(state): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(settings_json(&Settings::new(state.database))?))
+    Ok(Json(
+        run_main_api_blocking(&state, move |database| {
+            settings_json(&Settings::new(database))
+        })
+        .await?,
+    ))
 }
 
 pub async fn patch_settings(
@@ -1284,41 +1629,63 @@ pub async fn patch_settings(
     let patch = patch
         .as_object()
         .ok_or_else(|| ApiError::bad_request("settings patch must be an object"))?;
-    let settings = Settings::new(state.database);
     let changes = validate_settings_patch(patch)?;
-    validate_setting_relationships(&settings, &changes)?;
-    apply_settings_patch(&settings, changes)?;
-    Ok(Json(settings_json(&settings)?))
+    let value = run_main_api_blocking(&state, move |database| {
+        let settings = Settings::new(database);
+        validate_setting_relationships(&settings, &changes)?;
+        apply_settings_patch(&settings, changes)?;
+        settings_json(&settings)
+    })
+    .await?;
+    Ok(Json(value))
 }
 
 pub(crate) const MAX_WEBSOCKET_MESSAGE_BYTES: usize = 64 * 1024;
+#[cfg(not(test))]
+const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const WEBSOCKET_PING_INTERVAL: Duration = Duration::from_millis(200);
+const WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
+const WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Browser clients authenticate with the HttpOnly session cookie. Native
 /// clients may use the Authorization header. Credentials are never accepted
 /// from the URL, where proxies and request logs could retain them.
 pub async fn websocket(
     State(state): State<AppState>,
+    Extension(authentication): Extension<Authenticated>,
     upgrade: WebSocketUpgrade,
 ) -> ApiResult<Response> {
-    let permit = state.security.try_websocket_slot()?;
+    let permit = state.security.try_websocket_slot(&authentication.token)?;
+    let token = authentication.token;
     Ok(upgrade
         .max_frame_size(MAX_WEBSOCKET_MESSAGE_BYTES)
         .max_message_size(MAX_WEBSOCKET_MESSAGE_BYTES)
         .on_upgrade(move |socket| async move {
             let _permit = permit;
-            websocket_loop(state, socket).await;
+            websocket_loop(state, token, socket).await;
         }))
 }
 
-async fn websocket_loop(state: AppState, mut socket: WebSocket) {
+async fn websocket_loop(state: AppState, token: String, mut socket: WebSocket) {
     let mut events = state.events.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_secs(2));
-    let mut previous = Vec::new();
+    state.ensure_job_event_poller();
+    let mut ping = tokio::time::interval(WEBSOCKET_PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_seen = tokio::time::Instant::now();
     loop {
+        if state.auth.verify_token_cached(&token).is_err() {
+            let _ = send_message(&mut socket, Message::Close(None)).await;
+            break;
+        }
         tokio::select! {
             received = events.recv() => {
                 match received {
                     Ok(value) => {
+                        if state.auth.verify_token_cached(&token).is_err() {
+                            let _ = send_message(&mut socket, Message::Close(None)).await;
+                            break;
+                        }
                         if send_json(&mut socket, &value).await.is_err() {
                             break;
                         }
@@ -1327,42 +1694,19 @@ async fn websocket_loop(state: AppState, mut socket: WebSocket) {
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-            _ = interval.tick() => {
-                let database = state.database.clone();
-                let jobs = match tokio::task::spawn_blocking(move || {
-                    JobQueue::new(database).list()
-                }).await {
-                    Ok(Ok(jobs)) => jobs,
-                    Ok(Err(error)) => {
-                        tracing::warn!(error = %error, "websocket job polling failed");
-                        continue;
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "websocket job poll task failed");
-                        continue;
-                    }
-                };
-                let snapshot: Vec<_> = jobs.iter().map(job_snapshot).collect();
-                for job in &jobs {
-                    let current = job_snapshot(job);
-                    if !previous.contains(&current) {
-                        let value = json!({
-                            "type": "job",
-                            "id": job.id,
-                            "state": job_state_name(job.state),
-                            "progress": job.progress,
-                        });
-                        if send_json(&mut socket, &value).await.is_err() {
-                            return;
-                        }
-                    }
+            _ = ping.tick() => {
+                if last_seen.elapsed() >= WEBSOCKET_IDLE_TIMEOUT {
+                    let _ = send_message(&mut socket, Message::Close(None)).await;
+                    break;
                 }
-                previous = snapshot;
+                if send_message(&mut socket, Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
             }
             message = socket.recv() => {
                 match message {
                     Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => last_seen = tokio::time::Instant::now(),
                 }
             }
         }
@@ -1370,9 +1714,13 @@ async fn websocket_loop(state: AppState, mut socket: WebSocket) {
 }
 
 async fn send_json(socket: &mut WebSocket, value: &Value) -> Result<(), ()> {
-    socket
-        .send(Message::Text(value.to_string().into()))
+    send_message(socket, Message::Text(value.to_string().into())).await
+}
+
+async fn send_message(socket: &mut WebSocket, message: Message) -> Result<(), ()> {
+    tokio::time::timeout(WEBSOCKET_SEND_TIMEOUT, socket.send(message))
         .await
+        .map_err(|_| ())?
         .map_err(|_| ())
 }
 
@@ -1387,17 +1735,24 @@ async fn image_variant(
     Uuid::parse_str(&id).map_err(|_| ApiError::not_found("asset not found"))?;
     let selected = SelectedDatabase::from_request(&state, access);
     if selected
-        .result(AssetService::new(selected.database.clone()).get(&id))?
+        .run_blocking(&state, {
+            let id = id.clone();
+            move |database| AssetService::new(database).get(&id)
+        })
+        .await?
         .is_none()
     {
         return Err(ApiError::not_found("asset not found"));
     }
     let mut response = if let Some(vault) = &selected.vault {
         let blob_id = selected
-            .result(vault_blob_id(&selected.database, &id, vault_kind))?
+            .run_blocking(&state, {
+                let id = id.clone();
+                move |database| vault_blob_id(&database, &id, vault_kind)
+            })
+            .await?
             .ok_or_else(|| ApiError::not_found("image variant not found"))?;
-        let bytes = vault.read_blob(&blob_id).map_err(vault_core_error)?;
-        Body::from(bytes).into_response()
+        vault_blob_response(&state, vault, &blob_id).await?
     } else {
         let path = selected
             .database
@@ -1422,6 +1777,104 @@ async fn image_variant(
         }),
     );
     Ok(response)
+}
+
+/// Vault blobを固定長channelで逐次配信する。producerはblocking file/AEAD処理を
+/// async runtimeから隔離し、receiver切断時は次のsendで停止する。
+///
+/// `vault: no-log`
+pub(crate) async fn vault_blob_response(
+    state: &AppState,
+    vault: &VaultHandle,
+    blob_id: &str,
+) -> ApiResult<Response> {
+    let permit = state.security.try_vault_stream_slot()?;
+    let handle = vault.clone();
+    let blob_id = blob_id.to_owned();
+    let reader = tokio::task::spawn_blocking(move || handle.blob_reader(&blob_id))
+        .await
+        .map_err(|_| ApiError::internal_silent())?
+        .map_err(vault_core_error)?;
+    let (sender, receiver) =
+        tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(VAULT_STREAM_CHANNEL_CAPACITY);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let producer_aborted = Arc::clone(&aborted);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        for chunk in reader {
+            let item = chunk.map_err(|_| io::Error::other("vault stream failed"));
+            let terminal_error = item.is_err();
+            match send_vault_chunk_with_deadline(&sender, item) {
+                VaultChunkSend::Sent if terminal_error => return,
+                VaultChunkSend::Sent => {}
+                VaultChunkSend::Closed => return,
+                VaultChunkSend::TimedOut => {
+                    producer_aborted.store(true, Ordering::Release);
+                    return;
+                }
+            }
+        }
+    });
+    let body_stream = vault_body_stream(receiver, aborted);
+    Ok(Body::from_stream(body_stream).into_response())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VaultChunkSend {
+    Sent,
+    Closed,
+    TimedOut,
+}
+
+fn send_vault_chunk_with_deadline(
+    sender: &tokio::sync::mpsc::Sender<Result<Vec<u8>, io::Error>>,
+    mut item: Result<Vec<u8>, io::Error>,
+) -> VaultChunkSend {
+    let deadline = std::time::Instant::now() + VAULT_STREAM_BACKPRESSURE_TIMEOUT;
+    loop {
+        match sender.try_send(item) {
+            Ok(()) => return VaultChunkSend::Sent,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return VaultChunkSend::Closed;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                if std::time::Instant::now() >= deadline {
+                    return VaultChunkSend::TimedOut;
+                }
+                item = returned;
+                std::thread::sleep(VAULT_STREAM_BACKPRESSURE_RETRY);
+            }
+        }
+    }
+}
+
+struct VaultBodyStreamState {
+    receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, io::Error>>,
+    aborted: Arc<AtomicBool>,
+    abort_reported: bool,
+}
+
+fn vault_body_stream(
+    receiver: tokio::sync::mpsc::Receiver<Result<Vec<u8>, io::Error>>,
+    aborted: Arc<AtomicBool>,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, io::Error>> {
+    stream::unfold(
+        VaultBodyStreamState {
+            receiver,
+            aborted,
+            abort_reported: false,
+        },
+        |mut state| async move {
+            if let Some(item) = state.receiver.recv().await {
+                return Some((item, state));
+            }
+            if !state.abort_reported && state.aborted.load(Ordering::Acquire) {
+                state.abort_reported = true;
+                return Some((Err(io::Error::other("vault stream aborted")), state));
+            }
+            None
+        },
+    )
 }
 
 async fn serve_file(path: PathBuf, request: Request) -> ApiResult<Response> {
@@ -1585,7 +2038,7 @@ fn validate_settings_patch(patch: &Map<String, Value>) -> ApiResult<Vec<SettingC
                 key,
                 value,
                 MIN_JOB_CONCURRENCY,
-                MAX_JOB_CONCURRENCY,
+                MAX_ML_CONCURRENCY,
             )?)),
             "ml.tau_high_override" => Ok(SettingChange::TauHigh(value_f64_ratio(key, value)?)),
             "ml.tau_low_override" => Ok(SettingChange::TauLow(value_f64_ratio(key, value)?)),
@@ -1675,21 +2128,25 @@ fn settings_json(settings: &Settings) -> ApiResult<Value> {
     }))
 }
 
-fn require_ml_configured(state: &AppState) -> ApiResult<PathBuf> {
-    let settings = Settings::new(state.database.clone());
-    if !settings.ml_enabled()? {
+async fn require_ml_configured(state: &AppState) -> ApiResult<PathBuf> {
+    let (enabled, socket_path) = ml_configuration(state).await?;
+    if !enabled {
         return Err(ApiError::bad_request("ML is disabled"));
     }
-    settings
-        .ml_socket_path()?
-        .ok_or_else(|| ApiError::bad_request("ml.socket_path is not configured"))
+    socket_path.ok_or_else(|| ApiError::bad_request("ml.socket_path is not configured"))
 }
 
-fn ml_service(state: &AppState, database: Database) -> ApiResult<MlService> {
-    let path = Settings::new(state.database.clone())
-        .ml_socket_path()?
-        .unwrap_or_else(|| PathBuf::from("/dev/null"));
-    Ok(MlService::new(database, MlClient::new(path)))
+async fn ml_configuration(state: &AppState) -> ApiResult<(bool, Option<PathBuf>)> {
+    let permit = state.try_blocking_db_slot()?;
+    let database = state.database.clone();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let settings = Settings::new(database);
+        Ok::<_, illumia_core::db::Error>((settings.ml_enabled()?, settings.ml_socket_path()?))
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::from)
 }
 
 fn value_u32(key: &str, value: &Value) -> ApiResult<u32> {
@@ -1780,7 +2237,7 @@ fn lifecycle_name(lifecycle: Lifecycle) -> &'static str {
     }
 }
 
-fn job_state_name(state: JobState) -> &'static str {
+pub(crate) fn job_state_name(state: JobState) -> &'static str {
     match state {
         JobState::Queued => "queued",
         JobState::Running => "running",
@@ -1797,7 +2254,7 @@ fn quality_gate_name(value: QualityGate) -> &'static str {
     }
 }
 
-fn job_snapshot(job: &Job) -> JobSnapshot {
+pub(crate) fn job_snapshot(job: &Job) -> JobSnapshot {
     JobSnapshot {
         id: job.id.clone(),
         state: job_state_name(job.state),
@@ -1839,4 +2296,43 @@ fn base64(bytes: &[u8]) -> String {
         }
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_util::StreamExt;
+    use tokio::sync::Semaphore;
+
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unpolled_vault_stream_releases_its_permit_after_backpressure_deadline() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().acquire_owned().await.expect("stream permit");
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender
+            .try_send(Ok(Vec::new()))
+            .expect("channel should be filled");
+        let aborted = Arc::new(AtomicBool::new(false));
+        let producer_aborted = Arc::clone(&aborted);
+
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            assert_eq!(
+                send_vault_chunk_with_deadline(&sender, Ok(vec![1])),
+                VaultChunkSend::TimedOut
+            );
+            producer_aborted.store(true, Ordering::Release);
+        });
+
+        let _reacquired = tokio::time::timeout(Duration::from_secs(1), slots.acquire())
+            .await
+            .expect("an unpolled receiver must not pin a stream slot")
+            .expect("semaphore should remain open");
+
+        let mut body = Box::pin(vault_body_stream(receiver, aborted));
+        assert!(matches!(body.next().await, Some(Ok(chunk)) if chunk.is_empty()));
+        assert!(matches!(body.next().await, Some(Err(_))));
+        assert!(body.next().await.is_none());
+    }
 }

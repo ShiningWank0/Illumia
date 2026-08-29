@@ -21,7 +21,8 @@ SELECT id FROM assets
 WHERE lifecycle IN ('duplicate','trashed')
   AND purge_after IS NOT NULL
   AND purge_after < :now
-  AND NOT EXISTS (SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id);
+  AND NOT EXISTS (SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id)
+  AND NOT EXISTS (SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id);
 ";
 
 #[derive(Clone, Debug)]
@@ -77,6 +78,9 @@ impl PurgeService {
                    AND lifecycle IN ('duplicate','trashed')
                    AND NOT EXISTS (
                      SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id
                    )",
                 [id],
             )?;
@@ -114,6 +118,9 @@ impl PurgeService {
     }
 
     fn finish_purging(&self, id: &str) -> Result<()> {
+        if self.restore_referenced_legacy_tombstone(id)? {
+            return Ok(());
+        }
         let (library_path, blob_ids) = self.database.with_connection(|connection| {
             let library_path = connection
                 .query_row(
@@ -144,6 +151,30 @@ impl PurgeService {
                 [id],
             )?;
             Ok(())
+        })
+    }
+
+    /// Older builds could mark a canonical row as `purging` even while duplicate rows
+    /// still referenced it. Never resume physical deletion for that state: recover the
+    /// original lifecycle from the retained trash/dedup metadata instead.
+    fn restore_referenced_legacy_tombstone(&self, id: &str) -> Result<bool> {
+        self.database.with_connection_mut(|connection| {
+            let transaction = connection.transaction()?;
+            let changed = transaction.execute(
+                "UPDATE assets
+                 SET lifecycle = CASE
+                       WHEN trashed_at IS NOT NULL THEN 'trashed'
+                       WHEN duplicate_of IS NOT NULL THEN 'duplicate'
+                       ELSE 'trashed'
+                     END,
+                     visible_in_timeline = 0
+                 WHERE id = ?1
+                   AND lifecycle = 'purging'
+                   AND EXISTS (SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id)",
+                [id],
+            )?;
+            transaction.commit()?;
+            Ok(changed != 0)
         })
     }
 }

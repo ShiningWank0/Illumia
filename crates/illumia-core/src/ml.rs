@@ -15,13 +15,19 @@ use uuid::Uuid;
 use crate::{
     assets::{Asset, AssetService, asset_from_row, timestamp},
     db::{Database, Error, Result},
-    jobs::{Job, JobQueue},
+    jobs::{ActiveJobKey, Job, JobQueue},
     ml_client::{Analysis, Assignment, ClusterMode, ClusterParams, ClusterRequest, MlClient},
     settings::{QualityGate, Settings},
 };
 
 pub const ML_ANALYZE_JOB_KIND: &str = "ml_analyze";
+pub const ML_VAULT_ANALYZE_JOB_KIND: &str = "ml_vault_analyze";
 pub const ML_RECLUSTER_JOB_KIND: &str = "ml_recluster";
+pub const MAX_ANALYZE_ALL_BATCH: usize = 1_000;
+pub const MAX_CLUSTER_ROWS: usize = 512;
+pub const MAX_EMBEDDING_DIMENSION: usize = 4_096;
+pub const MAX_CLUSTER_INPUT_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_REVIEW_CANDIDATES: usize = 512;
 pub const ML_ANALYZE_PRIORITY: i64 = 10;
 pub const ML_RECLUSTER_PRIORITY: i64 = 5;
 
@@ -108,6 +114,11 @@ impl MlService {
     }
 
     pub fn handle_analyze_job(&self, job: &Job) -> Result<()> {
+        let queue = JobQueue::new(self.database.clone());
+        let cancelled = || queue.cancellation_requested(&job.id);
+        if cancelled()? {
+            return Ok(());
+        }
         let payload: MlAnalyzePayload = serde_json::from_str(&job.payload)?;
         let Some(asset) = AssetService::new(self.database.clone()).get(&payload.asset_id)? else {
             return Ok(());
@@ -121,6 +132,9 @@ impl MlService {
         {
             return Ok(());
         }
+        if cancelled()? {
+            return Ok(());
+        }
         let relative = Path::new(&asset.library_path);
         if relative.is_absolute()
             || relative
@@ -130,13 +144,28 @@ impl MlService {
             return Err(Error::InvalidAssetPath);
         }
         let bytes = fs::read(self.database.data_root().join(relative))?;
-        self.analyze_bytes(&payload.asset_id, &bytes)
+        self.analyze_bytes_cancellable(&payload.asset_id, &bytes, cancelled)
     }
 
     /// Persists an anonymous image analysis. Suitable for an unlocked vault.
     ///
     /// `vault: no-log` — callers must not log the asset identifier or image metadata.
     pub fn analyze_bytes(&self, asset_id: &str, bytes: &[u8]) -> Result<()> {
+        self.analyze_bytes_cancellable(asset_id, bytes, || Ok(false))
+    }
+
+    /// Runs analysis with cooperative checks before and after the blocking ML RPC.
+    ///
+    /// `vault: no-log` — the callback must not log asset metadata.
+    pub fn analyze_bytes_cancellable(
+        &self,
+        asset_id: &str,
+        bytes: &[u8],
+        mut cancelled: impl FnMut() -> Result<bool>,
+    ) -> Result<()> {
+        if cancelled()? {
+            return Ok(());
+        }
         if AssetService::new(self.database.clone())
             .get(asset_id)?
             .is_none()
@@ -144,11 +173,14 @@ impl MlService {
             return Err(Error::AssetNotFound);
         }
         let analysis = self.client.analyze(bytes)?;
+        if cancelled()? {
+            return Ok(());
+        }
         if self.has_model_analysis(asset_id, &analysis.model_version)? {
             return Ok(());
         }
         let inserted = self.persist_analysis(asset_id, analysis)?;
-        if !inserted.is_empty() {
+        if !inserted.is_empty() && !cancelled()? {
             self.assign_faces(&inserted)?;
         }
         Ok(())
@@ -156,10 +188,18 @@ impl MlService {
 
     pub fn handle_recluster_job(&self, job: &Job) -> Result<()> {
         let _: MlReclusterPayload = serde_json::from_str(&job.payload)?;
-        self.recluster()
+        let queue = JobQueue::new(self.database.clone());
+        self.recluster_cancellable(|| queue.cancellation_requested(&job.id))
     }
 
     pub fn recluster(&self) -> Result<()> {
+        self.recluster_cancellable(|| Ok(false))
+    }
+
+    pub fn recluster_cancellable(&self, mut cancelled: impl FnMut() -> Result<bool>) -> Result<()> {
+        if cancelled()? {
+            return Ok(());
+        }
         let Some(model_version) = self.current_model_version()? else {
             return Ok(());
         };
@@ -168,6 +208,7 @@ impl MlService {
             return Ok(());
         }
         let dimension = common_dimension(&rows)?;
+        validate_cluster_budget(rows.len(), dimension)?;
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
         let embeddings = rows
             .iter()
@@ -188,11 +229,19 @@ impl MlService {
             rejections: self.rejections(None)?,
             confirmed,
         })?;
+        if cancelled()? {
+            return Ok(());
+        }
         self.apply_full_clustering(response.assignments, response.new_clusters)
     }
 
     pub fn cluster_medoids(&self, model_version: &str) -> Result<Vec<ClusterMedoid>> {
         let rows = self.embedding_rows(model_version, Some(true))?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dimension = common_dimension(&rows)?;
+        validate_cluster_budget(rows.len(), dimension)?;
         let mut grouped = BTreeMap::<String, Vec<EmbeddingRow>>::new();
         for row in rows {
             if let Some(cluster_id) = &row.cluster_id {
@@ -351,14 +400,25 @@ impl MlService {
     }
 
     pub fn split_cluster(&self, cluster_id: &str, face_ids: &[String]) -> Result<ClusterSummary> {
-        if face_ids.is_empty() || face_ids.len() > 10_000 {
-            return Err(Error::InvalidMl("face_ids must not be empty".into()));
+        if face_ids.is_empty() || face_ids.len() > MAX_CLUSTER_ROWS {
+            return Err(Error::InvalidMl(
+                "face_ids must contain 1 to 512 entries".into(),
+            ));
+        }
+        Uuid::parse_str(cluster_id)
+            .map_err(|_| Error::InvalidMl("cluster_id must be a UUID".into()))?;
+        if face_ids
+            .iter()
+            .any(|face_id| Uuid::parse_str(face_id).is_err())
+        {
+            return Err(Error::InvalidMl("face_ids must be UUIDs".into()));
         }
         let unique = face_ids.iter().collect::<HashSet<_>>();
         if unique.len() != face_ids.len() {
             return Err(Error::InvalidMl("face_ids must be unique".into()));
         }
         let new_id = Uuid::now_v7().to_string();
+        let face_ids_json = serde_json::to_string(face_ids)?;
         self.database.with_connection_mut(|connection| {
             let transaction = connection.transaction()?;
             if transaction
@@ -370,36 +430,26 @@ impl MlService {
             {
                 return Err(Error::ClusterNotFound);
             }
-            let mut found = 0_usize;
-            {
-                let mut statement =
-                    transaction.prepare("SELECT cluster_id FROM faces WHERE id = ?1")?;
-                for face_id in face_ids {
-                    let current = statement
-                        .query_row([face_id], |row| row.get::<_, Option<String>>(0))
-                        .optional()?
-                        .ok_or(Error::FaceNotFound)?;
-                    if current.as_deref() != Some(cluster_id) {
-                        return Err(Error::InvalidMl("face does not belong to cluster".into()));
-                    }
-                    found += 1;
-                }
-            }
-            if found != face_ids.len() {
-                return Err(Error::FaceNotFound);
+            let found: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM faces
+                 WHERE cluster_id = ?1
+                   AND id IN (SELECT value FROM json_each(?2))",
+                params![cluster_id, &face_ids_json],
+                |row| row.get(0),
+            )?;
+            if found != face_ids.len() as i64 {
+                return Err(Error::InvalidMl("face does not belong to cluster".into()));
             }
             transaction.execute(
                 "INSERT INTO clusters(id, name, cover_face_id, created_by, created_at)
                  VALUES (?1, NULL, ?2, 'user', ?3)",
                 params![new_id, face_ids[0], timestamp(Utc::now())],
             )?;
-            for face_id in face_ids {
-                transaction.execute(
-                    "UPDATE faces SET cluster_id = ?2, state = 'confirmed', similarity = NULL
-                     WHERE id = ?1",
-                    params![face_id, new_id],
-                )?;
-            }
+            transaction.execute(
+                "UPDATE faces SET cluster_id = ?2, state = 'confirmed', similarity = NULL
+                 WHERE id IN (SELECT value FROM json_each(?1))",
+                params![&face_ids_json, new_id],
+            )?;
             transaction.commit()?;
             Ok(())
         })?;
@@ -413,7 +463,7 @@ impl MlService {
                 "SELECT id, asset_id, kind, bbox, det_conf, quality_flags, model_version,
                         cluster_id, state, similarity
                  FROM faces WHERE state = 'candidate'
-                 ORDER BY similarity DESC, id LIMIT 1000",
+                 ORDER BY similarity DESC, id LIMIT 512",
             )?;
             Ok(statement
                 .query_map([], face_from_row)?
@@ -691,11 +741,15 @@ impl MlService {
             };
             let sql = format!(
                 "SELECT id, embedding, model_version, cluster_id, state FROM faces
-                 WHERE embedding IS NOT NULL AND model_version = ?1{predicate} ORDER BY id"
+                 WHERE embedding IS NOT NULL AND model_version = ?1{predicate}
+                 ORDER BY id LIMIT ?2"
             );
             let mut statement = connection.prepare(&sql)?;
             let rows = statement
-                .query_map([model_version], embedding_from_row)?
+                .query_map(
+                    params![model_version, (MAX_CLUSTER_ROWS + 1) as i64],
+                    embedding_from_row,
+                )?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows.into_iter().map(decode_embedding_row).collect()
         })
@@ -722,26 +776,37 @@ impl MlService {
 
     fn rejections(&self, face_ids: Option<&[String]>) -> Result<Vec<[String; 2]>> {
         self.database.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT face_id, cluster_id FROM cluster_rejections ORDER BY face_id, cluster_id",
-            )?;
-            let filter = face_ids.map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
-            Ok(statement
-                .query_map([], |row| {
-                    Ok([row.get::<_, String>(0)?, row.get::<_, String>(1)?])
-                })?
-                .filter_map(|row| match row {
-                    Ok(pair)
-                        if filter
-                            .as_ref()
-                            .is_none_or(|ids| ids.contains(pair[0].as_str())) =>
-                    {
-                        Some(Ok(pair))
-                    }
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?)
+            let face_ids_json = face_ids.map(serde_json::to_string).transpose()?;
+            let predicate = if face_ids_json.is_some() {
+                " WHERE face_id IN (SELECT value FROM json_each(?1))"
+            } else {
+                ""
+            };
+            let sql = format!(
+                "SELECT face_id, cluster_id FROM cluster_rejections{predicate}
+                 ORDER BY face_id, cluster_id LIMIT {}",
+                MAX_CLUSTER_ROWS + 1
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let rows = if let Some(json) = &face_ids_json {
+                statement
+                    .query_map([json], |row| {
+                        Ok([row.get::<_, String>(0)?, row.get::<_, String>(1)?])
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                statement
+                    .query_map([], |row| {
+                        Ok([row.get::<_, String>(0)?, row.get::<_, String>(1)?])
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            if rows.len() > MAX_CLUSTER_ROWS {
+                return Err(Error::InvalidMl(
+                    "clustering rejections exceed the safety budget".into(),
+                ));
+            }
+            Ok(rows)
         })
     }
 
@@ -852,15 +917,60 @@ pub fn enqueue_analyze(database: &Database, asset_id: &str) -> Result<Job> {
     let payload = serde_json::to_string(&MlAnalyzePayload {
         asset_id: asset_id.to_owned(),
     })?;
-    JobQueue::new(database.clone()).enqueue(ML_ANALYZE_JOB_KIND, &payload, ML_ANALYZE_PRIORITY)
+    JobQueue::new(database.clone()).enqueue_unique_active(
+        ML_ANALYZE_JOB_KIND,
+        &payload,
+        ML_ANALYZE_PRIORITY,
+        ActiveJobKey::AssetId(asset_id),
+    )
+}
+
+/// Queues anonymous Vault analysis without reading or decrypting blob bytes in
+/// the request path.
+///
+/// `vault: no-log` — callers must not log returned payloads or identifiers.
+pub fn enqueue_vault_analyze_all(database: &Database) -> Result<Vec<Job>> {
+    let ids = database.with_connection(|connection| {
+        let mut statement = connection.prepare(
+            "SELECT a.id FROM assets a
+             WHERE a.lifecycle IN ('active','duplicate')
+               AND NOT EXISTS (SELECT 1 FROM faces f WHERE f.asset_id = a.id)
+               AND EXISTS (
+                 SELECT 1 FROM vault_blobs b
+                 WHERE b.asset_id = a.id AND b.kind = 'original'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM jobs j WHERE j.kind = ?1
+                   AND j.state IN ('queued','running')
+                   AND json_extract(j.payload, '$.asset_id') = a.id
+               )
+             ORDER BY a.id LIMIT ?2",
+        )?;
+        Ok(statement
+            .query_map(
+                params![ML_VAULT_ANALYZE_JOB_KIND, MAX_ANALYZE_ALL_BATCH as i64],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    })?;
+    let queue = JobQueue::new(database.clone());
+    ids.into_iter()
+        .map(|asset_id| {
+            let payload = serde_json::to_string(&MlAnalyzePayload {
+                asset_id: asset_id.clone(),
+            })?;
+            queue.enqueue_unique_active(
+                ML_VAULT_ANALYZE_JOB_KIND,
+                &payload,
+                ML_ANALYZE_PRIORITY,
+                ActiveJobKey::AssetId(&asset_id),
+            )
+        })
+        .collect()
 }
 
 pub fn enqueue_analyze_all(database: &Database) -> Result<Vec<Job>> {
-    let model_version = Settings::new(database.clone())
-        .ml_socket_path()?
-        .and_then(|path| MlClient::new(path).health().ok())
-        .and_then(|health| health.model_bundle.map(|bundle| bundle.version));
-    enqueue_analyze_all_for_model(database, model_version.as_deref())
+    enqueue_analyze_all_for_model(database, None)
 }
 
 pub fn enqueue_analyze_all_for_model(
@@ -880,12 +990,17 @@ pub fn enqueue_analyze_all_for_model(
                    AND j.state IN ('queued','running')
                    AND json_extract(j.payload, '$.asset_id') = a.id
                )
-             ORDER BY a.id",
+             ORDER BY a.id LIMIT ?3",
         )?;
         Ok(statement
-            .query_map(params![ML_ANALYZE_JOB_KIND, model_version], |row| {
-                row.get::<_, String>(0)
-            })?
+            .query_map(
+                params![
+                    ML_ANALYZE_JOB_KIND,
+                    model_version,
+                    MAX_ANALYZE_ALL_BATCH as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     })?;
     ids.into_iter()
@@ -894,11 +1009,28 @@ pub fn enqueue_analyze_all_for_model(
 }
 
 pub fn enqueue_recluster(database: &Database) -> Result<Job> {
-    JobQueue::new(database.clone()).enqueue(
+    JobQueue::new(database.clone()).enqueue_unique_active(
         ML_RECLUSTER_JOB_KIND,
         &serde_json::to_string(&MlReclusterPayload::default())?,
         ML_RECLUSTER_PRIORITY,
+        ActiveJobKey::Kind,
     )
+}
+
+fn validate_cluster_budget(rows: usize, dimension: usize) -> Result<()> {
+    let bytes = rows
+        .checked_mul(dimension)
+        .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+        .ok_or_else(|| Error::InvalidMl("clustering input size overflow".into()))?;
+    if rows > MAX_CLUSTER_ROWS
+        || dimension > MAX_EMBEDDING_DIMENSION
+        || bytes > MAX_CLUSTER_INPUT_BYTES
+    {
+        return Err(Error::InvalidMl(
+            "clustering input exceeds the safety budget".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub fn search_named_clusters(database: &Database, query: &str) -> Result<Vec<ClusterSummary>> {

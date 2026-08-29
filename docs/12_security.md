@@ -50,20 +50,43 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
   `Path=/api`、HTTPS 公開時は `Secure`。Web の setup / login response body に device
   token を返さず、JavaScript から保存・参照しない。
 - Cookie 認証の非 safe method は同一 authority の `Origin` を必須とする。
-- ネイティブは Bearer token を使い、OS secure storage に保存する。
+- ネイティブは Bearer token を使い、永続化する場合は OS secure storage に限る。M5 Androidは
+  Keystore未実装のため永続化せずRust process memoryのみに保持し、login/setup responseから
+  tokenをWebViewへ返さず、Rust bridgeだけがAuthorizationを付与する。再起動後は再ログインする。
+  Vault passwordをJavaScript Mapへ保存する生体認証代替は認証なしで読めるため禁止する。
 - ネイティブの接続先 URL は保存・読み出し・接続の各時点で検証する。`external` は
   `https` のみ。credential 埋め込み・query・fragment・path・制御文字を含む URL は拒否する
   (URL パーサは tab/改行を黙って除去するため、parse 前の生文字列で弾く)。
 - 接続先の選択順は **external → local**。平文 HTTP の `local` は自動選択せず、
-  使用のたびに利用者の明示確認を取る。
+  使用のたびに利用者の明示確認を取る。平文HTTPのhostはprivate/loopback/link-localの
+  IP literalまたはRFC `localhost`名だけを許可する。一般の`.local`/DNS hostnameはprobe後の
+  name rebindingで別IPへBearerを送れるため拒否し、hostnameにはHTTPSを必須とする。
 - クライアントは初回接続で server の `instance_id` を pin し、pin と一致しない server へは
   credential を送らない。到達性プローブは 2xx のみでは信用せず、response schema と
   `instance_id` を検証する。これは信頼できない Wi-Fi 上で攻撃者が同じ private IP に
   偽 server を立てる攻撃に対する防御であり、初回登録時のみ TOFU になる。
+- Android の native HTTP bridge は、identity 検証済み origin へプロセス中 1 回だけ bind し、
+  WebView からの自動再 bind を禁止する。request URL は join/正規化後の origin と `/api/`
+  境界を再検証し、encoded dot / slash / backslash を path に含む入力を拒否する。
+- native response は `Content-Length` を先に検査した上で chunk 読み込みへ固定上限を適用し、
+  未知長 response も上限超過時点で中止する。network call には有限の deadline、画像 decode
+  には dimension と allocation 上限を設ける。派生画像のnative受信上限は thumbnail 2 MiB、
+  preview 16 MiB とし、汎用API responseは4 MiBとする。
+- Android の原本は WebView IPC で Base64 全量化せず、native save dialog が返した保存先へ
+  直接 stream する。汎用 bridge から original endpoint を呼ぶことは禁止し、native download
+  command は正規化済みの main/Vault original path、UUID、headers、総byte数を再検証する。
+- Android汎用bridgeのrequestはBase64 IPC増幅を考慮し、multipart overhead込み17 MiBを
+  TypeScriptのArrayBuffer直後とRustのBase64 decode前/後で検査する。大容量uploadはnative
+  content-URI streaming commandが完成するまで拒否し、通常Web/serverの128 MiB上限と分離する。
 - token は URL query、WebSocket URL、HTML、通常ログ、error message に含めない。
 - WS の Cookie 認証でも同一 authority の `Origin` を要求する。
 - login/setup には失敗回数と同時 Argon2 実行数の上限を設ける。edge 側にも送信元 IP
   単位の rate limit を設ける。
+- server が proxy header を使うのは immediate peer が `ILLUMIA_TRUSTED_PROXY_CIDRS` に
+  含まれる場合だけとする。`X-Forwarded-For` は右端から trusted hop を除いて送信元を求め、
+  incoming headerへappendするproxy構成でも利用者指定の左端値をrate-limit keyにしない。
+  送信元bucketのmemory上限時は新規送信元を共有overflow bucketへ集約しない。最終失敗が最も古い
+  bucketをevictし、攻撃者がbucket上限を埋めても別の新規利用者へ失敗回数を継承させない。
 
 ## Pangolin / Newt で公開するときの必須チェック
 
@@ -91,11 +114,26 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
   `Referrer-Policy: no-referrer`, `Permissions-Policy` を全 response に付ける。
 - API response は既定で `Cache-Control: private, no-store`。認証済みの派生画像だけ
   private browser cache を許可し、共有 proxy cache には保存させない。
+- browser/WebView の認証済み Object URL cache は件数とBlob合計byte数の両方を制限する。
+  eviction・Vault lock・logoutではURL revokeとbyte会計を不可分に行い、Vault lockと競合した
+  in-flight responseを後からcacheへ追加しない。thumbnail/previewはbrowserでもresponse streamを
+  endpoint別上限までだけ読み、上限判定前に`Response.blob()`で全量bufferしない。
 - API body・配列・文字列・画像 dimension/decode allocation・検索結果・WS connection/frame に
   固定上限を設ける。上限超過は処理・allocation 前に 400/413/429 で拒否する。
-- 画像 decoder の同時実行数は job worker 数とは独立した process-wide 上限で制御する。
+- 画像原本のfile read、decoder、RGBA変換、resize、encode、ThumbHashの同時実行数は job
+  worker 数とは独立した process-wide 上限で制御する。permit待ちworkerが原本 `Vec` を
+  先に保持してはならない。
   Vault の暗号化 blob は固定長 channel でチャンク復号し、同時配信数を制限することで、
   大容量画像や slow client を組み合わせても平文全体や無制限の先読みを memory に保持しない。
+- HTTP connection は絶対寿命と bounded graceful drain を持つ。response body の frame timeout が
+  socket backpressure 中に poll されない場合でも slow client が connection/stream permit を無期限に
+  保持できないことを adversarial test する。Vault channel の連続fullにも短いdeadlineを設け、打切りは
+  正常EOFへ偽装せずbody errorで通知する。
+- 同期 SQLite mutex を取得する大規模 stack/cluster/list/search は bounded `spawn_blocking` admission
+  へ隔離し、Tokio worker を mutex wait や大量 row 反復で占有しない。
+- main ingest/export の大容量 file write・復号・`sync_all` は SQLite mutex/transaction の外で
+  完了させ、短い metadata commit だけを lock 内で行う。commit 失敗時は UUID 固有の新規 file を
+  rollback する。
 - user value は SQL bind parameter で渡す。LIKE wildcard は escape し、動的識別子は
   allowlist からのみ選ぶ。filesystem path は UUID と allowlist extension から生成し、
   DB 由来 relative path も component 単位で検証する。
@@ -122,15 +160,27 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 
 - runtime は非 root、`cap_drop: ALL`, `no-new-privileges`, read-only root filesystem、
   writable volume の限定、PID/CPU/memory 上限を既定とする。
+- server と ML sidecar は異なる UID を使い、共有するのは専用 group で保護した UDS directory
+  だけとする。ML へ application data volume を mount せず、model-only volume だけを read-only
+  mount する。
 - data directory は Unix では mode `0700`、DB と keyfile は `0600` とし、専用 UID/GID
   のみ読み書き可能にする。権限を変更できない共有 filesystem は公開運用に使わない。
   backup も同等に暗号化し、Vault keyfile と DB/blob を一緒に外部公開しない。
 - build context は `.env*`, key, DB, image library、Git metadata を除外する。
 - Cargo/npm/Python/Docker/GitHub Actions の dependency update と脆弱性監査を CI で行う。
   release job の token permission は job 単位の最小権限とし、SBOM/provenance を生成する。
+- Android signing key/passwordはnpm/Gradleやrepository codeを実行するbuild jobへ渡さない。
+  full CI済みunsigned artifactを別jobへ渡し、そのjobはrepositoryをcheckoutせず、署名と
+  fingerprint検証だけを行う。unsigned APKをGitHub Releaseへ添付しない。
 - Docker base imageとGitHub Actionはdigest / commit SHAへ固定し、Dependabotで追従する。
 - production artifact は GitHub Actions の固定 workflow だけで作り、review 済み commit と
   image digest を deployment 時に記録する。
+- production Compose は server/ML の repository と `@sha256:` を YAML 内で固定し、環境変数には
+  64桁 digest 本体だけを要求する。未設定時に
+  `latest` や local build へ fallback しない。production file に `build:` を置かず
+  `pull_policy: always` とする。起動 wrapper は両環境変数を 64-hex digest 形式で検証してから
+  `docker compose ... up --no-build` を実行する。local build は明示的な dev overlay にだけ置く。
+  model bundle も bundle 外の trusted digest/signature を pin する。
 
 ## 公開前の検証ゲート
 

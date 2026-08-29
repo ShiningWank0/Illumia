@@ -27,6 +27,11 @@ from .models import (
 
 MOCK_MODEL_VERSION = "mock-v1"
 EMBEDDING_DIM = 768
+MAX_MODEL_INPUT_DIMENSION = 4096
+MAX_MODEL_INPUT_PIXELS = 16_777_216
+MAX_EMBEDDING_DIMENSION = 4096
+MAX_DETECTOR_CANDIDATES = 4096
+MAX_ANALYSIS_INSTANCES = 256
 
 
 def _quality(
@@ -125,17 +130,32 @@ def _input_config(model: dict[str, Any]) -> dict[str, Any]:
     size = config.get("size")
     mean = config.get("mean")
     std = config.get("std")
+    try:
+        dimensions = (
+            [int(value) for value in size]
+            if isinstance(size, list)
+            and all(isinstance(value, int) and not isinstance(value, bool) for value in size)
+            else []
+        )
+        means = [float(value) for value in mean] if isinstance(mean, list) else []
+        standard_deviations = [float(value) for value in std] if isinstance(std, list) else []
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise BackendUnavailable("invalid preprocessing manifest") from exc
     if (
         config.get("layout") not in {"NCHW", "NHWC"}
         or config.get("dtype") != "float32"
         or config.get("color") not in {"RGB", "BGR"}
         or not isinstance(size, list)
         or len(size) != 2
+        or len(dimensions) != 2
         or not isinstance(mean, list)
         or len(mean) != 3
         or not isinstance(std, list)
         or len(std) != 3
-        or any(float(value) == 0.0 for value in std)
+        or any(not math.isfinite(value) for value in means + standard_deviations)
+        or any(value == 0.0 for value in standard_deviations)
+        or any(value <= 0 or value > MAX_MODEL_INPUT_DIMENSION for value in dimensions)
+        or math.prod(dimensions) > MAX_MODEL_INPUT_PIXELS
     ):
         raise BackendUnavailable("invalid preprocessing manifest")
     return config
@@ -191,6 +211,8 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, classes: np.ndarray, threshold: 
             for other in retained
         ):
             retained.append(index)
+            if len(retained) >= MAX_ANALYSIS_INSTANCES:
+                break
     return retained
 
 
@@ -218,7 +240,9 @@ class OnnxBackend:
             or not all(isinstance(output, str) and output for output in outputs)
             or classes != ["person", "head", "face"]
             or not isinstance(self._encoder.get("output"), str)
-            or int(self._encoder.get("dim", 0)) <= 0
+            or not isinstance(self._encoder.get("dim"), int)
+            or isinstance(self._encoder.get("dim"), bool)
+            or not 0 < self._encoder["dim"] <= MAX_EMBEDDING_DIMENSION
             or self._encoder.get("normalize") not in {"l2", "none"}
         ):
             raise BackendUnavailable("invalid model manifest")
@@ -230,7 +254,15 @@ class OnnxBackend:
         if not 0.0 <= nms_iou <= 1.0 or not 0.0 <= nms_conf <= 1.0:
             raise BackendUnavailable("invalid NMS manifest")
         providers = bundle.manifest.get("providers")
-        if not isinstance(providers, list) or "CPUExecutionProvider" not in providers:
+        if (
+            not isinstance(providers, list)
+            or len(providers) > 16
+            or any(
+                not isinstance(provider, str) or not 0 < len(provider) <= 256
+                for provider in providers
+            )
+            or "CPUExecutionProvider" not in providers
+        ):
             raise BackendUnavailable("CPU execution provider is required")
         available = set(runtime.get_available_providers())
         requested = tuple(str(provider) for provider in providers if str(provider) in available)
@@ -246,19 +278,20 @@ class OnnxBackend:
             return self._detector_session, self._encoder_session
         with self._load_lock:
             if self._detector_session is None:
-                detector_path = self.bundle.root / str(self._detector["file"])
-                encoder_path = self.bundle.root / str(self._encoder["file"])
+                detector_bytes = self.bundle.verified_bytes(str(self._detector["file"]))
+                encoder_bytes = self.bundle.verified_bytes(str(self._encoder["file"]))
                 try:
                     self._detector_session = self._runtime.InferenceSession(
-                        str(detector_path), providers=list(self.providers)
+                        detector_bytes, providers=list(self.providers)
                     )
                     self._encoder_session = self._runtime.InferenceSession(
-                        str(encoder_path), providers=list(self.providers)
+                        encoder_bytes, providers=list(self.providers)
                     )
                 except Exception as exc:
                     self._detector_session = None
                     self._encoder_session = None
                     raise BackendUnavailable("ONNX model loading failed") from exc
+                self.bundle.release_verified_bytes()
         return self._detector_session, self._encoder_session
 
     def _encode(self, crop: Image.Image, session: Any) -> bytes:
@@ -317,6 +350,9 @@ class OnnxBackend:
             raise BackendUnavailable("inconsistent detector outputs")
         confidence_threshold = float(nms_config.get("conf"))
         eligible = np.flatnonzero(scores >= confidence_threshold)
+        if len(eligible) > MAX_DETECTOR_CANDIDATES:
+            ranked = sorted(eligible, key=lambda index: (-float(scores[index]), int(index)))
+            eligible = np.asarray(ranked[:MAX_DETECTOR_CANDIDATES], dtype=np.intp)
         boxes = boxes[eligible]
         scores = scores[eligible]
         classes_array = classes_array[eligible]
@@ -369,9 +405,12 @@ class OnnxBackend:
         return Analysis(model_version=self.bundle.info.version, instances=tuple(instances))
 
 
-def select_backend(model_dir: Path | None = None) -> Backend:
+def select_backend(
+    model_dir: Path | None = None,
+    trusted_digests: set[str] | frozenset[str] | None = None,
+) -> Backend:
     """Select ONNX only after integrity and runtime checks; otherwise use mock."""
-    bundle = discover_bundle(model_dir)
+    bundle = discover_bundle(model_dir, trusted_digests)
     if bundle is None:
         return MockBackend()
     try:

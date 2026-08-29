@@ -6,7 +6,6 @@
 import { blake3 } from 'hash-wasm';
 
 import { isTauri, nativeFetch } from '$lib/platform/tauri';
-import { getNativeToken } from '$lib/platform/nativeAuth';
 import { getActiveBaseUrl } from '$lib/platform/connection';
 import { mapCluster, mapClusterAssets, mapClusters, mapSearchResult } from './mappers';
 import {
@@ -88,27 +87,26 @@ export function resolveBaseUrl(): string {
 
 /**
  * ネイティブ (アプリモード) 用 setup。X-Illumia-Auth-Mode: cookie を付けないため
- * サーバーは device token を body で返す。呼び出し側が secure storage に保存する。
+ * サーバーは device token を body で返すが、Android Rust bridge が response を捕捉し、
+ * WebView へは token を除いた成功応答だけを返す。
  */
-export async function nativeSetup(req: AuthRequest, setupToken?: string): Promise<string> {
+export async function nativeSetup(req: AuthRequest, setupToken?: string): Promise<void> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (setupToken) headers['X-Illumia-Setup-Token'] = setupToken;
-  const res = await request<{ token: string }>(resolveBaseUrl(), '/api/auth/setup', {
+  await request<Record<string, never>>(resolveBaseUrl(), '/api/auth/setup', {
     method: 'POST',
     headers,
     body: JSON.stringify(req)
   });
-  return res.token;
 }
 
-/** ネイティブ用 login。device token を body で受け取る。 */
-export async function nativeLogin(req: AuthRequest): Promise<string> {
-  const res = await request<{ token: string }>(resolveBaseUrl(), '/api/auth/login', {
+/** ネイティブ用 login。device token は Rust bridge が捕捉し、JS へ返さない。 */
+export async function nativeLogin(req: AuthRequest): Promise<void> {
+  await request<Record<string, never>>(resolveBaseUrl(), '/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(req)
   });
-  return res.token;
 }
 
 export interface RequestOptions {
@@ -128,11 +126,7 @@ export async function request<T>(
   const target = `${base}${path}`;
   const native = isTauri();
 
-  if (native) {
-    // ネイティブは Bearer 認証 (クロスオリジンのリモートサーバーへ接続)。
-    const token = getNativeToken();
-    if (token) headers.Authorization = `Bearer ${token}`;
-  } else if (typeof location !== 'undefined') {
+  if (!native && typeof location !== 'undefined') {
     // ブラウザは同一オリジン Cookie 認証を厳守する (docs/12)。
     const resolved = new URL(target, location.origin);
     if (resolved.origin !== location.origin) {

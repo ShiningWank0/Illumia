@@ -250,7 +250,6 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: install Android NDK
         run: |
           sdkmanager "ndk;26.1.10909125"
@@ -262,15 +261,9 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: apps/android/src-tauri
-      - name: restore signing keystore
-        if: needs.preflight.outputs.publish == 'true'
-        env:
-          KEYSTORE_B64: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_B64 }}
-        run: |
-          if [ -z "$KEYSTORE_B64" ]; then
-            echo "::error::ILLUMIA_ANDROID_KEYSTORE_B64 secret is not set"; exit 1
-          fi
-          echo "$KEYSTORE_B64" | base64 -d > apps/android/src-tauri/illumia.keystore
+      # full CI の Android gate と同一 lockfile が署名対象であることを build 直前にも確認する。
+      - name: verify audited Android lockfile
+        run: cargo metadata --manifest-path apps/android/src-tauri/Cargo.toml --locked --format-version 1 >/dev/null
       - name: build web frontend
         working-directory: web
         # npm ci はライフサイクルスクリプトを実行しない。esbuild 等の
@@ -285,76 +278,92 @@ jobs:
         working-directory: apps/android
         # Rust ターゲットは rust-toolchain アクションで導入済みなので --skip-targets-install。
         run: npm run tauri android init -- --ci --skip-targets-install
-      - name: configure release signing
-        if: needs.preflight.outputs.publish == 'true'
-        working-directory: apps/android/src-tauri/gen/android
-        env:
-          ILLUMIA_KEYSTORE_PASSWORD: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_PASSWORD }}
-          ILLUMIA_KEY_ALIAS: ${{ secrets.ILLUMIA_ANDROID_KEY_ALIAS }}
-        run: |
-          # keystore.properties を生成し、生成された app/build.gradle.kts に署名設定を注入する。
-          cat > keystore.properties <<EOF
-          password=$ILLUMIA_KEYSTORE_PASSWORD
-          keyAlias=$ILLUMIA_KEY_ALIAS
-          storeFile=$(cd ../.. && pwd)/illumia.keystore
-          EOF
-          # Python は必ず uv 経由 (AGENTS.md 6)。
-          uv run --no-project "$GITHUB_WORKSPACE/apps/android/scripts/inject-signing.py" \
-            app/build.gradle.kts
       - name: build APK
         working-directory: apps/android
         run: npm run tauri android build -- --apk
-      # 配布物の同一性を release notes へ記録する (SEC-007)。
-      - name: record APK fingerprints
-        if: needs.preflight.outputs.publish == 'true'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-apk-unsigned
+          path: apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+
+  # 依存package・Gradle pluginを実行するbuild jobへ署名鍵を渡さない。
+  # CI済みのunsigned APKだけを、repository codeをcheckoutしない専用jobで署名する。
+  android-sign:
+    needs: [preflight, ci, android]
+    if: >-
+      needs.preflight.outputs.android == 'true' &&
+      needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: android-apk-unsigned
+          path: unsigned
+      - name: sign and verify audited APKs
+        env:
+          KEYSTORE_B64: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_B64 }}
+          ILLUMIA_KEYSTORE_PASSWORD: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_PASSWORD }}
+          ILLUMIA_KEY_ALIAS: ${{ secrets.ILLUMIA_ANDROID_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          # apksigner は build-tools に含まれる。glob が外れて黙って
-          # "certs: unavailable" を書くことがあったため、明示的に探して
-          # 見つからなければ失敗させる (SEC-007 の記録要件)。
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$ILLUMIA_KEYSTORE_PASSWORD" ] || \
+             [ -z "$ILLUMIA_KEY_ALIAS" ]; then
+            echo "::error::Android signing secrets are not fully configured"; exit 1
+          fi
           apksigner=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" \
             -name apksigner -type f 2>/dev/null | sort -V | tail -1)
           if [ -z "$apksigner" ]; then
             echo "::error::apksigner が見つからない (build-tools 未導入)"; exit 1
           fi
-          echo "using: $apksigner"
-
-          mkdir -p fingerprints
+          mapfile -d '' apks < <(find unsigned -type f -name '*.apk' -print0)
+          if [ ${#apks[@]} -eq 0 ] || [ ${#apks[@]} -gt 4 ]; then
+            echo "::error::署名対象APKの個数が不正"; exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > illumia.keystore
+          chmod 600 illumia.keystore
+          cleanup() { rm -f illumia.keystore certs.txt; }
+          trap cleanup EXIT
+          mkdir -p signed fingerprints
           out=fingerprints/android-apk.txt
           : > "$out"
-          mapfile -d '' apks < <(
-            find apps/android/src-tauri/gen/android/app/build/outputs/apk \
-              -name '*.apk' -print0
-          )
-          if [ ${#apks[@]} -eq 0 ]; then
-            echo "::error::APK が見つからない"; exit 1
-          fi
           for apk in "${apks[@]}"; do
-            echo "file: $(basename "$apk")" >> "$out"
-            echo "sha256: $(sha256sum "$apk" | cut -d' ' -f1)" >> "$out"
-            # 署名の検証と証明書 fingerprint。失敗したら release を止める。
-            if ! "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1; then
-              echo "::error::APK の署名検証に失敗した: $apk"; cat /tmp/certs.txt; exit 1
+            size=$(stat -c '%s' "$apk")
+            if [ "$size" -le 0 ] || [ "$size" -gt 536870912 ]; then
+              echo "::error::署名対象APKのsizeが不正"; exit 1
             fi
-            grep -iE 'SHA-256 digest|SHA-1 digest|Signer #1 certificate DN' /tmp/certs.txt \
+            target="signed/$(basename "$apk")"
+            if [ -e "$target" ]; then
+              echo "::error::同名APKが複数の入力directoryに存在する"; exit 1
+            fi
+            "$apksigner" sign \
+              --ks illumia.keystore \
+              --ks-pass env:ILLUMIA_KEYSTORE_PASSWORD \
+              --ks-key-alias "$ILLUMIA_KEY_ALIAS" \
+              --out "$target" "$apk"
+            "$apksigner" verify --print-certs "$target" > certs.txt
+            echo "file: $(basename "$target")" >> "$out"
+            echo "sha256: $(sha256sum "$target" | cut -d' ' -f1)" >> "$out"
+            grep -iE 'SHA-256 digest|SHA-1 digest|Signer #1 certificate DN' certs.txt \
               >> "$out"
             echo >> "$out"
           done
-          if grep -qi 'unavailable' "$out"; then
-            echo "::error::証明書 fingerprint を記録できていない"; exit 1
-          fi
+          cleanup
+          trap - EXIT
           cat "$out"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: android-apk
           path: |
-            apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            signed/*.apk
             fingerprints/*
 
   # タグ push のとき、署名済み成果物だけを GitHub Release に添付する。
   # 未署名 desktop バイナリは対象外 (SEC-007)。
   publish-release:
-    needs: [preflight, ci, docker, desktop, android]
+    needs: [preflight, ci, docker, desktop, android, android-sign]
     if: >-
       always() && startsWith(github.ref, 'refs/tags/v') &&
       needs.ci.result == 'success' &&
@@ -373,6 +382,9 @@ jobs:
       - name: drop unsigned desktop artifacts
         run: |
           rm -rf artifacts/unsigned-desktop-* || true
+          # build jobのAPKは署名jobへの入力専用。Releaseへ添付するのは
+          # android-sign jobが生成した検証済みartifactだけに限定する。
+          rm -rf artifacts/android-apk-unsigned || true
           # docker build record は配布物ではないので添付しない。
           find artifacts -name '*.dockerbuild' -delete 2>/dev/null || true
           if compgen -G 'artifacts/unsigned-desktop-*' > /dev/null; then
@@ -382,6 +394,10 @@ jobs:
           if find artifacts -type f \( -name '*.exe' -o -name '*-macos-universal' \) \
               | grep -q .; then
             echo "::error::未署名の実行ファイルが配布対象に含まれている"; exit 1
+          fi
+          if find artifacts -type f -name '*.apk' \
+              ! -path 'artifacts/android-apk/*' | grep -q .; then
+            echo "::error::署名job外のAPKが配布対象に含まれている"; exit 1
           fi
           find artifacts -type f | sort
       - name: collect provenance records

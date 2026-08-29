@@ -8,9 +8,10 @@ use std::{
 
 use illumia_core::{
     assets::AssetService,
-    db::Database,
-    ml::{MlService, enqueue_analyze},
-    ml_client::{Error as ClientError, MlClient},
+    db::{Database, Error as DatabaseError},
+    jobs::JobQueue,
+    ml::{MlService, enqueue_analyze, enqueue_recluster},
+    ml_client::{ClusterMode, ClusterParams, ClusterRequest, Error as ClientError, MlClient},
 };
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use serde_json::{Value, json};
@@ -148,6 +149,72 @@ fn png() -> Vec<u8> {
 }
 
 #[test]
+fn parallel_ml_admission_is_idempotent_per_operation() {
+    let (_directory, database) = database();
+    let asset = AssetService::new(database.clone())
+        .ingest(&png(), "dedup.png", None)
+        .expect("asset should ingest")
+        .asset;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(17));
+    let mut workers = Vec::new();
+    for _ in 0..16 {
+        let worker_database = database.clone();
+        let worker_asset = asset.id.clone();
+        let worker_barrier = std::sync::Arc::clone(&barrier);
+        workers.push(thread::spawn(move || {
+            worker_barrier.wait();
+            let analyze = enqueue_analyze(&worker_database, &worker_asset)
+                .expect("analyze admission should succeed");
+            let recluster =
+                enqueue_recluster(&worker_database).expect("recluster admission should succeed");
+            (analyze.id, recluster.id)
+        }));
+    }
+    barrier.wait();
+    let results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("admission worker should finish"))
+        .collect::<Vec<_>>();
+    assert!(results.iter().all(|result| result.0 == results[0].0));
+    assert!(results.iter().all(|result| result.1 == results[0].1));
+    let active = JobQueue::new(database)
+        .list()
+        .expect("jobs should list")
+        .into_iter()
+        .filter(|job| {
+            matches!(
+                job.state,
+                illumia_core::jobs::JobState::Queued | illumia_core::jobs::JobState::Running
+            )
+        })
+        .count();
+    assert_eq!(active, 2);
+}
+
+#[test]
+fn clustering_request_rejects_rows_over_the_cpu_budget_before_connecting() {
+    let rows = illumia_core::ml::MAX_CLUSTER_ROWS + 1;
+    let request = ClusterRequest {
+        mode: ClusterMode::Full,
+        params: ClusterParams {
+            tau_high: None,
+            tau_low: None,
+            min_cluster_size: None,
+        },
+        embeddings: vec![vec![1.0]; rows],
+        shape: [rows, 1],
+        ids: (0..rows).map(|index| index.to_string()).collect(),
+        medoids: None,
+        rejections: Vec::new(),
+        confirmed: Vec::new(),
+    };
+    assert!(matches!(
+        MlClient::new("/definitely/missing.sock").cluster(&request),
+        Err(ClientError::InvalidEmbedding)
+    ));
+}
+
+#[test]
 fn analyze_jobs_persist_faces_and_assign_all_three_threshold_states() {
     let (directory, database) = database();
     let seed = AssetService::new(database.clone())
@@ -189,7 +256,7 @@ fn analyze_jobs_persist_faces_and_assign_all_three_threshold_states() {
             if path == "/ml/v1/health" {
                 json!({
                     "status":"ok", "backend":"onnx",
-                    "model_bundle":{"name":"test", "version":"test-v1", "sha256":"00"},
+                    "model_bundle":{"name":"test", "version":"test-v1", "sha256":"0000000000000000000000000000000000000000000000000000000000000000"},
                     "providers":["CPUExecutionProvider"]
                 })
             } else if path.starts_with("/ml/v1/analyze") {
@@ -363,6 +430,200 @@ fn client_reports_unavailable_and_timeout_separately() {
     let slow = MlClient::with_timeout(socket, Duration::from_millis(25));
     assert!(matches!(slow.health(), Err(ClientError::Timeout)));
     thread.join().expect("slow mock should finish");
+}
+
+#[test]
+fn client_absolute_deadline_rejects_slow_drip_response() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let socket = directory.path().join("drip.sock");
+    let listener = match UnixListener::bind(&socket) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("drip socket should bind: {error}"),
+    };
+    let thread = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("drip mock should accept");
+        let _ = read_request(&mut stream);
+        let body = br#"{"status":"ok","backend":"mock","model_bundle":null,"providers":[]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            std::str::from_utf8(body).expect("health body")
+        );
+        for byte in response.bytes() {
+            if stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    });
+    let client = MlClient::with_timeout(socket, Duration::from_millis(30));
+
+    assert!(matches!(client.health(), Err(ClientError::Timeout)));
+    thread.join().expect("drip mock should finish");
+}
+
+#[test]
+fn client_rejects_ambiguous_response_framing() {
+    for (index, ambiguous_header) in [
+        "Content-Length: 2\r\nContent-Length: 2",
+        "Content-Length: 2\r\nTransfer-Encoding: identity",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let socket = directory.path().join(format!("framing-{index}.sock"));
+        let listener = match UnixListener::bind(&socket) {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("framing socket should bind: {error}"),
+        };
+        let header = ambiguous_header.to_owned();
+        let thread = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("framing mock should accept");
+            let _ = read_request(&mut stream);
+            write!(stream, "HTTP/1.1 200 OK\r\n{header}\r\n\r\n{{}}")
+                .expect("ambiguous response should write");
+        });
+        assert!(matches!(
+            MlClient::new(socket).health(),
+            Err(ClientError::Protocol(_))
+        ));
+        thread.join().expect("framing mock should finish");
+    }
+}
+
+#[test]
+fn client_rejects_header_delimiter_beyond_the_header_budget() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let socket = directory.path().join("large-header.sock");
+    let listener = match UnixListener::bind(&socket) {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("large-header socket should bind: {error}"),
+    };
+    let thread = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("large-header mock should accept");
+        let _ = read_request(&mut stream);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nX-Fill: {}\r\nContent-Length: 2\r\n\r\n{{}}",
+            "a".repeat(64 * 1024)
+        );
+        let _ = stream.write_all(response.as_bytes());
+    });
+
+    assert!(matches!(
+        MlClient::new(socket).health(),
+        Err(ClientError::Protocol("headers too large"))
+    ));
+    thread.join().expect("large-header mock should finish");
+}
+
+#[test]
+fn client_rejects_unbounded_or_untrusted_sidecar_response_fields() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let Some(mock) = mock_or_skip(MockSidecar::new(
+        directory.path(),
+        3,
+        |index, _path, request| match index {
+            0 => json!({
+                "status":"ok", "backend":"onnx",
+                "model_bundle":{"name":"test", "version":"v1", "sha256":"short"},
+                "providers":[]
+            }),
+            1 => json!({
+                "model_version":"v1",
+                "instances":[{
+                    "kind":"face", "bbox":[0,0,1,1], "det_conf":1,
+                    "quality":{"passed":true,"flags":[]},
+                    "embedding":{"dtype":"f32","dim":4097,"b64":""}
+                }]
+            }),
+            _ => {
+                let requested_id = request["ids"][0].as_str().expect("request id");
+                json!({
+                    "assignments":[
+                        {"id":requested_id,"cluster":null,"state":"invented","similarity":0}
+                    ],
+                    "new_clusters":[]
+                })
+            }
+        },
+    )) else {
+        return;
+    };
+    let client = mock.client();
+    assert!(matches!(client.health(), Err(ClientError::Protocol(_))));
+    assert!(matches!(
+        client.analyze(b"not-used-by-mock"),
+        Err(ClientError::InvalidEmbedding)
+    ));
+    let request = ClusterRequest {
+        mode: ClusterMode::Full,
+        params: ClusterParams::default(),
+        embeddings: vec![vec![1.0]],
+        shape: [1, 1],
+        ids: vec!["face-1".into()],
+        medoids: None,
+        rejections: Vec::new(),
+        confirmed: Vec::new(),
+    };
+    assert!(matches!(
+        client.cluster(&request),
+        Err(ClientError::Protocol(_))
+    ));
+}
+
+#[test]
+fn clustering_reads_only_limit_plus_one_before_rejecting_persistent_overflow() {
+    let (_directory, database) = database();
+    let asset = AssetService::new(database.clone())
+        .ingest(&png(), "overflow.png", None)
+        .expect("asset should ingest")
+        .asset;
+    database
+        .with_connection(|connection| {
+            for _ in 0..=illumia_core::ml::MAX_CLUSTER_ROWS {
+                connection.execute(
+                    "INSERT INTO faces(id, asset_id, kind, bbox, det_conf, quality_flags,
+                       embedding, model_version, cluster_id, state)
+                     VALUES (?1, ?2, 'face', '[0,0,1,1]', 1, '[]', ?3,
+                             'overflow-v1', NULL, 'unassigned')",
+                    rusqlite::params![
+                        uuid::Uuid::now_v7().to_string(),
+                        asset.id,
+                        1.0_f32.to_le_bytes()
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .expect("overflow fixture should insert");
+
+    assert!(matches!(
+        MlService::new(database, MlClient::new("/definitely/missing.sock")).recluster(),
+        Err(DatabaseError::InvalidMl(_))
+    ));
+}
+
+#[test]
+fn split_cluster_rejects_oversized_or_non_uuid_input_before_database_work() {
+    let (_directory, database) = database();
+    let service = MlService::new(database, MlClient::new("/definitely/missing.sock"));
+    let cluster_id = uuid::Uuid::now_v7().to_string();
+    let too_many = (0..=illumia_core::ml::MAX_CLUSTER_ROWS)
+        .map(|_| uuid::Uuid::now_v7().to_string())
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        service.split_cluster(&cluster_id, &too_many),
+        Err(DatabaseError::InvalidMl(_))
+    ));
+    assert!(matches!(
+        service.split_cluster("not-a-uuid", &[uuid::Uuid::now_v7().to_string()]),
+        Err(DatabaseError::InvalidMl(_))
+    ));
 }
 
 fn png_with_marker(marker: u8) -> Vec<u8> {

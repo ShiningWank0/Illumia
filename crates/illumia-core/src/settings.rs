@@ -22,6 +22,8 @@ pub(crate) const DEFAULT_RETENTION_DAYS: u32 = 30;
 pub const MAX_RETENTION_DAYS: u32 = 36_500;
 pub const MIN_JOB_CONCURRENCY: u32 = 1;
 pub const MAX_JOB_CONCURRENCY: u32 = 64;
+/// ML workerは各々が最大128 MiBの原本を保持し得るため、汎用workerより厳しく制限する。
+pub const MAX_ML_CONCURRENCY: u32 = 4;
 pub const MIN_CLUSTER_SIZE_VALUE: u32 = 2;
 pub const MAX_CLUSTER_SIZE_VALUE: u32 = 100_000;
 pub const DEFAULT_ML_CONCURRENCY: u32 = 1;
@@ -121,7 +123,7 @@ impl Settings {
             ML_CONCURRENCY,
             self.get_u32(ML_CONCURRENCY, DEFAULT_ML_CONCURRENCY)?,
             MIN_JOB_CONCURRENCY,
-            MAX_JOB_CONCURRENCY,
+            MAX_ML_CONCURRENCY,
         )
     }
 
@@ -130,7 +132,7 @@ impl Settings {
             ML_CONCURRENCY,
             value,
             MIN_JOB_CONCURRENCY,
-            MAX_JOB_CONCURRENCY,
+            MAX_ML_CONCURRENCY,
         )?;
         self.set_u32(ML_CONCURRENCY, value)
     }

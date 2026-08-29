@@ -6,16 +6,18 @@
 //!   - `ILLUMIA_DATA_DIR` … データディレクトリ (既定: OS 標準のアプリデータ位置)
 //!   - **TCP を一切 bind しない**。HTTP listener は存在しない (docs/01 の必須要件)。
 //! - `ILLUMIA_DESKTOP_MODE=client-only`
-//!   - `ILLUMIA_SERVER_URL` … 接続先 (https のみ。平文 HTTP はループバックのみ)
-//!   - `ILLUMIA_DEVICE_TOKEN` … device token
+//!   - `ILLUMIA_SERVER_URL` … 接続先 (https 推奨。平文 HTTP は確認付き loopback のみ)
+//!   - password は terminal で echo 無し入力し、token/pin は OS secure storage へ保存する
 
-use std::sync::Arc;
+use std::{io::Write, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use illumia_desktop::{
     app::IllumiaApp,
-    backend::{self, Mode},
+    backend::{self, Mode, RemoteCredential},
+    credential_store,
 };
+use zeroize::Zeroize;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -52,14 +54,79 @@ fn resolve_mode() -> Result<Mode> {
             data_root: data_root()?,
         }),
         "client-only" => {
-            let base_url = std::env::var("ILLUMIA_SERVER_URL")
+            if std::env::var_os("ILLUMIA_DEVICE_TOKEN").is_some() {
+                bail!(
+                    "ILLUMIA_DEVICE_TOKEN は安全上の理由で廃止されました。環境変数を削除し、interactive login を使用してください"
+                );
+            }
+            let raw_base_url = std::env::var("ILLUMIA_SERVER_URL")
                 .context("client-only モードには ILLUMIA_SERVER_URL が必要です")?;
-            let token = std::env::var("ILLUMIA_DEVICE_TOKEN")
-                .context("client-only モードには ILLUMIA_DEVICE_TOKEN が必要です")?;
-            Ok(Mode::ClientOnly { base_url, token })
+            let base_url = backend::normalize_base_url(&raw_base_url)?;
+
+            if backend::is_insecure_loopback(&base_url)?
+                && !confirm(
+                    "警告: loopback でも HTTP 通信は暗号化されません。この接続を今回使用しますか? [y/N] ",
+                )?
+            {
+                bail!("平文 HTTP 接続は利用者に拒否されました");
+            }
+
+            let probed_instance_id = backend::probe_identity(&base_url)?;
+            let credential = match credential_store::load(&base_url)? {
+                Some(credential) if credential.instance_id() == probed_instance_id => credential,
+                Some(_) => {
+                    eprintln!(
+                        "保存済み pin と異なる server identity が応答しました: {probed_instance_id}"
+                    );
+                    if !confirm(
+                        "接続先を置き換えますか? 信頼できる server だと確認した場合だけ y を入力してください [y/N] ",
+                    )? {
+                        bail!("server identity mismatch のため credential を送信しませんでした");
+                    }
+                    login_and_store(&base_url, &probed_instance_id)?
+                }
+                None => {
+                    eprintln!("初回接続の server identity: {probed_instance_id}");
+                    if !confirm(
+                        "この identity を pin して login しますか? 信頼できる場合だけ y を入力してください [y/N] ",
+                    )? {
+                        bail!("初回 server identity が承認されませんでした");
+                    }
+                    login_and_store(&base_url, &probed_instance_id)?
+                }
+            };
+            Ok(Mode::ClientOnly {
+                base_url,
+                credential,
+            })
         }
         other => bail!("未知の ILLUMIA_DESKTOP_MODE: {other}"),
     }
+}
+
+fn login_and_store(base_url: &str, instance_id: &str) -> Result<RemoteCredential> {
+    let mut password = rpassword::prompt_password("Illumia password: ")
+        .context("password を安全に読み取れませんでした")?;
+    if password.is_empty() {
+        bail!("password は空にできません");
+    }
+    let result = backend::login(base_url, &password, instance_id);
+    password.zeroize();
+    let credential = result?;
+    credential_store::save(base_url, &credential)?;
+    Ok(credential)
+}
+
+fn confirm(prompt: &str) -> Result<bool> {
+    eprint!("{prompt}");
+    std::io::stderr()
+        .flush()
+        .context("確認 prompt を表示できない")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("確認入力を読み取れない")?;
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
 /// データディレクトリ。明示指定が無ければ OS 標準のアプリデータ位置を使う。

@@ -240,6 +240,17 @@ impl AuthService {
         Ok(())
     }
 
+    /// Revalidates an already-authenticated long-lived connection against the
+    /// process-local revocation cache without polling SQLite per connection.
+    pub fn verify_token_cached(&self, token: &str) -> ApiResult<()> {
+        let hash = token_hash(token).ok_or_else(ApiError::unauthorized)?;
+        if self.token_is_known(&hash)? {
+            Ok(())
+        } else {
+            Err(ApiError::unauthorized())
+        }
+    }
+
     pub fn devices(&self) -> ApiResult<Vec<Device>> {
         self.database
             .with_connection(|connection| {

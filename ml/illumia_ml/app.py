@@ -22,6 +22,31 @@ from .clustering import (
     validate_ids,
 )
 
+MAX_ANALYZE_BODY_BYTES = 128 * 1024 * 1024
+MAX_CLUSTER_BODY_BYTES = 32 * 1024 * 1024
+
+
+async def _bounded_body(request: Request, limit: int) -> bytes:
+    lengths = request.headers.getlist("content-length")
+    if len(lengths) > 1:
+        raise HTTPException(status_code=400, detail="duplicate content length")
+    if lengths:
+        try:
+            length = int(lengths[0], 10)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="invalid content length") from exc
+        if length < 0:
+            raise HTTPException(status_code=400, detail="invalid content length")
+        if length > limit:
+            raise HTTPException(status_code=413, detail="request body too large")
+
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(chunk) > limit - len(body):
+            raise HTTPException(status_code=413, detail="request body too large")
+        body.extend(chunk)
+    return bytes(body)
+
 
 def _analysis_json(analysis: Any) -> dict[str, Any]:
     return {
@@ -121,7 +146,7 @@ def create_app(*, manager: BackendManager | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=415, detail="content type must be application/octet-stream"
             )
-        body = await request.body()
+        body = await _bounded_body(request, MAX_ANALYZE_BODY_BYTES)
         if not body:
             raise HTTPException(status_code=422, detail="image body must not be empty")
         try:
@@ -132,7 +157,8 @@ def create_app(*, manager: BackendManager | None = None) -> FastAPI:
 
     @app.post("/ml/v1/cluster")
     async def cluster(request: Request) -> dict:
-        payload = _decode_request(request.headers.get("content-type", ""), await request.body())
+        body = await _bounded_body(request, MAX_CLUSTER_BODY_BYTES)
+        payload = _decode_request(request.headers.get("content-type", ""), body)
         try:
             return await run_in_threadpool(_cluster, payload, backend_manager)
         except (TypeError, ValueError, OverflowError) as exc:

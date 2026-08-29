@@ -9,11 +9,14 @@ repository.workspace = true
 anyhow = "1.0.104"
 axum = { version = "0.8.9", features = ["multipart", "ws"] }
 illumia-core = { path = "../illumia-core" }
+futures-util = "0.3"
+hyper = { version = "1.11.0", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1.20", features = ["http1", "http2", "server-auto", "service", "tokio"] }
 serde = "1.0.229"
 serde_json = "1.0.151"
 subtle = "2.6.1"
 tokio = { version = "1.53.1", features = ["full"] }
-tower-http = { version = "0.7.0", features = ["fs", "trace"] }
+tower-http = { version = "0.7.0", features = ["fs", "timeout", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
@@ -25,4 +28,3 @@ http-body-util = "0.1.4"
 tower = { version = "0.5.3", features = ["util"] }
 # WS connection flood の adversarial test 用 (docs/12: SEC-010)。
 tokio-tungstenite = "0.28"
-futures-util = "0.3"

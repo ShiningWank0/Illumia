@@ -5,7 +5,7 @@
 //! TCP は開かない (docs/01 の必須要件) ため、代替に TCP を使うことはしない。
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -16,16 +16,31 @@ use std::{
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_CLUSTER_ROWS: usize = 512;
+const MAX_EMBEDDING_DIMENSION: usize = 4_096;
+const MAX_CLUSTER_INPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_IDENTIFIER_BYTES: usize = 128;
+const MAX_TEXT_BYTES: usize = 256;
+const MAX_PROVIDERS: usize = 16;
+const MAX_QUALITY_FLAGS: usize = 32;
+const MAX_ANALYSIS_INSTANCES: usize = 256;
+const MAX_ANALYZE_INPUT_BYTES: usize = 128 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
-const MAX_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_HEALTH_RESPONSE_BYTES: usize = 64 * 1024;
+#[cfg(unix)]
+const MAX_ANALYZE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(unix)]
+const MAX_CLUSTER_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -191,11 +206,18 @@ impl MlClient {
     }
 
     pub fn health(&self) -> Result<Health> {
-        let body = self.request("GET", "/ml/v1/health", None, &[])?;
-        serde_json::from_slice(&body).map_err(Error::Json)
+        let health_client =
+            Self::with_timeout(self.socket_path.clone(), self.timeout.min(HEALTH_TIMEOUT));
+        let body = health_client.request("GET", "/ml/v1/health", None, &[])?;
+        let health: Health = serde_json::from_slice(&body).map_err(Error::Json)?;
+        validate_health(&health)?;
+        Ok(health)
     }
 
     pub fn analyze(&self, image_bytes: &[u8]) -> Result<Analysis> {
+        if image_bytes.is_empty() || image_bytes.len() > MAX_ANALYZE_INPUT_BYTES {
+            return Err(Error::InvalidEmbedding);
+        }
         let body = self.request(
             "POST",
             "/ml/v1/analyze?tagger=false",
@@ -203,6 +225,11 @@ impl MlClient {
             image_bytes,
         )?;
         let wire: AnalysisWire = serde_json::from_slice(&body).map_err(Error::Json)?;
+        if !valid_text(&wire.model_version, MAX_IDENTIFIER_BYTES)
+            || wire.instances.len() > MAX_ANALYSIS_INSTANCES
+        {
+            return Err(Error::InvalidEmbedding);
+        }
         let instances = wire
             .instances
             .into_iter()
@@ -219,15 +246,55 @@ impl MlClient {
             || request.shape != [request.embeddings.len(), request.shape[1]]
             || request.ids.len() != request.embeddings.len()
             || request
-                .embeddings
+                .ids
                 .iter()
-                .any(|embedding| embedding.len() != request.shape[1])
+                .any(|id| !valid_text(id, MAX_IDENTIFIER_BYTES))
+            || request.ids.iter().collect::<HashSet<_>>().len() != request.ids.len()
+            || request.embeddings.iter().any(|embedding| {
+                embedding.len() != request.shape[1]
+                    || embedding.iter().any(|value| !value.is_finite())
+            })
+            || request.medoids.as_ref().is_some_and(|medoids| {
+                medoids.len() > MAX_CLUSTER_ROWS
+                    || medoids.iter().any(|(id, embedding)| {
+                        !valid_text(id, MAX_IDENTIFIER_BYTES)
+                            || embedding.len() != request.shape[1]
+                            || embedding.iter().any(|value| !value.is_finite())
+                    })
+            })
+            || request.rejections.len() > MAX_CLUSTER_ROWS
+            || request.rejections.iter().any(|pair| {
+                pair.iter()
+                    .any(|value| !valid_text(value, MAX_IDENTIFIER_BYTES))
+            })
+            || request.confirmed.len() > MAX_CLUSTER_ROWS
+            || request
+                .confirmed
+                .iter()
+                .any(|id| !valid_text(id, MAX_IDENTIFIER_BYTES))
+        {
+            return Err(Error::InvalidEmbedding);
+        }
+        let bytes = request
+            .embeddings
+            .len()
+            .checked_mul(request.shape[1])
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or(Error::InvalidEmbedding)?;
+        if request.embeddings.len() > MAX_CLUSTER_ROWS
+            || request.shape[1] > MAX_EMBEDDING_DIMENSION
+            || bytes > MAX_CLUSTER_INPUT_BYTES
         {
             return Err(Error::InvalidEmbedding);
         }
         let encoded = serde_json::to_vec(request).map_err(Error::Json)?;
+        if encoded.len() > MAX_CLUSTER_INPUT_BYTES {
+            return Err(Error::InvalidEmbedding);
+        }
         let body = self.request("POST", "/ml/v1/cluster", Some("application/json"), &encoded)?;
-        serde_json::from_slice(&body).map_err(Error::Json)
+        let response: ClusterResponse = serde_json::from_slice(&body).map_err(Error::Json)?;
+        validate_cluster_response(&response, request)?;
+        Ok(response)
     }
 
     fn request(
@@ -259,13 +326,10 @@ impl MlClient {
         content_type: Option<&str>,
         body: &[u8],
     ) -> Result<Vec<u8>> {
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or(Error::Timeout)?;
         let mut stream = UnixStream::connect(&self.socket_path).map_err(map_io)?;
-        stream
-            .set_read_timeout(Some(self.timeout))
-            .map_err(map_io)?;
-        stream
-            .set_write_timeout(Some(self.timeout))
-            .map_err(map_io)?;
         let mut head = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
@@ -276,27 +340,170 @@ impl MlClient {
             head.push_str("\r\n");
         }
         head.push_str("\r\n");
-        stream.write_all(head.as_bytes()).map_err(map_io)?;
-        stream.write_all(body).map_err(map_io)?;
+        write_all_deadline(&mut stream, head.as_bytes(), deadline)?;
+        write_all_deadline(&mut stream, body, deadline)?;
+        set_write_deadline(&stream, deadline)?;
         stream.flush().map_err(map_io)?;
-        read_response(&mut stream)
+        let response_limit = if path == "/ml/v1/health" {
+            MAX_HEALTH_RESPONSE_BYTES
+        } else if path.starts_with("/ml/v1/analyze") {
+            MAX_ANALYZE_RESPONSE_BYTES
+        } else {
+            MAX_CLUSTER_RESPONSE_BYTES
+        };
+        read_response(&mut stream, deadline, response_limit)
     }
+}
+
+fn valid_text(value: &str, maximum: usize) -> bool {
+    !value.is_empty() && value.len() <= maximum && !value.chars().any(char::is_control)
+}
+
+fn validate_health(health: &Health) -> Result<()> {
+    if health.status != "ok"
+        || !matches!(health.backend.as_str(), "mock" | "onnx")
+        || (health.backend == "mock"
+            && (health.model_bundle.is_some() || !health.providers.is_empty()))
+        || (health.backend == "onnx"
+            && (health.model_bundle.is_none()
+                || !health
+                    .providers
+                    .iter()
+                    .any(|provider| provider == "CPUExecutionProvider")))
+        || health.providers.len() > MAX_PROVIDERS
+        || health
+            .providers
+            .iter()
+            .any(|provider| !valid_text(provider, MAX_TEXT_BYTES))
+        || health.model_bundle.as_ref().is_some_and(|bundle| {
+            !valid_text(&bundle.name, MAX_TEXT_BYTES)
+                || !valid_text(&bundle.version, MAX_IDENTIFIER_BYTES)
+                || bundle.sha256.len() != 64
+                || !bundle.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    {
+        return Err(Error::Protocol("invalid health response"));
+    }
+    Ok(())
+}
+
+fn validate_cluster_response(response: &ClusterResponse, request: &ClusterRequest) -> Result<()> {
+    if response.assignments.len() > request.embeddings.len()
+        || response.new_clusters.len() > request.embeddings.len()
+    {
+        return Err(Error::Protocol("cluster response exceeds row budget"));
+    }
+    let request_ids = request
+        .ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let mut assigned_ids = HashSet::new();
+    for assignment in &response.assignments {
+        if !request_ids.contains(assignment.id.as_str())
+            || !assigned_ids.insert(assignment.id.as_str())
+            || assignment
+                .cluster
+                .as_ref()
+                .is_some_and(|cluster| !valid_text(cluster, MAX_IDENTIFIER_BYTES))
+            || !matches!(
+                assignment.state.as_str(),
+                "auto" | "candidate" | "unassigned"
+            )
+            || !assignment.similarity.is_finite()
+            || !(-1.0..=1.0).contains(&assignment.similarity)
+            || (assignment.state == "unassigned") != assignment.cluster.is_none()
+        {
+            return Err(Error::Protocol("invalid cluster assignment"));
+        }
+    }
+
+    let mut temporary_ids = HashSet::new();
+    let mut all_members = HashSet::new();
+    let mut total_medoids = 0_usize;
+    for cluster in &response.new_clusters {
+        total_medoids = total_medoids
+            .checked_add(cluster.medoid_ids.len())
+            .ok_or(Error::Protocol("cluster response exceeds row budget"))?;
+        if !valid_text(&cluster.tmp_id, MAX_IDENTIFIER_BYTES)
+            || !temporary_ids.insert(cluster.tmp_id.as_str())
+            || cluster.member_ids.len() > MAX_CLUSTER_ROWS
+            || cluster.medoid_ids.len() > MAX_CLUSTER_ROWS
+            || cluster
+                .member_ids
+                .iter()
+                .any(|id| !request_ids.contains(id.as_str()) || !all_members.insert(id.as_str()))
+            || cluster
+                .medoid_ids
+                .iter()
+                .any(|id| !request_ids.contains(id.as_str()) || !cluster.member_ids.contains(id))
+        {
+            return Err(Error::Protocol("invalid new cluster response"));
+        }
+    }
+    if all_members.len() > request.embeddings.len() || total_medoids > request.embeddings.len() {
+        return Err(Error::Protocol("cluster response exceeds row budget"));
+    }
+    if request.mode == ClusterMode::Assign {
+        let allowed_clusters = request
+            .medoids
+            .iter()
+            .flat_map(|medoids| medoids.keys().map(String::as_str))
+            .collect::<HashSet<_>>();
+        if !response.new_clusters.is_empty()
+            || response.assignments.iter().any(|assignment| {
+                assignment
+                    .cluster
+                    .as_deref()
+                    .is_some_and(|cluster| !allowed_clusters.contains(cluster))
+            })
+        {
+            return Err(Error::Protocol("invalid assign response cluster"));
+        }
+    }
+    Ok(())
 }
 
 impl TryFrom<InstanceWire> for Instance {
     type Error = Error;
 
     fn try_from(wire: InstanceWire) -> Result<Self> {
-        if wire.embedding.dtype != "f32" || wire.embedding.dim == 0 {
+        let expected_bytes = wire
+            .embedding
+            .dim
+            .checked_mul(4)
+            .ok_or(Error::InvalidEmbedding)?;
+        let expected_b64 = expected_bytes
+            .div_ceil(3)
+            .checked_mul(4)
+            .ok_or(Error::InvalidEmbedding)?;
+        if wire.embedding.dtype != "f32"
+            || wire.embedding.dim == 0
+            || wire.embedding.dim > MAX_EMBEDDING_DIMENSION
+            || wire.embedding.b64.len() != expected_b64
+            || !matches!(wire.kind.as_str(), "person" | "head" | "face")
+            || wire.bbox.iter().any(|value| !value.is_finite())
+            || wire.bbox.iter().any(|value| !(0.0..=1.0).contains(value))
+            || wire.bbox[2] <= 0.0
+            || wire.bbox[3] <= 0.0
+            || wire.bbox[0] + wire.bbox[2] > 1.000_001
+            || wire.bbox[1] + wire.bbox[3] > 1.000_001
+            || !wire.det_conf.is_finite()
+            || !(0.0..=1.0).contains(&wire.det_conf)
+            || wire.quality.flags.len() > MAX_QUALITY_FLAGS
+            || wire
+                .quality
+                .flags
+                .iter()
+                .any(|flag| !valid_text(flag, MAX_TEXT_BYTES))
+        {
             return Err(Error::InvalidEmbedding);
         }
         let embedding = decode_base64(&wire.embedding.b64)?;
-        if embedding.len()
-            != wire
-                .embedding
-                .dim
-                .checked_mul(4)
-                .ok_or(Error::InvalidEmbedding)?
+        if embedding.len() != expected_bytes
+            || embedding.chunks_exact(4).any(|chunk| {
+                !f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]).is_finite()
+            })
         {
             return Err(Error::InvalidEmbedding);
         }
@@ -321,23 +528,66 @@ fn map_io(error: std::io::Error) -> Error {
     }
 }
 
-/// HTTP 応答を読む。transport 非依存にして、将来の named pipe 実装でも使える
-/// ようにする。
 #[cfg(unix)]
-fn read_response<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
+fn remaining(deadline: Instant) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(Error::Timeout)
+}
+
+#[cfg(unix)]
+fn set_read_deadline(stream: &UnixStream, deadline: Instant) -> Result<()> {
+    stream
+        .set_read_timeout(Some(remaining(deadline)?))
+        .map_err(map_io)
+}
+
+#[cfg(unix)]
+fn set_write_deadline(stream: &UnixStream, deadline: Instant) -> Result<()> {
+    stream
+        .set_write_timeout(Some(remaining(deadline)?))
+        .map_err(map_io)
+}
+
+#[cfg(unix)]
+fn write_all_deadline(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
+    while !bytes.is_empty() {
+        set_write_deadline(stream, deadline)?;
+        let written = stream.write(bytes).map_err(map_io)?;
+        if written == 0 {
+            return Err(Error::Protocol("incomplete request write"));
+        }
+        bytes = &bytes[written..];
+    }
+    Ok(())
+}
+
+/// HTTP 応答を absolute deadline と endpoint 別サイズ上限の内側で読む。
+#[cfg(unix)]
+fn read_response(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>> {
     let mut response = Vec::new();
     let header_end = loop {
-        if response.len() >= MAX_HEADER_BYTES {
-            return Err(Error::Protocol("headers too large"));
-        }
         let mut buffer = [0_u8; 8192];
+        set_read_deadline(stream, deadline)?;
         let count = stream.read(&mut buffer).map_err(map_io)?;
         if count == 0 {
             return Err(Error::Protocol("incomplete headers"));
         }
         response.extend_from_slice(&buffer[..count]);
         if let Some(position) = response.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position + 4;
+            let header_end = position + 4;
+            if header_end > MAX_HEADER_BYTES {
+                return Err(Error::Protocol("headers too large"));
+            }
+            break header_end;
+        }
+        if response.len() >= MAX_HEADER_BYTES {
+            return Err(Error::Protocol("headers too large"));
         }
     };
     let header = std::str::from_utf8(&response[..header_end])
@@ -353,12 +603,13 @@ fn read_response<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
-        if name.eq_ignore_ascii_case("transfer-encoding")
-            && !value.trim().eq_ignore_ascii_case("identity")
-        {
-            return Err(Error::Protocol("chunked response is unsupported"));
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(Error::Protocol("transfer encoding is unsupported"));
         }
         if name.eq_ignore_ascii_case("content-length") {
+            if content_length.is_some() {
+                return Err(Error::Protocol("duplicate content length"));
+            }
             content_length = Some(
                 value
                     .trim()
@@ -368,7 +619,7 @@ fn read_response<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
         }
     }
     let content_length = content_length.ok_or(Error::Protocol("missing content length"))?;
-    if content_length > MAX_RESPONSE_BYTES {
+    if content_length > max_response_bytes {
         return Err(Error::Protocol("response body too large"));
     }
     let mut body = response.split_off(header_end);
@@ -379,6 +630,7 @@ fn read_response<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
         let remaining = content_length - body.len();
         let mut buffer = [0_u8; 8192];
         let read_len = remaining.min(buffer.len());
+        set_read_deadline(stream, deadline)?;
         let count = stream.read(&mut buffer[..read_len]).map_err(map_io)?;
         if count == 0 {
             return Err(Error::Protocol("incomplete response body"));

@@ -1,4 +1,9 @@
-use std::{env, net::SocketAddr, path::PathBuf};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, anyhow};
 use illumia_core::sha2::{Digest, Sha256};
@@ -13,7 +18,7 @@ pub struct Config {
     pub web_dist: Option<PathBuf>,
     pub setup_token_hash: Option<[u8; 32]>,
     pub secure_cookies: bool,
-    pub trust_proxy_headers: bool,
+    pub(crate) trusted_proxy_cidrs: Vec<TrustedProxy>,
 }
 
 impl std::fmt::Debug for Config {
@@ -28,7 +33,7 @@ impl std::fmt::Debug for Config {
                 &self.setup_token_hash.map(|_| "[REDACTED]"),
             )
             .field("secure_cookies", &self.secure_cookies)
-            .field("trust_proxy_headers", &self.trust_proxy_headers)
+            .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
             .finish()
     }
 }
@@ -60,15 +65,78 @@ impl Config {
             })
             .transpose()?;
         let secure_cookies = boolean_env("ILLUMIA_SECURE_COOKIES", true)?;
-        let trust_proxy_headers = boolean_env("ILLUMIA_TRUST_PROXY_HEADERS", false)?;
+        if boolean_env("ILLUMIA_TRUST_PROXY_HEADERS", false)? {
+            return Err(anyhow!(
+                "ILLUMIA_TRUST_PROXY_HEADERS=true is unsafe and no longer supported; use \
+                 ILLUMIA_TRUSTED_PROXY_CIDRS"
+            ));
+        }
+        let trusted_proxy_cidrs = env::var("ILLUMIA_TRUSTED_PROXY_CIDRS")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|item| item.trim().parse::<TrustedProxy>())
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Self {
             data_dir,
             addr,
             web_dist,
             setup_token_hash,
             secure_cookies,
-            trust_proxy_headers,
+            trusted_proxy_cidrs,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedProxy {
+    network: IpAddr,
+    prefix: u8,
+}
+
+impl TrustedProxy {
+    pub(crate) fn contains(self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                let prefix = u32::from(self.prefix);
+                let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+                u32::from(network) & mask == u32::from(address) & mask
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let prefix = u32::from(self.prefix);
+                let mask = u128::MAX.checked_shl(128 - prefix).unwrap_or(0);
+                u128::from(network) & mask == u128::from(address) & mask
+            }
+            _ => false,
+        }
+    }
+}
+
+impl FromStr for TrustedProxy {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let (address, prefix) = value
+            .split_once('/')
+            .map_or((value, None), |(address, prefix)| (address, Some(prefix)));
+        let network = address
+            .parse::<IpAddr>()
+            .with_context(|| format!("invalid trusted proxy address {address}"))?;
+        let maximum = if network.is_ipv4() { 32 } else { 128 };
+        let prefix = prefix
+            .map(str::parse::<u8>)
+            .transpose()
+            .with_context(|| format!("invalid trusted proxy prefix in {value}"))?
+            .unwrap_or(maximum);
+        if prefix > maximum {
+            return Err(anyhow!("trusted proxy prefix is out of range in {value}"));
+        }
+        Ok(Self { network, prefix })
     }
 }
 

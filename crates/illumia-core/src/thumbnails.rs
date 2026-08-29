@@ -70,6 +70,9 @@ pub fn generate_thumbnails(database: &Database, asset_id: &str) -> Result<()> {
         return Ok(());
     }
 
+    // 原本Vecも最大128 MiBになるため、decodeだけでなくread前からpipeline permitを保持する。
+    // これにより多数のworkerがpermit待ちの間に原本を各自bufferすることを防ぐ。
+    let pipeline_permit = images::acquire_pipeline_permit();
     let source_path = database.data_root().join(asset.library_path);
     let source_bytes = match fs::read(source_path) {
         Ok(bytes) => bytes,
@@ -81,7 +84,7 @@ pub fn generate_thumbnails(database: &Database, asset_id: &str) -> Result<()> {
         }
         Err(error) => return Err(error.into()),
     };
-    let decoded = images::decode(&source_bytes, &asset.ext)?;
+    let decoded = images::decode_with_permit(&source_bytes, &asset.ext, pipeline_permit)?;
     let (source_width, source_height) = decoded.dimensions();
     let rgba = decoded.to_rgba8().into_raw();
 
@@ -136,7 +139,8 @@ pub(crate) fn generate_variants_in_memory(
     source_bytes: &[u8],
     extension: &str,
 ) -> Result<InMemoryVariants> {
-    let decoded = images::decode(source_bytes, extension)?;
+    let pipeline_permit = images::acquire_pipeline_permit();
+    let decoded = images::decode_with_permit(source_bytes, extension, pipeline_permit)?;
     let (source_width, source_height) = decoded.dimensions();
     let rgba = decoded.to_rgba8().into_raw();
     Ok(InMemoryVariants {

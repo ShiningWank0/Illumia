@@ -9,6 +9,11 @@ from dataclasses import dataclass
 
 from .models import QualityThresholds
 
+MAX_CLUSTER_ROWS = 512
+MAX_EMBEDDING_DIMENSION = 4096
+MAX_CLUSTER_VALUES = 8_388_608
+MAX_IDENTIFIER_LENGTH = 128
+
 
 @dataclass(frozen=True, slots=True)
 class ClusterParams:
@@ -25,8 +30,8 @@ def params_from_request(values: Mapping[str, object], defaults: QualityThreshold
     )
     if not 0.0 <= params.tau_low <= params.tau_high <= 1.0:
         raise ValueError("thresholds must satisfy 0 <= tau_low <= tau_high <= 1")
-    if params.min_cluster_size < 1:
-        raise ValueError("min_cluster_size must be positive")
+    if not 1 <= params.min_cluster_size <= MAX_CLUSTER_ROWS:
+        raise ValueError("min_cluster_size exceeds the clustering safety budget")
     return params
 
 
@@ -36,6 +41,8 @@ def decode_f32(value: object, shape: Sequence[object]) -> list[list[float]]:
     rows, dim = int(shape[0]), int(shape[1])
     if rows < 0 or dim <= 0:
         raise ValueError("invalid embedding shape")
+    if rows > MAX_CLUSTER_ROWS or dim > MAX_EMBEDDING_DIMENSION or rows * dim > MAX_CLUSTER_VALUES:
+        raise ValueError("embedding shape exceeds the clustering safety budget")
     if isinstance(value, str):
         import base64
 
@@ -85,30 +92,58 @@ def _medoid(members: Sequence[int], vectors: Sequence[Sequence[float]]) -> int:
     )
 
 
+def _centroid(members: Sequence[int], vectors: Sequence[Sequence[float]]) -> list[float]:
+    dimension = len(vectors[members[0]])
+    center = [0.0] * dimension
+    for member in members:
+        for index, value in enumerate(vectors[member]):
+            center[index] += value
+    divisor = float(len(members))
+    return _normalize([value / divisor for value in center])
+
+
 def _confirmed_ids(value: object) -> set[str]:
     if isinstance(value, dict):
-        return {str(item) for item in value}
-    if not isinstance(value, list):
+        items = list(value)
+    elif isinstance(value, list):
+        items = value
+    else:
         return set()
+    if len(items) > MAX_CLUSTER_ROWS:
+        raise ValueError("confirmed ids exceed the clustering safety budget")
     result: set[str] = set()
-    for item in value:
+    for item in items:
+        identifier: object
         if isinstance(item, list | tuple) and item:
-            result.add(str(item[0]))
+            identifier = item[0]
         elif isinstance(item, dict) and "id" in item:
-            result.add(str(item["id"]))
-        elif isinstance(item, str):
-            result.add(item)
+            identifier = item["id"]
+        else:
+            identifier = item
+        if not isinstance(identifier, str) or not 0 < len(identifier) <= MAX_IDENTIFIER_LENGTH:
+            raise ValueError("confirmed ids must be bounded strings")
+        result.add(identifier)
     return result
 
 
 def _rejection_pairs(value: object) -> set[tuple[str, str]]:
-    if not isinstance(value, list):
+    if value is None:
         return set()
-    return {
-        (str(item[0]), str(item[1]))
-        for item in value
-        if isinstance(item, list | tuple) and len(item) == 2
-    }
+    if not isinstance(value, list) or len(value) > MAX_CLUSTER_ROWS:
+        raise ValueError("rejections exceed the clustering safety budget")
+    result: set[tuple[str, str]] = set()
+    for item in value:
+        if (
+            not isinstance(item, list | tuple)
+            or len(item) != 2
+            or any(
+                not isinstance(part, str) or not 0 < len(part) <= MAX_IDENTIFIER_LENGTH
+                for part in item
+            )
+        ):
+            raise ValueError("rejections must contain bounded string pairs")
+        result.add((item[0], item[1]))
+    return result
 
 
 def _assignment(
@@ -141,28 +176,39 @@ def cluster_full(
     confirmed_ids = _confirmed_ids(confirmed)
     rejected = _rejection_pairs(rejections)
     available = [index for index, identifier in enumerate(ids) if identifier not in confirmed_ids]
+    available_set = set(available)
+    pair_candidates = sorted(
+        (
+            _similarity(normalized[left], normalized[right]),
+            -left,
+            -right,
+        )
+        for position, left in enumerate(available)
+        for right in available[position + 1 :]
+    )
     clusters: list[tuple[str, list[int], int]] = []
 
     while available:
         tmp_id = f"c{len(clusters)}"
         best_pair: tuple[float, int, int] | None = None
-        for position, left in enumerate(available):
-            if (ids[left], tmp_id) in rejected:
+        while pair_candidates:
+            candidate = pair_candidates.pop()
+            left, right = -candidate[1], -candidate[2]
+            if left not in available_set or right not in available_set:
                 continue
-            for right in available[position + 1 :]:
-                if (ids[right], tmp_id) in rejected:
-                    continue
-                candidate = (_similarity(normalized[left], normalized[right]), -left, -right)
-                if best_pair is None or candidate > best_pair:
-                    best_pair = candidate
+            if (ids[left], tmp_id) in rejected or (ids[right], tmp_id) in rejected:
+                continue
+            best_pair = candidate
+            break
         if best_pair is None or best_pair[0] < params.tau_low:
             break
         members = [-best_pair[1], -best_pair[2]]
+        available_set.difference_update(members)
         available = [index for index in available if index not in members]
         while available:
-            medoid = _medoid(members, normalized)
+            center = _centroid(members, normalized)
             choices = [
-                (_similarity(normalized[index], normalized[medoid]), -index, index)
+                (_similarity(normalized[index], center), -index, index)
                 for index in available
                 if (ids[index], tmp_id) not in rejected
             ]
@@ -172,6 +218,7 @@ def cluster_full(
             if similarity < params.tau_low:
                 break
             members.append(selected)
+            available_set.remove(selected)
             available.remove(selected)
         clusters.append((tmp_id, members, _medoid(members, normalized)))
 
@@ -230,7 +277,11 @@ def cluster_assign(
 def validate_ids(ids: object, vectors: Sequence[Sequence[float]]) -> list[str]:
     if not isinstance(ids, list) or len(ids) != len(vectors):
         raise ValueError("ids must match the embedding row count")
-    result = [str(identifier) for identifier in ids]
+    if any(not isinstance(identifier, str) for identifier in ids):
+        raise ValueError("ids must be strings")
+    result = ids
+    if any(not identifier or len(identifier) > MAX_IDENTIFIER_LENGTH for identifier in result):
+        raise ValueError("ids must be non-empty and bounded")
     if len(set(result)) != len(result):
         raise ValueError("ids must be unique")
     return result
@@ -239,9 +290,16 @@ def validate_ids(ids: object, vectors: Sequence[Sequence[float]]) -> list[str]:
 def decode_medoids(value: object, dim: int) -> dict[str, list[float]]:
     if not isinstance(value, dict):
         raise ValueError("assign mode requires medoids")
+    if len(value) > MAX_CLUSTER_ROWS:
+        raise ValueError("medoids exceed the clustering safety budget")
     result: dict[str, list[float]] = {}
     for cluster, encoded in value.items():
-        result[str(cluster)] = decode_f32(encoded, [1, dim])[0]
+        if not isinstance(cluster, str):
+            raise ValueError("medoid ids must be strings")
+        cluster_id = cluster
+        if not cluster_id or len(cluster_id) > MAX_IDENTIFIER_LENGTH:
+            raise ValueError("medoid ids must be non-empty and bounded")
+        result[cluster_id] = decode_f32(encoded, [1, dim])[0]
     return result
 
 
