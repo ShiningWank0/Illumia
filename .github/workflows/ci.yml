@@ -53,19 +53,6 @@ jobs:
           advanced-security: false
           annotations: true
 
-  dependency-review:
-    name: Dependency review
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Reject newly introduced high severity vulnerabilities
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
-        with:
-          fail-on-severity: high
-          license-check: false
-
   changes:
     runs-on: ubuntu-latest
     # release から呼ばれたときは paths-filter を通さず全ジョブを走らせる。
@@ -322,7 +309,7 @@ jobs:
   # ブランチ保護の必須チェックはこのジョブだけを指定する。
   # skip されたジョブは成功扱い、failure / cancelled があれば落とす。
   ci-ok:
-    needs: [workflow-security, dependency-review, changes, rust, web, android, ml, e2e, docker]
+    needs: [workflow-security, changes, rust, web, android, ml, e2e, docker]
     if: always()
     runs-on: ubuntu-latest
     steps:

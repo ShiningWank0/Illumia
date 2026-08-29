@@ -103,6 +103,8 @@
   required check にする。force-push と branch deletion は禁止する。
 - vulnerability alerts / Dependabot alerts、secret scanning、private vulnerability reporting
   を有効化する。公開前に Security タブで未解決 alert が 0 件であることを確認する。
+- Dependency Graphを有効化した後はPR差分のDependency Reviewもrequired checkへ追加する。
+  有効化前もCargo/npm/Pythonの全lockfile監査を `ci-ok` 内で必須とする。
 - 脆弱性報告は `SECURITY.md` に従い public Issue へ機密情報を書かない。
 - `CODEOWNERS` は security-sensitive な workflow、Docker、認証、Vault、native bridge を
   repository owner のレビュー対象として明示する。
