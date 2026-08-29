@@ -169,6 +169,9 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - build context は `.env*`, key, DB, image library、Git metadata を除外する。
 - Cargo/npm/Python/Docker/GitHub Actions の dependency update と脆弱性監査を CI で行う。
   release job の token permission は job 単位の最小権限とし、SBOM/provenance を生成する。
+- JavaScript/TypeScript、Python、Rust は CodeQL の `security-extended` query を
+  main / PR / 週次で実行する。Rust はこれに加えて clippy、RustSec、adversarial
+  integration test も必須とし、静的解析だけでruntime境界の検証を代替しない。
 - Android signing key/passwordはnpm/Gradleやrepository codeを実行するbuild jobへ渡さない。
   full CI済みunsigned artifactを別jobへ渡し、そのjobはrepositoryをcheckoutせず、署名と
   fingerprint検証だけを行う。unsigned APKをGitHub Releaseへ添付しない。
@@ -190,7 +193,10 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - `cargo audit`
 - Web の lint / `svelte-check` / unit test / build / `npm audit`
 - Python の `ruff check` / `ruff format --check` / test
-- `docker compose config`、Dockerfile/Compose lint、CI での multi-stage image build と scan
+- CodeQL code scanning に未解決の security alert がないこと
+- `docker compose config`、Dockerfile/Compose lint、CI での multi-stage image build と scan。
+  Trivy は未修正を含む `HIGH,CRITICAL` を失敗扱いにする。例外は vulnerability ID・根拠・
+  owner・失効期限を明示した期限付き allowlist としてレビューする
 - 認証なし、改ざん token、異なる Origin、oversize body、画像 bomb、SQLi metacharacter、
   path traversal、WS connection flood、Vault lock 中の 404 秘匿を含む adversarial test
 
@@ -206,7 +212,8 @@ Pangolin/Newt・回線・実機が無いと確認できない。**v0.2.0 はこ�
       (router の port forward、UPnP、IPv6 firewall を含め Pangolin を迂回する経路を閉じる)
 - [ ] 配布 APK を実機へ導入し、動作と署名証明書の fingerprint を確認する
 - [ ] reverse proxy の upload/body/idle timeout、rate limit、sensitive header のログ除外を確認する
-- [ ] private GitHub の Dependabot / code scanning / secret scanning alerts を確認する
+- [ ] GitHub の Dependabot / code scanning / secret scanning alerts を確認する
+- [ ] `main` ruleset で `ci-ok` / CodeQL を必須化し、force-push / deletion を禁止する
 
 コード側の防御 (認証境界・入力検証・資源上限・container 権限・supply chain gate) は
 CI で継続的に検証している。上記は「その外側」の設置作業であり、CI では代替できない。

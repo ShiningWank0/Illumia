@@ -12,12 +12,8 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual runs are always dry-runs, even when the selected ref is an existing tag.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: '成果物を公開せずビルドだけ検証する'
-        type: boolean
-        default: true
 
 permissions:
   contents: read
@@ -38,7 +34,7 @@ jobs:
       publish: ${{ steps.check.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - id: check
         run: |
           out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; echo "$1=$2"; }
@@ -48,7 +44,7 @@ jobs:
           [ -f apps/android/src-tauri/tauri.conf.json ] && out android true || out android false
           # Docker のリポジトリ名は小文字必須 (owner に大文字が含まれるため変換)
           out owner_lc "${GITHUB_REPOSITORY_OWNER,,}"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "${{ github.event_name }}" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             out version "${GITHUB_REF#refs/tags/}"
             out publish true
           else
@@ -59,7 +55,7 @@ jobs:
       # 不一致のまま publish すると、GHCR のタグと server が返す version がずれる。
       - name: verify component versions
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "${{ github.event_name }}" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             uv run --no-project scripts/check-versions.py --tag "${GITHUB_REF#refs/tags/}"
           else
             uv run --no-project scripts/check-versions.py
@@ -97,7 +93,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - if: matrix.image == 'illumia-ml' && needs.preflight.outputs.docker_ml != 'true'
         run: echo "skip=1" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         if: env.skip != '1'
 
       # scan 前に registry へ push しない。まずローカルへ load して Trivy を通す。
@@ -125,7 +121,7 @@ jobs:
           image-ref: ${{ matrix.image }}:scan
           format: table
           exit-code: '1'
-          ignore-unfixed: true
+          ignore-unfixed: false
           vuln-type: os,library
           severity: HIGH,CRITICAL
 
@@ -177,7 +173,7 @@ jobs:
           image-ref: ${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}
           format: table
           exit-code: '1'
-          ignore-unfixed: true
+          ignore-unfixed: false
           vuln-type: os,library
           severity: HIGH,CRITICAL
       - name: record digest
@@ -210,7 +206,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: build (macOS universal)
         if: matrix.name == 'macos'
         run: |
@@ -258,7 +254,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/android/src-tauri
       # full CI の Android gate と同一 lockfile が署名対象であることを build 直前にも確認する。
@@ -294,6 +290,9 @@ jobs:
       needs.preflight.outputs.android == 'true' &&
       needs.preflight.outputs.publish == 'true'
     runs-on: ubuntu-latest
+    # 署名secretは専用environmentへ隔離する。Repository settingsでこのenvironmentに
+    # release担当者のapproval ruleを設定する。
+    environment: release-signing
     permissions:
       contents: read
     steps:
@@ -365,7 +364,8 @@ jobs:
   publish-release:
     needs: [preflight, ci, docker, desktop, android, android-sign]
     if: >-
-      always() && startsWith(github.ref, 'refs/tags/v') &&
+      always() && needs.preflight.outputs.publish == 'true' &&
+      startsWith(github.ref, 'refs/tags/v') &&
       needs.ci.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
       (needs.android.result == 'success' || needs.docker.result == 'success')
