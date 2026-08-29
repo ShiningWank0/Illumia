@@ -10,8 +10,11 @@ Illumia は「サーバー 1 台 + 各端末のクライアント」という構
 | Android | クライアント | GitHub Release の APK (サイドロード) |
 | macOS / Windows | クライアント / all-in-one | 現状は自前ビルド (下記参照) |
 
-> リポジトリとGitHub Releaseはpublic。GHCR packageの公開状態はrelease notesを正とし、
-> pullが401になる環境でだけ `read:packages` 権限のPersonal Access Token (PAT)を使う。
+> リポジトリ、GitHub Release、GHCR packageは通常private。CI/CDの実行枠を確保するため
+> リポジトリを一時的にpublicへ切り替えることがあり、その期間中にGitHub Releaseを公開してもよい。
+> public期間中のReleaseは第三者から閲覧可能になるため、公開を意図した内容だけを含め、作業後は
+> repositoryをprivateへ戻す。GHCR packageはprivateを維持し、配布先はcollaboratorまたは
+> 最小権限のtokenを持つ利用者に限定する。
 
 ---
 
@@ -21,11 +24,11 @@ TrueNAS 等の常時稼働機に立てる。詳細な運用手順は
 [docker/README.md](../docker/README.md)、セキュリティ要件は
 [docs/12_security.md](12_security.md) を参照。
 
-### 1-1. GHCR の認証を確認する
+### 1-1. GHCR へ認証する
 
-public packageはログイン不要でpullできる。401が返る場合はGitHubの
-Settings → Developer settings → Personal access tokensで
-`read:packages` 権限のPATを作り、次のようにログインする。
+private packageをpullできるGitHub collaboratorのアカウントで、`read:packages` だけを持つ
+Personal Access Token (PAT)を作り、次のようにログインする。不要なrepository権限や
+`write:packages` は付けない。
 
 ```bash
 echo "<あなたのPAT>" | docker login ghcr.io -u <GitHubユーザー名> --password-stdin
@@ -107,7 +110,7 @@ Google Play には公開しないため、APK を直接インストールする�
 
 ### 3-1. APK をダウンロードする
 
-publicなGitHub Releaseからブラウザで取得する。
+権限のあるGitHubアカウントでprivate GitHub Releaseから取得する。
 
 1. <https://github.com/ShiningWank0/Illumia/releases/latest> を開く。
 2. `Assets` を展開し、`app-universal-release.apk` をタップする。

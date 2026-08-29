@@ -219,6 +219,12 @@ Pangolin/Newt・回線・実機が無いと確認できない。**v0.2.0 はこ�
 - [ ] reverse proxy の upload/body/idle timeout、rate limit、sensitive header のログ除外を確認する
 - [ ] GitHub の Dependabot / code scanning / secret scanning alerts を確認する
 - [ ] `main` ruleset で `ci-ok` / CodeQL を必須化し、force-push / deletion を禁止する
+- [ ] `release-signing` environment に required reviewer とAndroid署名secret 3点を設定し、
+      workflow_dispatchのdry-run成功後、tag releaseで署名fingerprintを照合する
+- [ ] CI枠確保のため一時的にpublicへ変更したrepositoryを、作業後にprivateへ戻す。public期間中に
+      GitHub Releaseを公開する場合は第三者から閲覧可能な内容だけであることを確認する。server / ML
+      のGHCR packageはprivateを維持し、許可したアカウントの `read:packages` tokenでrelease notes
+      記載のimmutable digestをpullできることを確認する
 
 コード側の防御 (認証境界・入力検証・資源上限・container 権限・supply chain gate) は
 CI で継続的に検証している。上記は「その外側」の設置作業であり、CI では代替できない。

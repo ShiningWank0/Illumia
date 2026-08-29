@@ -42,11 +42,12 @@ GitHub Secrets はテキストしか保持できないので、keystore を base
 base64 -i illumia-release.keystore | tr -d '\n' > illumia-keystore.b64
 ```
 
-## 3. GitHub Secrets に登録する
+## 3. `release-signing` environment に登録する
 
-リポジトリの **Settings → Secrets and variables → Actions → New repository secret**
-から、次の 3 つを登録する。`gh` CLI を使う場合は下のコマンドでもよい
-(パスワードは対話入力になる)。
+リポジトリの **Settings → Environments** で `release-signing` environment を作成し、
+公開リリースを承認する担当者を **Required reviewers** に登録する。その environment の
+**Environment secrets** として次の 3 つを登録する。repository / organization secret へは
+登録しない。これにより署名secretへ到達できるのは、承認後に実行される専用署名jobだけになる。
 
 | Secret 名 | 値 |
 |---|---|
@@ -54,19 +55,10 @@ base64 -i illumia-release.keystore | tr -d '\n' > illumia-keystore.b64
 | `ILLUMIA_ANDROID_KEYSTORE_PASSWORD` | 手順 1 で決めたパスワード |
 | `ILLUMIA_ANDROID_KEY_ALIAS` | `illumia` (手順 1 の `-alias` と同じ値) |
 
-```bash
-gh secret set ILLUMIA_ANDROID_KEYSTORE_B64 < illumia-keystore.b64
-gh secret set ILLUMIA_ANDROID_KEYSTORE_PASSWORD   # 入力を求められる
-gh secret set ILLUMIA_ANDROID_KEY_ALIAS --body illumia
-```
-
 ## 4. 登録できたか確認する
 
-```bash
-gh secret list
-```
-
-3 つ並べば完了。`base64` の中間ファイルは不要なので消す。
+`release-signing` environment の Environment secrets に3つ並び、Required reviewers が
+1人以上設定されていれば登録完了。`base64` の中間ファイルは不要なので消す。
 
 ```bash
 rm illumia-keystore.b64
@@ -83,11 +75,10 @@ Secrets が揃った状態で `vX.Y.Z` タグを push すると、release workfl
 署名jobはSHA-256と署名証明書のfingerprintを検証・記録し、unsigned APKはReleaseへ
 添付しない (docs/12: SEC-007)。
 
-タグを打つ前に、公開しない経路で全ジョブが通ることを確認できる:
-
-```bash
-gh workflow run release.yml --ref main -f dry_run=true
-```
+タグを打つ前に GitHub Actions の **Release → Run workflow** を `main` に対して実行し、
+全ジョブが通ることを確認する。`workflow_dispatch` は入力値にかかわらず常にdry-runで、
+imageのpush、APK署名、GitHub Release作成は行わない。公開はreview済みの `vX.Y.Z` tagを
+pushした場合だけ許可される。
 
 ## 配布後に fingerprint を確認する
 
