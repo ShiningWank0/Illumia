@@ -265,15 +265,20 @@ jobs:
     if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - image: illumia-server
             dockerfile: docker/Dockerfile.server
+            trivyignore: .trivyignore.server.yaml
           - image: illumia-ml
             dockerfile: docker/Dockerfile.ml
+            trivyignore: .trivyignore.ml.yaml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
       - name: validate production image and compose policy
         env:
           ILLUMIA_SERVER_DIGEST: '1111111111111111111111111111111111111111111111111111111111111111'
@@ -296,6 +301,8 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
       - name: scan ${{ matrix.image }} test image
+        env:
+          TRIVY_SHOW_SUPPRESSED: 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ matrix.image }}:ci
@@ -304,6 +311,7 @@ jobs:
           # 未修正でも既知の HIGH/CRITICAL を黙認しない。例外が必要なら
           # vulnerability ID・根拠・owner・期限を持つ allowlist を別途レビューする。
           ignore-unfixed: false
+          trivyignores: ${{ matrix.trivyignore }}
           vuln-type: os,library
           severity: HIGH,CRITICAL
 

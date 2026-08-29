@@ -1,0 +1,55 @@
+# Temporary, image-specific risk exceptions for Debian 13 packages present in python:3.12-slim.
+# CI keeps ignore-unfixed=false and shows every suppressed finding. New IDs and expired entries
+# fail automatically; the short expiry forces fixed packages and reachability changes to be reviewed.
+vulnerabilities:
+  - id: CVE-2025-69720
+    statement: >-
+      Owner: @ShiningWank0. The ML service has no terminal input and never invokes ncurses,
+      curses, readline, tic, or infocmp; the vulnerable parser is not reachable.
+    expired_at: 2026-09-29
+  - id: CVE-2026-41992
+    statement: >-
+      Owner: @ShiningWank0. The ML service never executes the system gzip binary and does not
+      accept gzip archives or Content-Encoding input; this package is not reachable.
+    expired_at: 2026-09-29
+  - id: CVE-2026-54369
+    statement: >-
+      Owner: @ShiningWank0. The read-only, non-root ML runtime never reads or writes POSIX ACLs;
+      no request or model path invokes the vulnerable libacl operation.
+    expired_at: 2026-09-29
+  - id: CVE-2026-11822
+    statement: >-
+      Owner: @ShiningWank0. The ML service does not import sqlite3, open SQLite databases, or
+      accept SQL; libsqlite is an unused Python runtime component.
+    expired_at: 2026-09-29
+  - id: CVE-2026-11824
+    statement: >-
+      Owner: @ShiningWank0. The ML service does not import sqlite3, open SQLite databases, or
+      accept SQL; libsqlite is an unused Python runtime component.
+    expired_at: 2026-09-29
+  - id: CVE-2026-13221
+    statement: &unused_perl >-
+      Owner: @ShiningWank0. The ML image never starts Perl or loads Perl regex, archive,
+      compression, or Storable modules; requests and model bundles cannot invoke Perl.
+    expired_at: 2026-09-29
+  - id: CVE-2026-42496
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-42497
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-48962
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-57432
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-57433
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-8376
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-9538
+    statement: *unused_perl
+    expired_at: 2026-09-29

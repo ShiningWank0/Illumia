@@ -2,7 +2,10 @@ FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd
 
 COPY --from=ghcr.io/astral-sh/uv:0.8.15@sha256:a5727064a0de127bdb7c9d3c1383f3a9ac307d9f2d8a391edc7896c54289ced0 /uv /uvx /bin/
 
-RUN groupadd --gid 2000 illumia-socket \
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 2000 illumia-socket \
     && groupadd --gid 10001 illumia \
     && useradd --uid 10001 --gid 10001 --groups 2000 --create-home --shell /usr/sbin/nologin illumia \
     && mkdir -p /app/ml /models /run/illumia \

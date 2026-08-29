@@ -84,6 +84,10 @@
   BuildKitで実imageをbuildし、TrivyでHIGH/CRITICALをscanする。
 - `release.yml`: タグ `v*` / 手動 (workflow_dispatch) で本番ビルド。
   公開は `v*` tag の push event からだけ許可し、手動実行は選択refがtagでも常にdry-runとする。
+  container は publish 時に1回だけbuildしてtag無しのcandidate digestとしてpushし、そのdigestを
+  Trivyでscanする。全container candidateのscanと他の配布build/sign jobの成功後、単一jobが
+  同じdigestへversion/`latest` tagを付ける。scan前に配布tagを付けたり、scan後に同じcontextを
+  再buildした別imageを配布したり、matrix途中で一部imageだけを先行公開したりしない。
   コンポーネント未実装の間は preflight 判定で該当ジョブを自動スキップする。
   成果物: Docker イメージ (ghcr: server / ml)、egui バイナリ (macOS universal / Windows)、
   Android APK (署名は GitHub Secrets)。

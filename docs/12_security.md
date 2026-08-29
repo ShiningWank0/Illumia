@@ -177,7 +177,10 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
   fingerprint検証だけを行う。unsigned APKをGitHub Releaseへ添付しない。
 - Docker base imageとGitHub Actionはdigest / commit SHAへ固定し、Dependabotで追従する。
 - production artifact は GitHub Actions の固定 workflow だけで作り、review 済み commit と
-  image digest を deployment 時に記録する。
+  image digest を deployment 時に記録する。container はtag無しcandidate digestとして1回だけbuildし、
+  registry上の同じdigestをscanする。全container candidateのscanと他の配布build/sign jobの
+  成功後に単一jobからのみversion/`latest` tagへpromoteする。scan前やmatrix途中にrelease tagを
+  公開せず、scan後の再buildで配布物を差し替えない。
 - production Compose は server/ML の repository と `@sha256:` を YAML 内で固定し、環境変数には
   64桁 digest 本体だけを要求する。未設定時に
   `latest` や local build へ fallback しない。production file に `build:` を置かず
@@ -196,7 +199,9 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - CodeQL code scanning に未解決の security alert がないこと
 - `docker compose config`、Dockerfile/Compose lint、CI での multi-stage image build と scan。
   Trivy は未修正を含む `HIGH,CRITICAL` を失敗扱いにする。例外は vulnerability ID・根拠・
-  owner・失効期限を明示した期限付き allowlist としてレビューする
+  owner・失効期限を明示した期限付き allowlist としてimage別にレビューし、suppressed findingも
+  CI logへ表示する。期限切れと新規IDは失敗扱いにし、修正版が出たIDは定期reviewでallowlistから
+  削除する
 - 認証なし、改ざん token、異なる Origin、oversize body、画像 bomb、SQLi metacharacter、
   path traversal、WS connection flood、Vault lock 中の 404 秘匿を含む adversarial test
 
