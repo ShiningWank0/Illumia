@@ -748,16 +748,14 @@ mod tests {
             let filler = Socket::new(Domain::UNIX, Type::STREAM, None).expect("filler socket");
             match filler.connect_timeout(&address, Duration::from_millis(5)) {
                 Ok(()) => fillers.push(filler),
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
+                // Linux can signal a full Unix accept queue as ETIMEDOUT/EAGAIN
+                // or as POLLHUP without a corresponding SO_ERROR. Once at least
+                // one connection is queued, either outcome proves saturation.
+                Err(_) if !fillers.is_empty() => {
                     saturated = true;
                     break;
                 }
-                Err(error) => panic!("accept queue saturation should be bounded: {error}"),
+                Err(error) => panic!("listener rejected the first filler connection: {error}"),
             }
         }
         assert!(saturated, "test did not saturate the unix accept queue");
