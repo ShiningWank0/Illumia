@@ -142,6 +142,7 @@ impl TestApp {
 async fn vault_api_full_transfer_and_visibility_flow() {
     let app = TestApp::new(Duration::from_secs(15 * 60));
     let auth = app.setup().await;
+    let vault_password = format!("test-vault-password-{}", Uuid::now_v7());
 
     let status = app
         .request(Method::GET, "/api/vault/status", Some(&auth), None, None)
@@ -169,7 +170,7 @@ async fn vault_api_full_transfer_and_visibility_flow() {
             "/api/vault/init",
             Some(&auth),
             None,
-            Some(json!({"password": "vault password"})),
+            Some(json!({"password": vault_password.as_str()})),
         )
         .await;
     assert_eq!(initialized.status, StatusCode::CREATED);
@@ -206,7 +207,7 @@ async fn vault_api_full_transfer_and_visibility_flow() {
             "/api/vault/unlock",
             Some(&auth),
             None,
-            Some(json!({"password": "vault password"})),
+            Some(json!({"password": vault_password.as_str()})),
         )
         .await;
     assert_eq!(unlocked.status, StatusCode::OK);
@@ -271,7 +272,7 @@ async fn vault_api_full_transfer_and_visibility_flow() {
         .await;
     assert_eq!(queued_analysis.status, StatusCode::ACCEPTED);
     assert_eq!(queued_analysis.json()["enqueued"], 1);
-    let queue_view = VaultHandle::unlock(app.root(), "vault password")
+    let queue_view = VaultHandle::unlock(app.root(), &vault_password)
         .expect("vault queue should open for test inspection");
     assert!(
         JobQueue::new(queue_view.db)

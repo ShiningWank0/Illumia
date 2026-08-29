@@ -142,9 +142,9 @@ async fn vault_downloads_use_a_bounded_global_stream_gate() {
     let path = std::env::temp_dir().join(format!("illumia-vault-stream-{}", Uuid::now_v7()));
     fs::create_dir_all(&path).expect("test directory should be created");
     let database = Database::open(&path).expect("main database should open");
-    core_vault::init(&path, "correct horse battery staple").expect("vault should initialize");
-    let vault =
-        VaultHandle::unlock(&path, "correct horse battery staple").expect("vault should unlock");
+    let password = format!("test-vault-password-{}", Uuid::now_v7());
+    core_vault::init(&path, &password).expect("vault should initialize");
+    let vault = VaultHandle::unlock(&path, &password).expect("vault should unlock");
     let plaintext = vec![0x5a; VAULT_BLOB_CHUNK_SIZE * 3 + 17];
     let blob_id = vault.write_blob(&plaintext).expect("blob should encrypt");
     let (events, _) = broadcast::channel(EVENT_BUFFER);

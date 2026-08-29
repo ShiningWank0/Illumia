@@ -738,12 +738,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("full.sock");
         let address = SockAddr::unix(&path).expect("unix socket address");
-        let _listener = std::os::unix::net::UnixListener::bind(&path)
-            .expect("listener should bind without accepting connections");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("listener socket");
+        listener.bind(&address).expect("listener should bind");
+        listener.listen(1).expect("listener should listen");
 
         let mut fillers = Vec::new();
         let mut saturated = false;
-        for _ in 0..1_024 {
+        for _ in 0..64 {
             let filler = Socket::new(Domain::UNIX, Type::STREAM, None).expect("filler socket");
             match filler.connect_timeout(&address, Duration::from_millis(5)) {
                 Ok(()) => fillers.push(filler),
