@@ -516,7 +516,11 @@ jobs:
             if [ "$size" -le 0 ] || [ "$size" -gt 536870912 ]; then
               echo "::error::署名対象APKのsizeが不正"; exit 1
             fi
-            target="signed/$(basename "$apk")"
+            target_name=$(basename "$apk")
+            if [[ ! "$target_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$ ]]; then
+              echo "::error::署名対象APKのfilenameが不正"; exit 1
+            fi
+            target="signed/$target_name"
             if [ -e "$target" ]; then
               echo "::error::同名APKが複数の入力directoryに存在する"; exit 1
             fi
@@ -526,11 +530,22 @@ jobs:
               --ks-key-alias "$ILLUMIA_KEY_ALIAS" \
               --out "$target" "$apk"
             "$apksigner" verify --print-certs "$target" > certs.txt
-            echo "file: $(basename "$target")" >> "$out"
-            echo "sha256: $(sha256sum "$target" | cut -d' ' -f1)" >> "$out"
-            grep -iE 'SHA-256 digest|SHA-1 digest|Signer #1 certificate DN' certs.txt \
-              >> "$out"
-            echo >> "$out"
+            mapfile -t cert_sha_lines < <(
+              grep -iE '^Signer #[0-9]+ certificate SHA-256 digest:' certs.txt || true
+            )
+            if [ "${#cert_sha_lines[@]}" -ne 1 ] ||
+               [[ ! "${cert_sha_lines[0]}" =~ ^Signer\ \#1\ certificate\ SHA-256\ digest:\ ([0-9A-Fa-f]{64})$ ]]; then
+              echo "::error::単一signerのSHA-256 fingerprintを取得できない"; exit 1
+            fi
+            cert_sha=${BASH_REMATCH[1]}
+            apk_sha=$(sha256sum "$target" | cut -d' ' -f1)
+            if [[ ! "$cert_sha" =~ ^[0-9A-Fa-f]{64}$ ]] ||
+               [[ ! "$apk_sha" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::APK provenanceのSHA-256形式が不正"; exit 1
+            fi
+            # Public provenance contains no certificate DN or legacy SHA-1.
+            printf 'file: %s\napk-sha256: %s\nsigning-certificate-sha256: %s\n\n' \
+              "$target_name" "$apk_sha" "${cert_sha,,}" >> "$out"
           done
           cleanup
           trap - EXIT
@@ -559,40 +574,119 @@ jobs:
       contents: write
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        continue-on-error: true
         with:
           path: artifacts
-      # 未署名 desktop バイナリは配布対象外 (SEC-007)。負の glob に頼らず、
-      # 取得後に明示的に削除し、残っていないことを検証してから添付する。
-      - name: drop unsigned desktop artifacts
+      # 配布対象を既知の署名済みAPKとprovenanceだけへallowlistする。
+      # downloadした全artifactをそのままReleaseへ渡さない (SEC-007)。
+      - name: stage allowlisted release assets
+        env:
+          EXPECT_ML: ${{ needs.preflight.outputs.docker_ml }}
+          EXPECT_ANDROID: ${{ needs.preflight.outputs.android }}
         run: |
-          rm -rf artifacts/unsigned-desktop-* || true
-          # build jobのAPKは署名jobへの入力専用。Releaseへ添付するのは
-          # android-sign jobが生成した検証済みartifactだけに限定する。
-          rm -rf artifacts/android-apk-unsigned || true
-          # docker build record は配布物ではないので添付しない。
-          find artifacts -name '*.dockerbuild' -delete 2>/dev/null || true
-          if compgen -G 'artifacts/unsigned-desktop-*' > /dev/null; then
-            echo "::error::未署名 desktop 成果物を除外できていない"; exit 1
+          set -euo pipefail
+          mkdir release-assets
+
+          # serverはreleaseの必須container。ML/Androidはpreflight結果と厳密に一致させる。
+          server_digest=artifacts/candidate-digest-illumia-server/illumia-server.txt
+          test -f "$server_digest"
+          cp -- "$server_digest" release-assets/
+
+          ml_digest=artifacts/candidate-digest-illumia-ml/illumia-ml.txt
+          if [ "$EXPECT_ML" = true ]; then
+            test -f "$ml_digest"
+            cp -- "$ml_digest" release-assets/
+          elif [ -e "$ml_digest" ]; then
+            echo "::error::preflight対象外のML provenanceが存在する"; exit 1
           fi
-          # 実行ファイル形式が紛れ込んでいないことも確認する。
-          if find artifacts -type f \( -name '*.exe' -o -name '*-macos-universal' \) \
-              | grep -q .; then
-            echo "::error::未署名の実行ファイルが配布対象に含まれている"; exit 1
+
+          apks=()
+          if [ -d artifacts/android-apk/signed ]; then
+            mapfile -d '' apks < <(
+              find artifacts/android-apk/signed -maxdepth 1 -type f -name '*.apk' -print0
+            )
           fi
-          if find artifacts -type f -name '*.apk' \
-              ! -path 'artifacts/android-apk/*' | grep -q .; then
-            echo "::error::署名job外のAPKが配布対象に含まれている"; exit 1
+          fingerprint_source=artifacts/android-apk/fingerprints/android-apk.txt
+          if [ "$EXPECT_ANDROID" = true ]; then
+            if [ "${#apks[@]}" -eq 0 ] || [ "${#apks[@]}" -gt 4 ] ||
+               [ ! -f "$fingerprint_source" ]; then
+              echo "::error::Android release artifactが不足または過剰"; exit 1
+            fi
+            cp -- "$fingerprint_source" release-assets/
+          elif [ "${#apks[@]}" -ne 0 ] || [ -e "$fingerprint_source" ]; then
+            echo "::error::preflight対象外のAndroid artifactが存在する"; exit 1
           fi
-          find artifacts -type f | sort
+          if [ "${#apks[@]}" -gt 4 ]; then
+            echo "::error::配布対象APKの個数が不正"; exit 1
+          fi
+
+          expected_pairs=$(mktemp)
+          recorded_pairs=$(mktemp)
+          expected_sorted=$(mktemp)
+          recorded_sorted=$(mktemp)
+          cleanup() {
+            rm -f "$expected_pairs" "$recorded_pairs" "$expected_sorted" "$recorded_sorted"
+          }
+          trap cleanup EXIT
+          for apk in "${apks[@]}"; do
+            name=$(basename "$apk")
+            if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$ ]] ||
+               [ -e "release-assets/$name" ]; then
+              echo "::error::配布対象APKのfilenameが不正または重複"; exit 1
+            fi
+            apk_sha=$(sha256sum "$apk" | cut -d' ' -f1)
+            printf '%s %s\n' "$name" "$apk_sha" >> "$expected_pairs"
+            cp -- "$apk" release-assets/
+          done
+
+          if [ "$EXPECT_ANDROID" = true ]; then
+            awk '
+              function bad() { exit 2 }
+              /^file: / {
+                if (state != 0) bad()
+                file = substr($0, 7)
+                if (file !~ /^[A-Za-z0-9][A-Za-z0-9._-]*\.apk$/) bad()
+                state = 1; next
+              }
+              /^apk-sha256: / {
+                if (state != 1) bad()
+                sha = substr($0, 13)
+                if (length(sha) != 64 || sha !~ /^[0-9a-f]+$/) bad()
+                print file " " sha
+                state = 2; next
+              }
+              /^signing-certificate-sha256: / {
+                if (state != 2) bad()
+                sha = substr($0, 29)
+                if (length(sha) != 64 || sha !~ /^[0-9a-f]+$/) bad()
+                state = 3; next
+              }
+              /^$/ {
+                if (state == 0) next
+                if (state != 3) bad()
+                state = 0; next
+              }
+              { bad() }
+              END { if (state != 0 && state != 3) bad() }
+            ' "$fingerprint_source" > "$recorded_pairs"
+            sort -u "$expected_pairs" > "$expected_sorted"
+            sort -u "$recorded_pairs" > "$recorded_sorted"
+            if [ "$(wc -l < "$recorded_sorted")" -ne "${#apks[@]}" ] ||
+               ! cmp -s "$expected_sorted" "$recorded_sorted"; then
+              echo "::error::署名済みAPKとfingerprint recordが一致しない"; exit 1
+            fi
+          fi
+          cleanup
+          trap - EXIT
+          find release-assets -maxdepth 1 -type f -print | sort
       - name: collect provenance records
         run: |
-          # digest / fingerprint は artifact 名のサブディレクトリ配下にある。
-          find artifacts -type f -name '*.txt' -exec cat {} + > provenance.txt || true
-          if [ ! -s provenance.txt ]; then
-            echo "::error::image digest / APK fingerprint を回収できていない (SEC-007)"
-            exit 1
-          fi
+          set -euo pipefail
+          : > provenance.txt
+          for record in release-assets/illumia-server.txt \
+            release-assets/illumia-ml.txt release-assets/android-apk.txt; do
+            [ ! -f "$record" ] || cat -- "$record" >> provenance.txt
+          done
+          test -s provenance.txt
           cat provenance.txt
       - name: compose provenance notes
         run: |
@@ -602,8 +696,7 @@ jobs:
             echo "- tag: \`${GITHUB_REF#refs/tags/}\`"
             echo "- commit: \`$GITHUB_SHA\`"
             echo
-            # download-artifact は artifact 名のサブディレクトリへ展開するので、
-            # トップレベルの glob では拾えない。再帰的に探す。
+            # allowlistでstage・検証したprovenanceだけを公開する。
             if [ -s provenance.txt ]; then
               echo '### container image digest / APK fingerprint'
               echo
@@ -615,20 +708,16 @@ jobs:
             echo "未署名の macOS / Windows デスクトップバイナリは配布対象外です"
             echo "(署名・公証の導入まで CI artifact 止まり → docs/12 SEC-007)。"
             echo
-            echo "## インターネット公開前に必要な未実施の検証"
+            echo "## 実環境ゲート"
             echo
-            echo "コード側の防御は CI で継続検証していますが、**設置環境に対する"
-            echo "次の検証は未実施**です。インターネットへ公開する前に必ず実施してください"
-            echo "(詳細: docs/12_security.md)。"
-            echo
-            echo "- Pangolin/Newt 配下の外部回線からの adversarial test"
-            echo "- 外部回線から origin IP / host port へ直接到達できないことの IPv4/IPv6 確認"
-            echo "- 配布 APK の実機動作と署名証明書 fingerprint の確認"
-            echo "- reverse proxy の timeout / rate limit / sensitive header ログ除外の確認"
+            echo "このReleaseは release-production 承認者がdocs/15のA/Bをprivate証跡で"
+            echo "確認した後に公開されています。endpoint等の機密情報は公開しません。"
+            echo "公開後はdocs/15のCでdigest、APK、GHCR権限、repository visibilityを照合し、"
+            echo "Cが成功するまでreleaseを完了扱いにしません。"
           } > release-notes.md
           cat release-notes.md
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
-          files: artifacts/**/*
+          files: release-assets/*
           body_path: release-notes.md
           generate_release_notes: true

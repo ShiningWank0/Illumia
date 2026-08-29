@@ -205,12 +205,15 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - 認証なし、改ざん token、異なる Origin、oversize body、画像 bomb、SQLi metacharacter、
   path traversal、WS connection flood、Vault lock 中の 404 秘匿を含む adversarial test
 
-## 公開前に必須の実環境検証 (v0.2.0 時点で未実施)
+## v1.0公開運用に必須の実環境検証と公開後照合 (v0.2.0 時点で未実施)
 
 以下は Illumia のコードではなく**設置環境**に対する検証であり、実際の
 Pangolin/Newt・回線・実機が無いと確認できない。**v0.2.0 はこれらを未実施のまま
-リリースしている**。インターネットへ公開する前に必ず実施すること。
-完了をもって v1.0 以降の公開運用へ進む。
+リリースしている**。`docs/15` のA/Bはインターネット公開前、Cは公開直後に実施し、
+Cの照合が完了するまでv1.0 releaseを完了扱いにしない。
+結果は [docs/15_release_evidence.md](15_release_evidence.md) の様式に従ってprivateに保管し、
+機密情報をIssue、PR、Actions logへ残さない。同手順のtag前準備、candidate生成後の承認前検証、
+公開後照合を混同しない。
 
 - [ ] Pangolin/Newt 配下の外部回線から adversarial test を実施する
 - [ ] 外部回線から origin IP / host port へ直接到達できないことを IPv4 / IPv6 双方で確認する
@@ -218,11 +221,15 @@ Pangolin/Newt・回線・実機が無いと確認できない。**v0.2.0 はこ�
 - [ ] 配布 APK を実機へ導入し、動作と署名証明書の fingerprint を確認する
 - [ ] reverse proxy の upload/body/idle timeout、rate limit、sensitive header のログ除外を確認する
 - [ ] GitHub の Dependabot / code scanning / secret scanning alerts を確認する
-- [ ] `main` ruleset で `ci-ok` / CodeQL を必須化し、force-push / deletion を禁止する
+- [ ] `main` ruleset で `ci-ok` / CodeQLを必須化し、force-push / deletionを禁止する。
+      Dependency Reviewを現在のvisibility / planで利用できる場合は、Dependency Graphを有効化し、
+      canary PR成功後に同checkも必須化する。利用できない場合は、依存変更時の対応ecosystem監査と
+      release full CIの全lockfile監査を `ci-ok` で維持する
 - [ ] `release-signing` environment に required reviewer とAndroid署名secret 3点を設定し、
       workflow_dispatchのdry-run成功後、tag releaseで署名fingerprintを照合する
 - [ ] `release-production` environment に required reviewer を設定し、上記の実環境項目と
-      全build/scan/sign成功を確認してからdigest promotion / GitHub Releaseを承認する
+      全build/scan/sign成功、candidate digest、署名済みActions artifactを確認してから
+      digest promotion / GitHub Releaseを承認する。公開後はdocs/15の手順Cで照合する
 - [ ] CI枠確保のため一時的にpublicへ変更したrepositoryを、作業後にprivateへ戻す。public期間中に
       GitHub Releaseを公開する場合は第三者から閲覧可能な内容だけであることを確認する。server / ML
       のGHCR packageはprivateを維持し、許可したアカウントの `read:packages` tokenでrelease notes

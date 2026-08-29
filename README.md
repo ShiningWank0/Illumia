@@ -38,6 +38,7 @@ Immich を基軸に、イラスト閲覧・漫画スタック・キャラクタ�
 | [12_security.md](docs/12_security.md) | 脅威モデル・公開前セキュリティゲート |
 | [13_model_requirements.md](docs/13_model_requirements.md) | MLモデルバンドル契約 |
 | [14_install.md](docs/14_install.md) | インストール・運用手順 |
+| [15_release_evidence.md](docs/15_release_evidence.md) | v1リリース検証記録・承認手順 |
 
 ## 開発
 
