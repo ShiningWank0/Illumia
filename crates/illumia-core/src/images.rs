@@ -2,11 +2,12 @@
 
 use std::{
     io::Cursor,
+    ops::Deref,
     path::Path,
     sync::{Condvar, LazyLock, Mutex},
 };
 
-use image::{DynamicImage, ImageFormat, ImageReader, Limits};
+use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader, Limits};
 
 use crate::db::{Error, Result};
 
@@ -18,14 +19,29 @@ pub const MAX_CONCURRENT_IMAGE_DECODES: usize = 2;
 pub const MAX_ORIGINAL_NAME_BYTES: usize = 1024;
 pub const MAX_ORIGINAL_NAME_CHARS: usize = 255;
 
-static DECODE_LIMITER: LazyLock<DecodeLimiter> = LazyLock::new(DecodeLimiter::new);
+static PIPELINE_LIMITER: LazyLock<DecodeLimiter> = LazyLock::new(DecodeLimiter::new);
 
 struct DecodeLimiter {
     active: Mutex<usize>,
     available: Condvar,
 }
 
-struct DecodePermit(&'static DecodeLimiter);
+pub struct ImagePipelinePermit(&'static DecodeLimiter);
+
+/// A decoded pixel buffer that owns its process-wide admission permit.
+/// The buffer therefore cannot outlive the concurrency slot that accounts for it.
+pub(crate) struct DecodedImage {
+    image: DynamicImage,
+    _permit: ImagePipelinePermit,
+}
+
+impl Deref for DecodedImage {
+    type Target = DynamicImage;
+
+    fn deref(&self) -> &Self::Target {
+        &self.image
+    }
+}
 
 impl DecodeLimiter {
     const fn new() -> Self {
@@ -35,7 +51,7 @@ impl DecodeLimiter {
         }
     }
 
-    fn acquire(&'static self) -> DecodePermit {
+    fn acquire(&'static self) -> ImagePipelinePermit {
         let mut active = self
             .active
             .lock()
@@ -47,11 +63,11 @@ impl DecodeLimiter {
                 .unwrap_or_else(|error| error.into_inner());
         }
         *active += 1;
-        DecodePermit(self)
+        ImagePipelinePermit(self)
     }
 }
 
-impl Drop for DecodePermit {
+impl Drop for ImagePipelinePermit {
     fn drop(&mut self) {
         let mut active = self
             .0
@@ -79,13 +95,30 @@ pub fn normalized_extension(original_name: &str) -> Result<String> {
     }
 }
 
-/// Decodes an image only with the parser selected by its validated extension.
+/// Validates an image and returns its dimensions while the process-wide permit
+/// remains held for the complete lifetime of the decoded pixel buffer.
 ///
 /// The initial format check prevents a file named as one supported type from
 /// reaching another decoder through content sniffing. Dimensions are inspected
 /// before the full pixel buffer is allocated.
-pub fn decode(bytes: &[u8], extension: &str) -> Result<DynamicImage> {
-    let _permit = DECODE_LIMITER.acquire();
+pub fn validate_and_dimensions(bytes: &[u8], extension: &str) -> Result<(u32, u32)> {
+    let image = decode_with_permit(bytes, extension, acquire_pipeline_permit())?;
+    let dimensions = image.dimensions();
+    drop(image);
+    Ok(dimensions)
+}
+
+/// Acquires one process-wide slot for a complete image processing pipeline.
+pub fn acquire_pipeline_permit() -> ImagePipelinePermit {
+    PIPELINE_LIMITER.acquire()
+}
+
+/// Decodes while a caller-owned permit remains held through later transforms.
+pub(crate) fn decode_with_permit(
+    bytes: &[u8],
+    extension: &str,
+    permit: ImagePipelinePermit,
+) -> Result<DecodedImage> {
     if bytes.is_empty() {
         return Err(Error::InvalidImage("image is empty".to_owned()));
     }
@@ -115,9 +148,13 @@ pub fn decode(bytes: &[u8], extension: &str) -> Result<DynamicImage> {
         ));
     }
 
-    reader(bytes, expected)
+    let image = reader(bytes, expected)
         .decode()
-        .map_err(|_| Error::InvalidImage("image data is invalid".to_owned()))
+        .map_err(|_| Error::InvalidImage("image data is invalid".to_owned()))?;
+    Ok(DecodedImage {
+        image,
+        _permit: permit,
+    })
 }
 
 fn reader(bytes: &[u8], format: ImageFormat) -> ImageReader<Cursor<&[u8]>> {
@@ -175,14 +212,23 @@ mod tests {
     #[test]
     fn extension_selects_the_only_allowed_decoder() {
         let bytes = png(1, 1);
-        assert!(decode(&bytes, "png").is_ok());
-        assert!(matches!(decode(&bytes, "jpg"), Err(Error::InvalidImage(_))));
+        assert_eq!(
+            validate_and_dimensions(&bytes, "png").expect("valid one-pixel PNG"),
+            (1, 1)
+        );
+        assert!(matches!(
+            validate_and_dimensions(&bytes, "jpg"),
+            Err(Error::InvalidImage(_))
+        ));
     }
 
     #[test]
     fn dimensions_and_filename_metadata_are_bounded() {
         let bytes = png(MAX_IMAGE_DIMENSION + 1, 1);
-        assert!(matches!(decode(&bytes, "png"), Err(Error::InvalidImage(_))));
+        assert!(matches!(
+            validate_and_dimensions(&bytes, "png"),
+            Err(Error::InvalidImage(_))
+        ));
         assert!(normalized_extension("../../secret.png").is_err());
         assert!(normalized_extension("bad\nname.png").is_err());
         assert_eq!(

@@ -19,21 +19,21 @@ import {
 } from './connection';
 import { parseServerUrl, ServerUrlError } from './serverUrl';
 
-const nativeFetch = vi.hoisted(() => vi.fn());
-vi.mock('./tauri', () => ({ nativeFetch }));
+const { probeNativeServer, bindNativeServer } = vi.hoisted(() => ({
+  probeNativeServer: vi.fn(),
+  bindNativeServer: vi.fn()
+}));
+vi.mock('./tauri', () => ({ probeNativeServer, bindNativeServer }));
 
 const REAL_INSTANCE = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const ATTACKER_INSTANCE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
 function infoResponse(instanceId: string) {
   return {
-    ok: true,
-    json: async () => ({
-      setup_completed: true,
-      authenticated: false,
-      setup_token_required: false,
-      instance_id: instanceId
-    })
+    setup_completed: true,
+    authenticated: false,
+    setup_token_required: false,
+    instance_id: instanceId
   };
 }
 
@@ -63,7 +63,9 @@ const storage = new MemoryStorage();
 vi.stubGlobal('localStorage', storage);
 
 beforeEach(() => {
-  nativeFetch.mockReset();
+  probeNativeServer.mockReset();
+  bindNativeServer.mockReset();
+  bindNativeServer.mockResolvedValue(undefined);
   storage.clear();
 });
 
@@ -107,6 +109,16 @@ describe('URL 検証', () => {
     expect(() => parseServerUrl('http://example.com', { allowInsecurePrivate: true })).toThrow(
       ServerUrlError
     );
+    // `.local` は probe 後に mDNS/DNS が別IPへ変わり得るため、平文credential送信に使わない。
+    expect(() => parseServerUrl('http://photos.local', { allowInsecurePrivate: true })).toThrow(
+      ServerUrlError
+    );
+    expect(parseServerUrl('https://photos.local', { allowInsecurePrivate: true }).insecure).toBe(
+      false
+    );
+    expect(
+      parseServerUrl('http://illumia.localhost:2283', { allowInsecurePrivate: true }).insecure
+    ).toBe(true);
   });
 
   it('改ざんされた localStorage は読み出し時に拒否する', () => {
@@ -122,38 +134,39 @@ describe('接続先の選択', () => {
   };
 
   it('external を local より先に試す', async () => {
-    nativeFetch.mockResolvedValueOnce(infoResponse(REAL_INSTANCE));
+    probeNativeServer.mockResolvedValueOnce(infoResponse(REAL_INSTANCE));
     const result = await probeAndSelect(profile, { confirmInsecureLocal: async () => true });
 
     expect(result.baseUrl).toBe('https://illumia.example.com');
-    expect(nativeFetch).toHaveBeenCalledTimes(1);
-    expect(nativeFetch.mock.calls[0][0]).toBe('https://illumia.example.com/api/server/info');
+    expect(probeNativeServer).toHaveBeenCalledTimes(1);
+    expect(probeNativeServer.mock.calls[0][0]).toBe('https://illumia.example.com');
+    expect(bindNativeServer).toHaveBeenCalledWith('https://illumia.example.com', REAL_INSTANCE);
   });
 
   it('明示確認がなければ平文 HTTP の local を試さない', async () => {
-    nativeFetch.mockImplementationOnce(unreachable);
+    probeNativeServer.mockImplementationOnce(unreachable);
     // confirmInsecureLocal を渡さない = 確認が取れていない
     const result = await probeAndSelect(profile);
 
     expect(result.baseUrl).toBeNull();
     // external の 1 回だけ。local へは 1 度も接触しない。
-    expect(nativeFetch).toHaveBeenCalledTimes(1);
+    expect(probeNativeServer).toHaveBeenCalledTimes(1);
   });
 
   it('利用者が拒否した場合は平文 HTTP の local を試さない', async () => {
-    nativeFetch.mockImplementationOnce(unreachable);
+    probeNativeServer.mockImplementationOnce(unreachable);
     const confirm = vi.fn(async () => false);
     const result = await probeAndSelect(profile, { confirmInsecureLocal: confirm });
 
     expect(confirm).toHaveBeenCalled();
     expect(result.baseUrl).toBeNull();
-    expect(nativeFetch).toHaveBeenCalledTimes(1);
+    expect(probeNativeServer).toHaveBeenCalledTimes(1);
   });
 
   it('偽 local サーバー (pin 不一致) を採用しない', async () => {
     // 別 Wi-Fi にいて external へ届かず、攻撃者が同じ private IP で応答する状況。
-    nativeFetch.mockImplementationOnce(unreachable);
-    nativeFetch.mockResolvedValueOnce(infoResponse(ATTACKER_INSTANCE));
+    probeNativeServer.mockImplementationOnce(unreachable);
+    probeNativeServer.mockResolvedValueOnce(infoResponse(ATTACKER_INSTANCE));
 
     const result = await probeAndSelect(
       { ...profile, instanceId: REAL_INSTANCE },
@@ -165,7 +178,7 @@ describe('接続先の選択', () => {
   });
 
   it('2xx でも Illumia の schema でなければ採用しない', async () => {
-    nativeFetch.mockResolvedValueOnce({ ok: true, json: async () => ({ hello: 'world' }) });
+    probeNativeServer.mockResolvedValueOnce({ hello: 'world' });
     const result = await probeAndSelect(
       { external: 'https://illumia.example.com' },
       { confirmInsecureLocal: async () => true }
@@ -175,8 +188,8 @@ describe('接続先の選択', () => {
   });
 
   it('pin 済みサーバーと一致する local は明示確認の上で採用する', async () => {
-    nativeFetch.mockImplementationOnce(unreachable);
-    nativeFetch.mockResolvedValueOnce(infoResponse(REAL_INSTANCE));
+    probeNativeServer.mockImplementationOnce(unreachable);
+    probeNativeServer.mockResolvedValueOnce(infoResponse(REAL_INSTANCE));
 
     const result = await probeAndSelect(
       { ...profile, instanceId: REAL_INSTANCE },
@@ -188,10 +201,23 @@ describe('接続先の選択', () => {
   });
 
   it('初回接続では instance_id を pin する', async () => {
-    nativeFetch.mockResolvedValueOnce(infoResponse(REAL_INSTANCE));
+    probeNativeServer.mockResolvedValueOnce(infoResponse(REAL_INSTANCE));
     const result = await probeAndSelect({ external: 'https://illumia.example.com' });
 
     expect(result.pinned).toBe(REAL_INSTANCE);
+  });
+
+  it('Rust bridge が再 bind を拒否した接続先は採用しない', async () => {
+    probeNativeServer.mockResolvedValueOnce(infoResponse(REAL_INSTANCE));
+    bindNativeServer.mockRejectedValueOnce(new Error('binding is frozen'));
+
+    const result = await probeAndSelect({
+      external: 'https://illumia.example.com',
+      instanceId: REAL_INSTANCE
+    });
+
+    expect(result.baseUrl).toBeNull();
+    expect(result.identityMismatch).toBe(true);
   });
 });
 

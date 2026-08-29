@@ -1,4 +1,11 @@
-use std::{fs, io::Cursor, path::PathBuf};
+use std::{
+    fs,
+    io::Cursor,
+    path::PathBuf,
+    sync::mpsc,
+    thread,
+    time::{Duration as StdDuration, Instant},
+};
 
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use illumia_core::{
@@ -145,6 +152,56 @@ fn i2_only_later_duplicate_is_purged_property_cases() -> Result<()> {
 }
 
 #[test]
+fn i2_canonical_target_is_never_purged_and_legacy_tombstone_recovers() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let uploaded = instant(2025, 2, 2, 0);
+    let bytes = png(19);
+    let original = fixture
+        .assets
+        .ingest_at(&bytes, "canonical.png", Some(uploaded), uploaded)?
+        .asset;
+    let duplicate = fixture
+        .assets
+        .ingest_at(
+            &bytes,
+            "duplicate.png",
+            Some(uploaded),
+            uploaded + Duration::seconds(1),
+        )?
+        .asset;
+    let original_path = fixture.absolute_path(&original);
+
+    fixture.assets.trash_at(&original.id, uploaded)?;
+    fixture.force_expired(&original.id, "trashed", uploaded - Duration::seconds(1));
+    assert_eq!(fixture.purge.run_due_at(uploaded)?, 0);
+    assert!(matches!(
+        fixture.purge.purge_now(&original.id),
+        Err(Error::AssetNotFound)
+    ));
+    assert!(original_path.is_file());
+    assert!(fixture.assets.get(&duplicate.id)?.is_some());
+
+    // Simulate a tombstone left by an older build and verify startup recovery
+    // never reaches physical deletion while the reverse reference exists.
+    fixture.force_expired(&original.id, "purging", uploaded - Duration::seconds(1));
+    assert_eq!(fixture.purge.resume_purging()?, 1);
+    let recovered = fixture
+        .assets
+        .get(&original.id)?
+        .expect("referenced canonical should be restored");
+    assert_eq!(recovered.lifecycle, Lifecycle::Trashed);
+    assert!(original_path.is_file());
+    assert_eq!(
+        fixture
+            .assets
+            .get(&duplicate.id)?
+            .and_then(|asset| asset.duplicate_of),
+        Some(original.id)
+    );
+    Ok(())
+}
+
+#[test]
 fn i3_stack_references_block_duplicate_and_trashed_purge() -> Result<()> {
     let fixture = Fixture::new()?;
     let uploaded = instant(2025, 3, 1, 0);
@@ -172,6 +229,35 @@ fn i3_stack_references_block_duplicate_and_trashed_purge() -> Result<()> {
     assert!(fixture.assets.get(&trashed.id)?.is_some());
     assert!(fixture.absolute_path(&duplicate).is_file());
     assert!(fixture.absolute_path(&trashed).is_file());
+    Ok(())
+}
+
+#[test]
+fn i3_resume_purging_restores_stack_referenced_asset_without_deleting_anything() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let uploaded = instant(2025, 3, 2, 0);
+    let asset = fixture.ingest(32, "legacy-purging.png", uploaded);
+    let asset_path = fixture.absolute_path(&asset);
+    let stack = fixture
+        .stacks
+        .create("再開保護スタック", std::slice::from_ref(&asset.id))?;
+
+    // Simulate a crash tombstone created by an older build after stack validation.
+    fixture.force_expired(&asset.id, "purging", uploaded - Duration::seconds(1));
+    assert_eq!(fixture.purge.resume_purging()?, 1);
+
+    let restored = fixture
+        .assets
+        .get(&asset.id)?
+        .expect("stack-referenced tombstone must be restored");
+    assert_eq!(restored.lifecycle, Lifecycle::Active);
+    assert!(asset_path.is_file());
+    let restored_stack = fixture
+        .stacks
+        .get(&stack.id)?
+        .expect("stack must remain present");
+    assert_eq!(restored_stack.chapters[0].pages.len(), 1);
+    assert_eq!(restored_stack.chapters[0].pages[0].asset.id, asset.id);
     Ok(())
 }
 
@@ -488,7 +574,7 @@ fn migration_and_typed_settings_are_configured() -> Result<()> {
     fixture.database.with_connection(|connection| {
         assert_eq!(
             connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?,
-            2
+            5
         );
         assert_eq!(
             connection.query_row("PRAGMA foreign_keys", [], |row| row.get::<_, i64>(0))?,
@@ -499,6 +585,57 @@ fn migration_and_typed_settings_are_configured() -> Result<()> {
         assert_eq!(mode.to_ascii_lowercase(), "wal");
         Ok(())
     })
+}
+
+#[test]
+fn ingest_writes_uuid_file_before_waiting_for_the_database_mutex() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let database = fixture.database.clone();
+    let locked_database = database.clone();
+    let (locked_tx, locked_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let locker = thread::spawn(move || {
+        locked_database.with_connection(|_| {
+            locked_tx.send(()).expect("signal held database mutex");
+            release_rx.recv().expect("release database mutex");
+            Ok(())
+        })
+    });
+    locked_rx.recv().expect("database mutex should be held");
+
+    let bytes = png(201);
+    let ingest_database = database.clone();
+    let ingest = thread::spawn(move || {
+        AssetService::new(ingest_database).ingest_at(
+            &bytes,
+            "mutex-order.png",
+            Some(instant(2025, 1, 2, 3)),
+            instant(2025, 1, 2, 3),
+        )
+    });
+    let target_directory = database.data_root().join("library/2025/01");
+    let deadline = Instant::now() + StdDuration::from_secs(2);
+    while !target_directory
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_some())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "file I/O must complete before ingest waits for SQLite"
+        );
+        thread::sleep(StdDuration::from_millis(10));
+    }
+
+    release_tx.send(()).expect("release database mutex");
+    locker.join().expect("locker thread")?;
+    let result = ingest.join().expect("ingest thread")?;
+    assert!(
+        database
+            .data_root()
+            .join(result.asset.library_path)
+            .is_file()
+    );
+    Ok(())
 }
 
 fn asset_is_visible(database: &Database, id: &str) -> Result<bool> {

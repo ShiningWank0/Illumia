@@ -7,7 +7,7 @@ repository.workspace = true
 
 [dependencies]
 argon2 = "0.5.3"
-blake3 = "1.8.5"
+blake3 = "1.8.7"
 chacha20poly1305 = "0.11.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 fast_image_resize = "6.1.0"
@@ -25,6 +25,9 @@ tracing = "0.1.44"
 uuid = { version = "1.24.0", features = ["v7", "serde"] }
 webp = { version = "0.3.1", default-features = false }
 zeroize = { version = "1.9.0", features = ["derive"] }
+
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6.5"
 
 [lints]
 workspace = true

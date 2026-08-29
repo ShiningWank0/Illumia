@@ -4,6 +4,8 @@
 //
 // vault: no-log — asset id / ファイル名 / トークン / 検索語をログに出さない。
 
+import { blake3 } from 'hash-wasm';
+
 import { request, resolveBaseUrl } from './client';
 import { getVaultToken, vaultSession } from '$lib/vaultSession.svelte';
 import { isMock } from './index';
@@ -116,7 +118,7 @@ function unsupported(name: string): never {
 /**
  * vault ミラー用の IllumiaApi。Timeline / スタック / 検索コンポーネントを
  * そのまま再利用するため、同じインタフェースで /api/vault/... を叩く。
- * vault に存在しない操作 (upload / settings / auth) は投げる。
+ * vault に存在しない操作 (settings / auth) は投げる。
  */
 export function createHttpVaultClient(): IllumiaApi {
   const enc = encodeURIComponent;
@@ -154,8 +156,20 @@ export function createHttpVaultClient(): IllumiaApi {
       return `${b()}/api/vault/assets/${enc(id)}/original`;
     },
 
-    uploadAsset(): Promise<UploadResult> {
-      return unsupported('uploadAsset');
+    async uploadAsset(file: File): Promise<UploadResult> {
+      const buffer = new Uint8Array(await file.arrayBuffer());
+      const checksum = await blake3(buffer);
+      buffer.fill(0);
+      const form = new FormData();
+      form.append('file', file, file.name);
+      return vreq<UploadResult>('/api/vault/assets', {
+        method: 'POST',
+        headers: {
+          'X-Illumia-Checksum': checksum,
+          'X-Illumia-Taken-At': new Date(file.lastModified).toISOString()
+        },
+        body: form
+      });
     },
     assetsExist(): Promise<Record<string, string>> {
       return unsupported('assetsExist');

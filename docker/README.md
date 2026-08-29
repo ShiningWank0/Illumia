@@ -23,22 +23,25 @@ mock で動作しますが、リソース節約のため `ml` profile による 
 cp docker/.env.example docker/.env
 chmod 600 docker/.env
 # docker/.env の ILLUMIA_SETUP_TOKEN に `openssl rand -hex 32` の出力を設定する
-docker compose --env-file docker/.env -f docker/compose.yaml pull
-docker compose --env-file docker/.env -f docker/compose.yaml up -d
+# Release notes の server/ML image@sha256 digest も設定する
+./docker/compose-prod.sh pull
+./docker/compose-prod.sh up -d
 ```
 
-公開済みの `ghcr.io/shiningwank0/illumia-server:latest` イメージを使用します。
+`.env` の `ILLUMIA_SERVER_DIGEST` / `ILLUMIA_ML_DIGEST` を、YAML 内に固定した
+`ghcr.io/...@sha256:` へ連結した immutable reference だけを使用します。
+digest 未設定時や `.env.example` の zero digest のままでは安全側に pull が失敗します。
 状態とログは次のコマンドで確認できます。
 
 ```sh
-docker compose --env-file docker/.env -f docker/compose.yaml ps
-docker compose --env-file docker/.env -f docker/compose.yaml logs -f illumia-server
+./docker/compose-prod.sh ps
+./docker/compose-prod.sh logs -f illumia-server
 ```
 
 停止する場合は次を実行します。named volume は削除されないため、データは保持されます。
 
 ```sh
-docker compose --env-file docker/.env -f docker/compose.yaml down
+./docker/compose-prod.sh down
 ```
 
 `down -v` は永続データの volume も削除するため、データを失ってよい場合を除いて
@@ -49,14 +52,19 @@ docker compose --env-file docker/.env -f docker/compose.yaml down
 ML サイドカーを含めて pull・起動する場合は `ml` profile を指定します。
 
 ```sh
-docker compose --env-file docker/.env -f docker/compose.yaml --profile ml pull
-docker compose --env-file docker/.env -f docker/compose.yaml --profile ml up -d
+./docker/compose-prod.sh --profile ml pull
+./docker/compose-prod.sh --profile ml up -d
 ```
 
-モデルバンドルは `illumia_data` named volume 内の `models/`、コンテナから見て
-`/data/models/<bundle_name>/` に配置します。サイドカーからは読み取り専用でマウントされ、
-探索先は `ILLUMIA_MODEL_DIR=/data/models` です。必要なファイル構成と checksum の要件は
+モデルバンドルは application data と分離した `illumia_models` named volume、コンテナから見て
+`/models/<bundle_name>/` に配置します。サイドカーからは読み取り専用でマウントされ、
+main DB/library/Vault を含む `illumia_data` は一切 mount されません。探索先は
+`ILLUMIA_MODEL_DIR=/models` です。必要なファイル構成と checksum の要件は
 [モデル要件](../docs/13_model_requirements.md) を参照してください。
+
+配置後に `shasum -a 256 checksums.sha256` の値を `.env` の
+`ILLUMIA_TRUSTED_MODEL_DIGESTS` へ設定します。bundle 内 checksum だけでは真正性を保証しないため、
+この外部 pin が無い場合は mock backend へ fail closed します。
 
 起動後、認証済み device token を用いて設定 API に共有 UDS のパスを登録します。
 `ILLUMIA_DEVICE_TOKEN` は `POST /api/auth/login` で取得した token を設定してください。
@@ -125,15 +133,15 @@ ACLやfilesystemの制約でこの権限を設定できない保存先では起�
 から読み書きできる権限を設定します。その後、TrueNAS の Apps 画面から Custom App を
 追加し、次の値を設定します。
 
-- イメージ: `ghcr.io/shiningwank0/illumia-server:latest`
+- イメージ: Release notes の `ghcr.io/shiningwank0/illumia-server@sha256:<digest>`
 - コンテナポート: `2283`。host portは原則publishせず、必要ならloopbackだけ
 - ホストパス: `/mnt/pool/illumia`
 - コンテナ内パス: `/data`
 - 再起動ポリシー: `unless-stopped`
 - 環境変数: 下表。初回のみ `ILLUMIA_SETUP_TOKEN` も必須
 
-TrueNAS SCALE の「Install via YAML」を使う場合は、`compose.yaml` を基にしつつ、
-ローカルソースを必要とする `build:` セクションを削除し、`illumia_data:/data` を
+TrueNAS SCALE の「Install via YAML」を使う場合は、build を含まない production 用
+`compose.yaml` を基にしつつ、`illumia_data:/data` を
 `/mnt/pool/illumia:/data` に置き換えて登録します。画面名や入力欄は TrueNAS の
 バージョンによって異なるため、利用中のバージョンの Custom App ドキュメントも確認して
 ください。
@@ -147,7 +155,7 @@ TrueNAS SCALE の「Install via YAML」を使う場合は、`compose.yaml` を�
 | `ILLUMIA_WEB_DIST` | `/app/web` | サーバーが配信する Web SPA のビルド成果物ディレクトリ。 |
 | `ILLUMIA_SETUP_TOKEN` | 空 | 初回セットアップ用の32〜256 byte secret。初回完了後は削除。 |
 | `ILLUMIA_SECURE_COOKIES` | `true` | HTTPS公開時は必ずtrue。平文LAN直結時だけfalse。 |
-| `ILLUMIA_TRUST_PROXY_HEADERS` | `false` | 直接到達経路がなく、proxyが受信headerを除去・再設定すると確認した場合だけtrue。 |
+| `ILLUMIA_TRUSTED_PROXY_CIDRS` | 未設定 | client forwarding headerを除去・再設定するproxy peerだけをCIDR（comma区切り）で指定。未指定peerのheaderは無視する。 |
 
 先頭3項目は `docker/Dockerfile.server` に設定済みです。secretをCompose YAML、Git、
 shell history、通常logへ直接書かないでください。
@@ -171,11 +179,17 @@ docker run -d \
   --cpus 4 \
   --env-file docker/.env \
   -v illumia_data:/data \
-  ghcr.io/shiningwank0/illumia-server:latest
+  "ghcr.io/shiningwank0/illumia-server@sha256:${ILLUMIA_SERVER_DIGEST}"
 ```
 
-長期運用ではmutableな `latest` ではなく、確認済みrelease tag、可能なら
-`image@sha256:<digest>` を指定し、更新時にdigestを記録してください。
+`ILLUMIA_SERVER_DIGEST` は Release notes の server image の64桁 digest 本体を指定してください。
+mutable tag と `latest` は production では使用しません。
 
 リポジトリ内の Dockerfile は GitHub Actions で本番イメージを作るためのものです。
 ローカルビルドを行う場合は動作確認用途に限定し、ローカル成果物を配布しないでください。
+明示的な開発ビルドは `.env.example` を使う次の overlay にだけ存在します。
+
+```sh
+docker compose --env-file docker/.env.example \
+  -f docker/compose.yaml -f docker/compose.dev.yaml --profile ml build
+```

@@ -12,12 +12,12 @@ name: Release
 on:
   push:
     tags: ['v*']
+  # Manual runs are always dry-runs, even when the selected ref is an existing tag.
   workflow_dispatch:
-    inputs:
-      dry_run:
-        description: '成果物を公開せずビルドだけ検証する'
-        type: boolean
-        default: true
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -38,7 +38,7 @@ jobs:
       publish: ${{ steps.check.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
       - id: check
         run: |
           out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; echo "$1=$2"; }
@@ -48,7 +48,7 @@ jobs:
           [ -f apps/android/src-tauri/tauri.conf.json ] && out android true || out android false
           # Docker のリポジトリ名は小文字必須 (owner に大文字が含まれるため変換)
           out owner_lc "${GITHUB_REPOSITORY_OWNER,,}"
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "${{ github.event_name }}" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             out version "${GITHUB_REF#refs/tags/}"
             out publish true
           else
@@ -59,7 +59,7 @@ jobs:
       # 不一致のまま publish すると、GHCR のタグと server が返す version がずれる。
       - name: verify component versions
         run: |
-          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+          if [[ "${{ github.event_name }}" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
             uv run --no-project scripts/check-versions.py --tag "${GITHUB_REF#refs/tags/}"
           else
             uv run --no-project scripts/check-versions.py
@@ -81,9 +81,6 @@ jobs:
     permissions:
       contents: read
       packages: write
-    outputs:
-      server_digest: ${{ steps.record.outputs.illumia-server }}
-      ml_digest: ${{ steps.record.outputs.illumia-ml }}
     strategy:
       # digest を確実に記録するため直列化する。
       max-parallel: 1
@@ -91,21 +88,33 @@ jobs:
         include:
           - image: illumia-server
             dockerfile: docker/Dockerfile.server
+            trivyignore: .trivyignore.server.yaml
           - image: illumia-ml
             dockerfile: docker/Dockerfile.ml
+            trivyignore: .trivyignore.ml.yaml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - if: matrix.image == 'illumia-ml' && needs.preflight.outputs.docker_ml != 'true'
         run: echo "skip=1" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
         if: env.skip != '1'
+        with:
+          version: v0.36.1
 
-      # scan 前に registry へ push しない。まずローカルへ load して Trivy を通す。
-      - name: build for scanning
+      - name: calculate image name
+        id: image
         if: env.skip != '1'
         env:
-          # build record (*.dockerbuild) を artifact として上げない。
-          # Release に無関係なファイルが混ざるのを防ぐ。
+          IMAGE: ${{ env.REGISTRY }}/${{ needs.preflight.outputs.owner_lc }}/${{ matrix.image }}
+        run: |
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      # 手動実行はregistryへ一切書かず、release用Dockerfileのbuild/scanだけを検証する。
+      - name: build dry-run image for scanning
+        if: env.skip != '1' && needs.preflight.outputs.publish != 'true'
+        env:
           DOCKER_BUILD_SUMMARY: false
           DOCKER_BUILD_RECORD_UPLOAD: false
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
@@ -114,18 +123,32 @@ jobs:
           file: ${{ matrix.dockerfile }}
           load: true
           push: false
-          tags: ${{ matrix.image }}:scan
+          tags: ${{ matrix.image }}:release-dry-run
           build-args: SOURCE_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
-      - name: scan ${{ matrix.image }}
-        if: env.skip != '1'
+      - name: verify dry-run MiniZip attack surface is absent
+        if: >-
+          matrix.image == 'illumia-server' &&
+          needs.preflight.outputs.publish != 'true'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --entrypoint /bin/sh "$IMAGE:release-dry-run" -ceu '
+            ! command -v minizip
+            ! command -v miniunzip
+          '
+      - name: scan dry-run image
+        if: env.skip != '1' && needs.preflight.outputs.publish != 'true'
+        env:
+          TRIVY_SHOW_SUPPRESSED: 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ matrix.image }}:scan
+          image-ref: ${{ matrix.image }}:release-dry-run
           format: table
           exit-code: '1'
-          ignore-unfixed: true
+          ignore-unfixed: false
+          trivyignores: ${{ matrix.trivyignore }}
           vuln-type: os,library
           severity: HIGH,CRITICAL
 
@@ -135,24 +158,11 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: calculate immutable and stable tags
-        id: image
-        if: env.skip != '1'
-        env:
-          IMAGE: ${{ env.REGISTRY }}/${{ needs.preflight.outputs.owner_lc }}/${{ matrix.image }}
-          VERSION: ${{ needs.preflight.outputs.version }}
-        run: |
-          {
-            echo 'tags<<EOF'
-            echo "$IMAGE:$VERSION"
-            # latest はタグ push (= release 成功経路) のときだけ更新する。
-            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then echo "$IMAGE:latest"; fi
-            echo EOF
-          } >> "$GITHUB_OUTPUT"
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-      # scan を通った同一 context を push する。digest を release notes へ記録する。
-      - name: push scanned image
-        id: push
+
+      # 本番imageは一度だけbuildし、まずtag無しのcandidate digestとしてpushする。
+      # version/latestはscan成功後まで作成しない。
+      - name: build and push untagged candidate digest
+        id: candidate
         if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
         env:
           DOCKER_BUILD_SUMMARY: false
@@ -161,38 +171,187 @@ jobs:
         with:
           context: .
           file: ${{ matrix.dockerfile }}
-          push: true
-          tags: ${{ steps.image.outputs.tags }}
+          tags: ${{ steps.image.outputs.image }}
+          outputs: type=image,name=${{ steps.image.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           build-args: SOURCE_COMMIT=${{ github.sha }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha,scope=${{ matrix.image }}
-      # push した実 image を digest 指定で再 scan する。scan 済み context と
-      # 実際に配布される image が一致していることを、配布物側から確認する
-      # (docs/12 の公開前チェック)。
-      - name: rescan published image by digest
+
+      - name: verify candidate MiniZip attack surface is absent
+        if: >-
+          matrix.image == 'illumia-server' &&
+          needs.preflight.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          docker run --rm --entrypoint /bin/sh "$IMAGE@$DIGEST" -ceu '
+            ! command -v minizip
+            ! command -v miniunzip
+          '
+
+      - name: scan candidate image by digest
         if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
+        env:
+          TRIVY_SHOW_SUPPRESSED: 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}
+          image-ref: ${{ steps.image.outputs.image }}@${{ steps.candidate.outputs.digest }}
           format: table
           exit-code: '1'
-          ignore-unfixed: true
+          ignore-unfixed: false
+          trivyignores: ${{ matrix.trivyignore }}
           vuln-type: os,library
           severity: HIGH,CRITICAL
+
       - name: record digest
-        id: record
         if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
+        env:
+          DIGEST: ${{ steps.candidate.outputs.digest }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          MATRIX_IMAGE: ${{ matrix.image }}
         run: |
-          echo "${{ matrix.image }}=${{ steps.push.outputs.digest }}" >> "$GITHUB_OUTPUT"
           mkdir -p digests
-          echo "${{ steps.image.outputs.image }}@${{ steps.push.outputs.digest }}" \
-            > "digests/${{ matrix.image }}.txt"
+          echo "$IMAGE@$DIGEST" > "digests/$MATRIX_IMAGE.txt"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: env.skip != '1' && needs.preflight.outputs.publish == 'true'
         with:
-          name: digest-${{ matrix.image }}
+          name: candidate-digest-${{ matrix.image }}
           path: digests/*
+
+  # 全imageのcandidate scan成功後だけ、単一jobが同じdigestへrelease tagを付ける。
+  # 他の配布build/signも全て成功してから実行し、途中失敗でcontainerだけが公開される
+  # 状態を作らない。
+  docker-promote:
+    needs: [preflight, ci, docker, desktop, android, android-sign]
+    if: >-
+      always() &&
+      needs.preflight.outputs.publish == 'true' &&
+      needs.ci.result == 'success' &&
+      needs.docker.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: candidate-digest-*
+          path: candidate-digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: promote all scanned candidate digests
+        env:
+          EXPECT_ML: ${{ needs.preflight.outputs.docker_ml }}
+          IMAGE_OWNER: ${{ needs.preflight.outputs.owner_lc }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f candidate-digests/illumia-server.txt
+          if [ "$EXPECT_ML" = true ]; then
+            test -f candidate-digests/illumia-ml.txt
+          fi
+
+          mapfile -t files < <(find candidate-digests -maxdepth 1 -type f \
+            -name 'illumia-*.txt' -print | sort)
+          expected=1
+          [ "$EXPECT_ML" = true ] && expected=2
+          if [ "${#files[@]}" -ne "$expected" ]; then
+            echo "::error::unexpected candidate digest count"
+            exit 1
+          fi
+
+          images=()
+          digests=()
+          declare -A seen_images=()
+          for file in "${files[@]}"; do
+            ref=$(tr -d '\r\n' < "$file")
+            image=${ref%@*}
+            digest=${ref##*@}
+            expected_image=$(basename "$file" .txt)
+            if [[ ! "$image" =~ ^ghcr\.io/$IMAGE_OWNER/illumia-(server|ml)$ ]] ||
+               [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+               [ "${image##*/}" != "$expected_image" ] ||
+               [[ -n "${seen_images[$image]+present}" ]]; then
+              echo "::error::invalid candidate digest record"
+              exit 1
+            fi
+            seen_images[$image]=1
+            images+=("$image")
+            digests+=("$digest")
+          done
+
+          inspect_existing_digest() {
+            local ref=$1
+            local error_file=$2
+            local output
+            local attempt
+            for attempt in 1 2 3; do
+              if output=$(docker buildx imagetools inspect \
+                  --format '{{json .Manifest.Digest}}' "$ref" 2>"$error_file"); then
+                output=${output#\"}; output=${output%\"}
+                printf '%s' "$output"
+                return 0
+              fi
+              # GHCR may report a missing tag using either OCI's MANIFEST_UNKNOWN or HTTP 404.
+              # Authentication, rate-limit, DNS, and other registry errors must fail closed.
+              if grep -Eqi 'manifest unknown|manifest not found|no such manifest|unexpected status.*404' \
+                   "$error_file" || grep -Fqi "$ref: not found" "$error_file"; then
+                return 44
+              fi
+              [ "$attempt" -lt 3 ] && sleep "$((attempt * 2))"
+            done
+            cat "$error_file" >&2
+            return 1
+          }
+
+          # どのversion tagも変更しないことを全件先に確認する。
+          inspect_error=$(mktemp)
+          trap 'rm -f "$inspect_error"' EXIT
+          for index in "${!images[@]}"; do
+            version_ref="${images[$index]}:$VERSION"
+            if existing=$(inspect_existing_digest "$version_ref" "$inspect_error"); then
+              if [ "$existing" != "${digests[$index]}" ]; then
+                echo "::error::immutable version tag already points to a different digest"
+                exit 1
+              fi
+            else
+              status=$?
+              if [ "$status" -ne 44 ]; then
+                echo "::error::could not verify immutable version tag"
+                exit "$status"
+              fi
+            fi
+          done
+          rm -f "$inspect_error"
+          trap - EXIT
+
+          # 単一source digestをcarbon-copyしてversion/latestへ付与する。
+          for index in "${!images[@]}"; do
+            image=${images[$index]}
+            digest=${digests[$index]}
+            docker buildx imagetools create --prefer-index=false \
+              --tag "$image:$VERSION" --tag "$image:latest" "$image@$digest"
+            for tag in "$image:$VERSION" "$image:latest"; do
+              actual=$(docker buildx imagetools inspect \
+                --format '{{json .Manifest.Digest}}' "$tag")
+              actual=${actual#\"}; actual=${actual%\"}
+              if [ "$actual" != "$digest" ]; then
+                echo "::error::promoted tag digest does not match scanned candidate"
+                exit 1
+              fi
+            done
+          done
 
   # 未署名バイナリは配布しない (SEC-007)。ビルド検証と CI artifact 保管のみ行い、
   # GitHub Release へは添付しない。署名・公証を導入したら publish 対象へ戻す。
@@ -210,7 +369,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: build (macOS universal)
         if: matrix.name == 'macos'
         run: |
@@ -250,7 +409,6 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
       - name: install Android NDK
         run: |
           sdkmanager "ndk;26.1.10909125"
@@ -259,18 +417,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/android/src-tauri
-      - name: restore signing keystore
-        if: needs.preflight.outputs.publish == 'true'
-        env:
-          KEYSTORE_B64: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_B64 }}
-        run: |
-          if [ -z "$KEYSTORE_B64" ]; then
-            echo "::error::ILLUMIA_ANDROID_KEYSTORE_B64 secret is not set"; exit 1
-          fi
-          echo "$KEYSTORE_B64" | base64 -d > apps/android/src-tauri/illumia.keystore
+      # full CI の Android gate と同一 lockfile が署名対象であることを build 直前にも確認する。
+      - name: verify audited Android lockfile
+        run: cargo metadata --manifest-path apps/android/src-tauri/Cargo.toml --locked --format-version 1 >/dev/null
       - name: build web frontend
         working-directory: web
         # npm ci はライフサイクルスクリプトを実行しない。esbuild 等の
@@ -285,79 +437,100 @@ jobs:
         working-directory: apps/android
         # Rust ターゲットは rust-toolchain アクションで導入済みなので --skip-targets-install。
         run: npm run tauri android init -- --ci --skip-targets-install
-      - name: configure release signing
-        if: needs.preflight.outputs.publish == 'true'
-        working-directory: apps/android/src-tauri/gen/android
-        env:
-          ILLUMIA_KEYSTORE_PASSWORD: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_PASSWORD }}
-          ILLUMIA_KEY_ALIAS: ${{ secrets.ILLUMIA_ANDROID_KEY_ALIAS }}
-        run: |
-          # keystore.properties を生成し、生成された app/build.gradle.kts に署名設定を注入する。
-          cat > keystore.properties <<EOF
-          password=$ILLUMIA_KEYSTORE_PASSWORD
-          keyAlias=$ILLUMIA_KEY_ALIAS
-          storeFile=$(cd ../.. && pwd)/illumia.keystore
-          EOF
-          # Python は必ず uv 経由 (AGENTS.md 6)。
-          uv run --no-project "$GITHUB_WORKSPACE/apps/android/scripts/inject-signing.py" \
-            app/build.gradle.kts
       - name: build APK
         working-directory: apps/android
         run: npm run tauri android build -- --apk
-      # 配布物の同一性を release notes へ記録する (SEC-007)。
-      - name: record APK fingerprints
-        if: needs.preflight.outputs.publish == 'true'
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: android-apk-unsigned
+          path: apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+
+  # 依存package・Gradle pluginを実行するbuild jobへ署名鍵を渡さない。
+  # CI済みのunsigned APKだけを、repository codeをcheckoutしない専用jobで署名する。
+  android-sign:
+    needs: [preflight, ci, android]
+    if: >-
+      needs.preflight.outputs.android == 'true' &&
+      needs.preflight.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    # 署名secretは専用environmentへ隔離する。Repository settingsでこのenvironmentに
+    # release担当者のapproval ruleを設定する。
+    environment: release-signing
+    permissions:
+      contents: read
+    steps:
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: android-apk-unsigned
+          path: unsigned
+      - name: sign and verify audited APKs
+        env:
+          KEYSTORE_B64: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_B64 }}
+          ILLUMIA_KEYSTORE_PASSWORD: ${{ secrets.ILLUMIA_ANDROID_KEYSTORE_PASSWORD }}
+          ILLUMIA_KEY_ALIAS: ${{ secrets.ILLUMIA_ANDROID_KEY_ALIAS }}
         run: |
           set -euo pipefail
-          # apksigner は build-tools に含まれる。glob が外れて黙って
-          # "certs: unavailable" を書くことがあったため、明示的に探して
-          # 見つからなければ失敗させる (SEC-007 の記録要件)。
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$ILLUMIA_KEYSTORE_PASSWORD" ] || \
+             [ -z "$ILLUMIA_KEY_ALIAS" ]; then
+            echo "::error::Android signing secrets are not fully configured"; exit 1
+          fi
           apksigner=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" \
             -name apksigner -type f 2>/dev/null | sort -V | tail -1)
           if [ -z "$apksigner" ]; then
             echo "::error::apksigner が見つからない (build-tools 未導入)"; exit 1
           fi
-          echo "using: $apksigner"
-
-          mkdir -p fingerprints
+          mapfile -d '' apks < <(find unsigned -type f -name '*.apk' -print0)
+          if [ ${#apks[@]} -eq 0 ] || [ ${#apks[@]} -gt 4 ]; then
+            echo "::error::署名対象APKの個数が不正"; exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > illumia.keystore
+          chmod 600 illumia.keystore
+          cleanup() { rm -f illumia.keystore certs.txt; }
+          trap cleanup EXIT
+          mkdir -p signed fingerprints
           out=fingerprints/android-apk.txt
           : > "$out"
-          mapfile -d '' apks < <(
-            find apps/android/src-tauri/gen/android/app/build/outputs/apk \
-              -name '*.apk' -print0
-          )
-          if [ ${#apks[@]} -eq 0 ]; then
-            echo "::error::APK が見つからない"; exit 1
-          fi
           for apk in "${apks[@]}"; do
-            echo "file: $(basename "$apk")" >> "$out"
-            echo "sha256: $(sha256sum "$apk" | cut -d' ' -f1)" >> "$out"
-            # 署名の検証と証明書 fingerprint。失敗したら release を止める。
-            if ! "$apksigner" verify --print-certs "$apk" > /tmp/certs.txt 2>&1; then
-              echo "::error::APK の署名検証に失敗した: $apk"; cat /tmp/certs.txt; exit 1
+            size=$(stat -c '%s' "$apk")
+            if [ "$size" -le 0 ] || [ "$size" -gt 536870912 ]; then
+              echo "::error::署名対象APKのsizeが不正"; exit 1
             fi
-            grep -iE 'SHA-256 digest|SHA-1 digest|Signer #1 certificate DN' /tmp/certs.txt \
+            target="signed/$(basename "$apk")"
+            if [ -e "$target" ]; then
+              echo "::error::同名APKが複数の入力directoryに存在する"; exit 1
+            fi
+            "$apksigner" sign \
+              --ks illumia.keystore \
+              --ks-pass env:ILLUMIA_KEYSTORE_PASSWORD \
+              --ks-key-alias "$ILLUMIA_KEY_ALIAS" \
+              --out "$target" "$apk"
+            "$apksigner" verify --print-certs "$target" > certs.txt
+            echo "file: $(basename "$target")" >> "$out"
+            echo "sha256: $(sha256sum "$target" | cut -d' ' -f1)" >> "$out"
+            grep -iE 'SHA-256 digest|SHA-1 digest|Signer #1 certificate DN' certs.txt \
               >> "$out"
             echo >> "$out"
           done
-          if grep -qi 'unavailable' "$out"; then
-            echo "::error::証明書 fingerprint を記録できていない"; exit 1
-          fi
+          cleanup
+          trap - EXIT
           cat "$out"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: android-apk
           path: |
-            apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+            signed/*.apk
             fingerprints/*
 
   # タグ push のとき、署名済み成果物だけを GitHub Release に添付する。
   # 未署名 desktop バイナリは対象外 (SEC-007)。
   publish-release:
-    needs: [preflight, ci, docker, desktop, android]
+    needs: [preflight, ci, docker, docker-promote, desktop, android, android-sign]
     if: >-
-      always() && startsWith(github.ref, 'refs/tags/v') &&
+      always() && needs.preflight.outputs.publish == 'true' &&
+      startsWith(github.ref, 'refs/tags/v') &&
       needs.ci.result == 'success' &&
+      needs.docker-promote.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
       (needs.android.result == 'success' || needs.docker.result == 'success')
     runs-on: ubuntu-latest
@@ -373,6 +546,9 @@ jobs:
       - name: drop unsigned desktop artifacts
         run: |
           rm -rf artifacts/unsigned-desktop-* || true
+          # build jobのAPKは署名jobへの入力専用。Releaseへ添付するのは
+          # android-sign jobが生成した検証済みartifactだけに限定する。
+          rm -rf artifacts/android-apk-unsigned || true
           # docker build record は配布物ではないので添付しない。
           find artifacts -name '*.dockerbuild' -delete 2>/dev/null || true
           if compgen -G 'artifacts/unsigned-desktop-*' > /dev/null; then
@@ -382,6 +558,10 @@ jobs:
           if find artifacts -type f \( -name '*.exe' -o -name '*-macos-universal' \) \
               | grep -q .; then
             echo "::error::未署名の実行ファイルが配布対象に含まれている"; exit 1
+          fi
+          if find artifacts -type f -name '*.apk' \
+              ! -path 'artifacts/android-apk/*' | grep -q .; then
+            echo "::error::署名job外のAPKが配布対象に含まれている"; exit 1
           fi
           find artifacts -type f | sort
       - name: collect provenance records

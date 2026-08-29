@@ -3,9 +3,9 @@
 
 import { getApi } from '$lib/api';
 import { nativeLogin, nativeSetup } from '$lib/api/client';
-import { isTauri } from '$lib/platform/tauri';
-import { setNativeToken } from '$lib/platform/nativeAuth';
+import { clearNativeAuth, isTauri } from '$lib/platform/tauri';
 import { ApiError } from '$lib/api/types';
+import { revokeAllObjectUrls } from '$lib/api/image';
 
 export type SessionStatus = 'loading' | 'needs-setup' | 'needs-login' | 'authed' | 'error';
 
@@ -30,11 +30,14 @@ class Session {
       this.version = info.version ?? '';
       this.setupTokenRequired = info.setup_token_required;
       if (!info.setup_completed) {
+        revokeAllObjectUrls();
         this.status = 'needs-setup';
       } else {
         this.status = info.authenticated ? 'authed' : 'needs-login';
+        if (!info.authenticated) revokeAllObjectUrls();
       }
     } catch (e) {
+      revokeAllObjectUrls();
       this.status = 'error';
       this.error = messageOf(e);
     }
@@ -42,8 +45,7 @@ class Session {
 
   async setup(password: string, deviceName: string, setupToken?: string): Promise<void> {
     if (isTauri()) {
-      // ネイティブは Bearer token を secure storage (現状メモリ) に保存する。
-      setNativeToken(await nativeSetup({ password, device_name: deviceName }, setupToken));
+      await nativeSetup({ password, device_name: deviceName }, setupToken);
     } else {
       await getApi().setup({ password, device_name: deviceName }, setupToken);
     }
@@ -52,7 +54,7 @@ class Session {
 
   async login(password: string, deviceName: string): Promise<void> {
     if (isTauri()) {
-      setNativeToken(await nativeLogin({ password, device_name: deviceName }));
+      await nativeLogin({ password, device_name: deviceName });
     } else {
       await getApi().login({ password, device_name: deviceName });
     }
@@ -64,8 +66,12 @@ class Session {
     try {
       await getApi().logout();
     } finally {
-      if (isTauri()) setNativeToken(null);
-      this.status = 'needs-login';
+      try {
+        if (isTauri()) await clearNativeAuth();
+      } finally {
+        revokeAllObjectUrls();
+        this.status = 'needs-login';
+      }
     }
   }
 }

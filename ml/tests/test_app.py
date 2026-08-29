@@ -8,6 +8,8 @@ import msgpack
 import pytest
 from fastapi.testclient import TestClient
 
+from illumia_ml.app import MAX_ANALYZE_BODY_BYTES, MAX_CLUSTER_BODY_BYTES
+
 
 def test_health_reports_mock_backend(client: TestClient) -> None:
     response = client.get("/ml/v1/health")
@@ -58,6 +60,39 @@ def test_analyze_rejects_wrong_media_type(client: TestClient, image_bytes: bytes
     response = client.post("/ml/v1/analyze", content=image_bytes)
 
     assert response.status_code == 415
+
+
+@pytest.mark.parametrize(
+    ("path", "content_type", "limit"),
+    [
+        ("/ml/v1/analyze", "application/octet-stream", MAX_ANALYZE_BODY_BYTES),
+        ("/ml/v1/cluster", "application/json", MAX_CLUSTER_BODY_BYTES),
+    ],
+)
+def test_request_body_rejects_oversized_content_length_before_reading(
+    client: TestClient, path: str, content_type: str, limit: int
+) -> None:
+    response = client.post(
+        path,
+        content=b"x",
+        headers={"Content-Type": content_type, "Content-Length": str(limit + 1)},
+    )
+
+    assert response.status_code == 413
+
+
+def test_streamed_request_body_is_bounded_without_content_length(
+    client: TestClient, monkeypatch
+) -> None:
+    monkeypatch.setattr("illumia_ml.app.MAX_CLUSTER_BODY_BYTES", 4)
+
+    response = client.post(
+        "/ml/v1/cluster",
+        content=(chunk for chunk in [b"abc", b"de"]),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 413
 
 
 def test_cluster_accepts_msgpack(client: TestClient) -> None:

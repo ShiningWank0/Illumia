@@ -45,7 +45,8 @@ SELECT id FROM assets
 WHERE lifecycle IN ('duplicate','trashed')
   AND purge_after IS NOT NULL
   AND purge_after < :now
-  AND NOT EXISTS (SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id);
+  AND NOT EXISTS (SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id)
+  AND NOT EXISTS (SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id);
 ```
 
 削除手順 (クラッシュ耐性):
@@ -55,6 +56,11 @@ WHERE lifecycle IN ('duplicate','trashed')
 3. DB 行削除 (faces / FTS 等は FK CASCADE とトリガで同時に消える)
 
 起動時に `purging` の残骸があれば手順 2 から再開する。
+旧版が `duplicate_of` の参照先を `purging` にして残していた場合は、物理 file を
+削除せず安全な lifecycle へ戻す。旧版の残骸や crash 後の再開でも、物理削除前に
+I2 の逆参照と I3 の `stack_pages` 参照を同一の排他transaction内で再検証する。
+参照があればfileを削除しない。file削除からDB行削除までDB write lockを保持し、
+その間に新しい参照を追加できないようにする。
 **手順 2 で削除するパスは必ず自 asset 行の `library_path` / 自 id 由来のサムネパスのみ**。
 他の行のパスを計算・削除するコードを書いてはならない。
 
@@ -64,7 +70,7 @@ WHERE lifecycle IN ('duplicate','trashed')
 |---|---|---|
 | I1 | `lifecycle='active'` の行はパージジョブの対象に**絶対に**ならない (SQL の WHERE で構造的に除外) | active な行だけの DB でパージを回し、ファイル・行が 1 つも消えないこと |
 | I2 | 重複パージで消えるのは**後からアップロードされた側 (duplicate 行) のみ**。`duplicate_of` の参照先 (本体) はいかなる経路でも消えない | 本体+重複ペアを作り重複の期限を過ぎさせてパージ → 本体の行とファイルが無傷であること。逆参照 (本体側を duplicate 扱いする) バグを property test で否定 |
-| I3 | スタック参照がある asset はパージされない (重複昇格漏れ・trashed でも同様) | スタックに入れた duplicate / trashed の期限を過ぎさせてパージ → 残ること |
+| I3 | スタック参照がある asset はパージされない (重複昇格漏れ・trashed・`purging` crash残骸の再開でも同様) | スタックに入れた duplicate / trashed の期限を過ぎさせてパージ → 残ること。さらに強制的に `purging` にしたstack pageを再開処理へ渡し、行・file・pageが全て残ること |
 | I4 | 削除→復元→再削除でタイマーがリセットされる | 再削除後の `purge_after` が「再削除時刻 + retention」に一致し、初回削除時刻に依存しないこと |
 | I5 | パージは自分のファイルだけを消す (パス計算は自行由来のみ) | 同 hash の本体と重複が別ファイルとして存在し、重複パージ後に本体ファイルが開けること |
 | I6 | 復元は完全に元の状態へ戻す (visible_in_timeline・スタック所属・FTS を含む) | trash → restore 後にタイムライン/検索/スタックの見え方が削除前と一致すること |
@@ -79,3 +85,13 @@ WHERE lifecycle IN ('duplicate','trashed')
   (照合は vault 内の hash とのみ行う。平文側 hash とは突合しない — 存在秘匿のため)。
 - メイン ⇄ vault の移動 (→ docs/06) は本ドキュメントのライフサイクルとは別の
   「DB 間移動」であり、パージジョブの対象選定に影響しない。
+- transfer reconciliation が削除できるのは journal に記録した source asset 自身の
+  `library_path`、自身の id から生成した thumbnail/preview、または transfer UUID 専用 staging
+  directory のみ。通常 purge の対象 SQL・I1〜I6 を再利用・迂回してはならず、reconciliation
+  後にも I1〜I6 の統合テストを全て通す。
+- transfer の source journal 作成と同じ transaction で `duplicate_of` の逆参照閉包を検証する。
+  参照元を source 集合へ含めない部分 transfer は file を 1 byte も消す前に拒否する。
+  file 削除直前にも同じ transaction で閉包を再検証して source rows を `purging` に lease する。
+  journal 中・lease 中の asset は新規 dedup の参照先に選ばない。旧版 journal が不完全な閉包のまま
+  source file 削除済みなら、残存 duplicate を transaction 内で新しい本体へ昇格・再親子付けして
+  DB を収束させる。

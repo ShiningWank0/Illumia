@@ -7,7 +7,7 @@
 
 - `src-tauri/` … Tauri 2 の Rust シェル (独立 Cargo ワークスペース)。
   - `tauri.conf.json` … `frontendDist` は `../../../web/build` を指す。
-  - `src/lib.rs` … `run()` (mobile entry)。dialog / fs / biometric プラグインを登録。
+  - `src/lib.rs` … `run()` (mobile entry)。dialog / fs プラグインを登録。
   - `src/bridge.rs` … Illumia 専用 HTTP ブリッジ (`illumia_request` / `illumia_set_server`)。
   - `capabilities/default.json` … プラグイン権限。
   - `Cargo.lock` … コミット必須。release では `--locked` で解決を固定する (docs/12: SEC-007)。
@@ -37,7 +37,7 @@ web の SPA は `window.__TAURI_INTERNALS__` で Tauri を検出し、アプリ�
 
 - サーバー接続設定 (external/local URL + 到達性プローブで自動選択)
 - Bearer 認証 (device token は現状メモリ内保持 → Keystore 連携は将来)
-- 生体認証による vault アンロック (フォールバックにパスワード入力を必ず残す)
+- パスワードによる Vault アンロック (生体認証は native Keystore 実装が完成するまで無効)
 - 自動アップロード (フォアグラウンド同期。バックグラウンド常駐は将来)
 
 を有効化する。ブラウザ配信時は従来どおり同一オリジン Cookie 認証で動作する。

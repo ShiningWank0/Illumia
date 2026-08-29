@@ -2,18 +2,36 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directory: /
+    cooldown:
+      default-days: 7
     schedule:
       interval: weekly
       day: monday
       time: "03:00"
       timezone: Asia/Tokyo
+    # 0.x の minor は互換性を壊し得るため、通常のgroup更新へ混ぜず
+    # migrationとtarget別テストを伴う手動PRで更新する。
+    ignore:
+      - dependency-name: eframe
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: egui
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: egui_extras
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: tokio-tungstenite
+        update-types: ["version-update:semver-minor"]
     groups:
       rust-dependencies:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: npm
     directory: /web
+    cooldown:
+      default-days: 7
     schedule:
       interval: weekly
       day: monday
@@ -23,9 +41,14 @@ updates:
       web-dependencies:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: pip
     directory: /ml
+    cooldown:
+      default-days: 7
     schedule:
       interval: weekly
       day: monday
@@ -35,17 +58,35 @@ updates:
       ml-dependencies:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: docker
     directory: /docker
+    cooldown:
+      default-days: 7
     schedule:
       interval: weekly
       day: monday
       time: "03:45"
       timezone: Asia/Tokyo
+    # Repository全体のtoolchain固定と同時にだけ更新する。Dockerfile単独の
+    # major/minor更新でNode/Python/Rustの互換性を崩さない。
+    ignore:
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+      - dependency-name: python
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
+      - dependency-name: rust
+        update-types: ["version-update:semver-minor"]
 
   - package-ecosystem: github-actions
     directory: /
+    cooldown:
+      default-days: 7
     schedule:
       interval: weekly
       day: monday
@@ -55,23 +96,38 @@ updates:
       actions:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   # Android は独立 Cargo ワークスペース。ルートの cargo 設定では追従されないため
   # 個別に登録する (Cargo.lock をコミットしている → docs/12 SEC-007)。
   - package-ecosystem: cargo
     directory: /apps/android/src-tauri
+    cooldown:
+      default-days: 7
     schedule:
       interval: weekly
       day: monday
       time: "04:15"
       timezone: Asia/Tokyo
+    # 0.23 は default-on unsafe SIMD を追加するため、通常のgroup更新へ
+    # 混ぜず、feature選択とAndroid targetの安全性レビューを必須にする。
+    ignore:
+      - dependency-name: base64
+        update-types: ["version-update:semver-minor"]
     groups:
       android-rust-dependencies:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch
 
   - package-ecosystem: npm
     directory: /apps/android
+    cooldown:
+      default-days: 7
     schedule:
       interval: weekly
       day: monday
@@ -81,3 +137,6 @@ updates:
       android-tooling:
         patterns:
           - "*"
+        update-types:
+          - minor
+          - patch

@@ -3,6 +3,14 @@
 v1 (M1〜M6) 完了後に着手する機能。**全ての検索系機能は日本語クエリを第一級で
 サポートする**ことを共通要件とする (v1 の FTS trigram と同様 → docs/03)。
 
+## 視覚的重複レビュー
+
+- v1のexact hash重複とは分離し、将来のopt-in機能として扱う。誤判定だけで原本を自動削除せず、
+  候補提示からユーザー確認を経てdocs/11のatomic trash経路だけを呼ぶ。
+- 採用条件は、再配布可能な実画像corpusでprecision / recallの基準を確定し、実ライブラリ規模で
+  実行時間とpeak RSSを測定すること。閾値・モデルversion・判定根拠を永続化し、再現可能にする。
+- 既存の実験実装はv1 release lineへ含めず、上記の精度・資源上限を満たす独立変更として再提案する。
+
 ## OCR 検索
 
 - 目的: イラスト・漫画ページ内の文字 (セリフ・タイトル等) で検索できるようにする。
@@ -55,15 +63,20 @@ M5 (apps/android, Tauri 2) では以下を**縮退実装**した。将来タス�
   (起動時 + 手動トリガ) に限定した。将来は WorkManager の定期ジョブ + MediaStore 差分
   クエリを Tauri プラグインとして実装し、Wi-Fi のみ / 充電中のみ・指数バックオフに対応する
   (→ docs/08)。送信済み台帳も localStorage からローカル SQLite へ移す。
-- **秘密の OS セキュアストレージ保存**: device token / vault パスワードは、汎用 Keystore
-  プラグインが無いため v1 はプロセスメモリ内保持 (再起動で失効 → 再ログイン / 再アンロック)。
-  将来は Android Keystore に「ラップ済み MK」/ device token を保存する専用プラグインを作り、
+- **秘密の OS セキュアストレージ保存**: device token は、汎用 Keystore plugin が無いため
+  M5ではWebViewへ返さずRust process memory内だけに保持する (再起動で失効 → 再ログイン)。
+  Vault passwordの保存と生体認証unlockは提供せず、JavaScript Mapによる代替も禁止する。
+  将来は Android Keystore に「ラップ済み MK」/ device token を保存する専用pluginを作り、
   生体認証成功時のみ復号する (→ docs/06 / docs/08)。
 - **Wi-Fi SSID 紐付け**: local URL を特定 SSID にのみ試す最適化。現状 SSID 取得プラグインが
   無いため、UI と設定スキーマ (ssid フィールド) だけ用意し、判定は到達性プローブ
-  (local→external, 各 2 秒) で代替している (→ docs/08)。SSID 自動取得プラグイン導入後に
+  (external→local, 各 2 秒) で代替している (→ docs/08)。SSID 自動取得プラグイン導入後に
   「指定 SSID 接続時のみ local を試す」を有効化する (位置情報権限の説明が必要)。
 - **共有インテント (「Illumia へ送る」)**: 下記「その他の候補」にも記載。
+- **Android大容量uploadのnative streaming**: M5の汎用bridgeはBase64 IPC増幅によるOOMを
+  防ぐためmultipart requestを17 MiBで制限する。通常のWeb/server上限128 MiBをAndroidでも
+  利用するには、Storage Access Frameworkのcontent URI/file descriptorをnative commandへ渡し、
+  Rust側でchecksum計算とmultipart uploadを固定長chunkで行う専用経路を実装する。
 
 ## その他の候補 (優先度低)
 

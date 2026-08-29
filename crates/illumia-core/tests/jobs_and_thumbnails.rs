@@ -9,8 +9,9 @@ use std::{
 use illumia_core::{
     PurgeService,
     assets::AssetService,
-    db::{Database, Result},
-    jobs::{JobQueue, JobRunner, JobState},
+    db::{Database, Error, Result},
+    images,
+    jobs::{ActiveJobKey, JobQueue, JobRunner, JobState, MAX_ACTIVE_JOBS},
     settings::Settings,
     thumbnails::{
         THUMBNAIL_JOB_KIND, enqueue_thumbnail, generate_thumbnails, handle_thumbnail_job,
@@ -62,6 +63,29 @@ fn png(width: u32, height: u32) -> Vec<u8> {
 }
 
 #[test]
+fn image_pipeline_permit_bounds_the_complete_operation() {
+    let first = images::acquire_pipeline_permit();
+    let second = images::acquire_pipeline_permit();
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _third = images::acquire_pipeline_permit();
+        acquired_tx.send(()).expect("receiver should remain open");
+    });
+    assert!(
+        acquired_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_err(),
+        "a third image pipeline must wait while two full-pipeline permits are held"
+    );
+    drop(first);
+    acquired_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("dropping a pipeline permit should wake one waiter");
+    drop(second);
+    worker.join().expect("pipeline waiter should finish");
+}
+
+#[test]
 fn queue_claims_by_priority() -> Result<()> {
     let fixture = Fixture::new()?;
     let queue = JobQueue::new(fixture.database);
@@ -73,6 +97,45 @@ fn queue_claims_by_priority() -> Result<()> {
     assert_eq!(queue.claim()?.map(|job| job.id), Some(normal.id));
     assert_eq!(queue.claim()?.map(|job| job.id), Some(low.id));
     assert!(queue.claim()?.is_none());
+    Ok(())
+}
+
+#[test]
+fn queue_admission_is_bounded_and_prunes_expired_terminal_rows() -> Result<()> {
+    let fixture = Fixture::new()?;
+    fixture.database.with_connection(|connection| {
+        connection.execute(
+            "INSERT INTO jobs(id, kind, payload, state, priority, progress, created_at, finished_at)
+             VALUES ('expired', 'test', '{}', 'done', 0, 1, '2020-01-01T00:00:00Z',
+                     '2020-01-01T00:00:00Z')",
+            [],
+        )?;
+        let transaction = connection.unchecked_transaction()?;
+        {
+            let mut insert = transaction.prepare(
+                "INSERT INTO jobs(id, kind, payload, state, priority, progress, created_at)
+                 VALUES (?1, 'test', '{}', 'queued', 0, 0, '2026-01-01T00:00:00Z')",
+            )?;
+            for index in 0..MAX_ACTIVE_JOBS {
+                insert.execute([format!("active-{index:05}")])?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    })?;
+    let queue = JobQueue::new(fixture.database.clone());
+    assert!(matches!(
+        queue.enqueue("test", "{}", 0),
+        Err(Error::JobQueueFull)
+    ));
+    let expired: i64 = fixture.database.with_connection(|connection| {
+        Ok(connection.query_row(
+            "SELECT count(*) FROM jobs WHERE id = 'expired'",
+            [],
+            |row| row.get(0),
+        )?)
+    })?;
+    assert_eq!(expired, 0, "admission must prune expired terminal jobs");
     Ok(())
 }
 
@@ -153,6 +216,53 @@ fn queue_supports_progress_failure_cancellation_and_listing() -> Result<()> {
     assert!(failed.finished_at.is_some());
     assert_eq!(cancelled.state, JobState::Cancelled);
     assert!(cancelled.finished_at.is_some());
+    Ok(())
+}
+
+#[test]
+fn cancelling_running_job_keeps_dedup_active_until_worker_exits() -> Result<()> {
+    let fixture = Fixture::new()?;
+    Settings::new(fixture.database.clone()).set_thumbnail_concurrency(1)?;
+    let queue = JobQueue::new(fixture.database.clone());
+    let job = queue.enqueue_unique_active("wait", "{}", 0, ActiveJobKey::Kind)?;
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
+    let mut runner = JobRunner::new(fixture.database);
+    runner.register_handler("wait", move |_, _| {
+        started_tx.send(()).expect("start receiver");
+        release_rx
+            .lock()
+            .expect("release mutex")
+            .recv()
+            .expect("release sender");
+        Ok(())
+    });
+    runner.start()?;
+    started_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker should claim the job");
+
+    assert!(queue.cancel(&job.id)?);
+    let cancelling = queue
+        .list()?
+        .into_iter()
+        .find(|candidate| candidate.id == job.id)
+        .expect("running job should remain visible");
+    assert_eq!(cancelling.state, JobState::Running);
+    assert!(cancelling.cancel_requested);
+    let duplicate = queue.enqueue_unique_active("wait", "{}", 0, ActiveJobKey::Kind)?;
+    assert_eq!(duplicate.id, job.id, "cancel must not reopen admission");
+
+    release_tx.send(()).expect("worker should still be waiting");
+    runner.shutdown()?;
+    let cancelled = queue
+        .list()?
+        .into_iter()
+        .find(|candidate| candidate.id == job.id)
+        .expect("cancelled job should remain visible");
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert!(!cancelled.cancel_requested);
     Ok(())
 }
 

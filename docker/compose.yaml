@@ -1,15 +1,13 @@
 services:
   illumia-server:
-    image: ${ILLUMIA_IMAGE:-ghcr.io/shiningwank0/illumia-server:latest}
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.server
+    image: ghcr.io/shiningwank0/illumia-server@sha256:${ILLUMIA_SERVER_DIGEST:?Set ILLUMIA_SERVER_DIGEST to the release sha256 digest}
+    pull_policy: always
     ports:
       - "127.0.0.1:2283:2283"
     environment:
       ILLUMIA_SETUP_TOKEN: ${ILLUMIA_SETUP_TOKEN:-}
       ILLUMIA_SECURE_COOKIES: ${ILLUMIA_SECURE_COOKIES:-true}
-      ILLUMIA_TRUST_PROXY_HEADERS: ${ILLUMIA_TRUST_PROXY_HEADERS:-false}
+      ILLUMIA_TRUSTED_PROXY_CIDRS: ${ILLUMIA_TRUSTED_PROXY_CIDRS:-}
       # ML 有効化時は認証済みの設定 API (PATCH /api/settings) で
       # {"ml.socket_path":"/run/illumia/ml.sock"} を指定する。
     volumes:
@@ -27,6 +25,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    group_add:
+      - "2000"
     pids_limit: 256
     cpus: "4"
     mem_limit: 3g
@@ -34,15 +34,14 @@ services:
 
   illumia-ml:
     profiles: ["ml"]
-    image: ${ILLUMIA_ML_IMAGE:-ghcr.io/shiningwank0/illumia-ml:latest}
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile.ml
+    image: ghcr.io/shiningwank0/illumia-ml@sha256:${ILLUMIA_ML_DIGEST:?Set ILLUMIA_ML_DIGEST to the release sha256 digest}
+    pull_policy: always
     environment:
-      ILLUMIA_MODEL_DIR: /data/models
+      ILLUMIA_MODEL_DIR: /models
+      ILLUMIA_TRUSTED_MODEL_DIGESTS: ${ILLUMIA_TRUSTED_MODEL_DIGESTS:-}
     volumes:
       - illumia_sock:/run/illumia
-      - illumia_data:/data:ro
+      - illumia_models:/models:ro
     network_mode: none
     restart: unless-stopped
     init: true
@@ -53,6 +52,8 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    group_add:
+      - "2000"
     pids_limit: 256
     cpus: "4"
     mem_limit: 4g
@@ -60,10 +61,11 @@ services:
 
 volumes:
   illumia_data:
+  illumia_models:
   illumia_sock:
     driver: local
     driver_opts:
       # socket は永続化不要。非 root の両コンテナが確実に共有できる tmpfs とする。
       type: tmpfs
       device: tmpfs
-      o: uid=1000,gid=1000,mode=0700
+      o: uid=1000,gid=2000,mode=2770

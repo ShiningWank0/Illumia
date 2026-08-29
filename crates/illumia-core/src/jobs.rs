@@ -21,6 +21,16 @@ use crate::{
 };
 
 const IDLE_WAIT: Duration = Duration::from_millis(100);
+pub const MAX_ACTIVE_JOBS: usize = 10_000;
+pub const MAX_ACTIVE_ML_JOBS: usize = 5_000;
+pub const MAX_TERMINAL_JOBS: usize = 5_000;
+const TERMINAL_RETENTION_DAYS: i64 = 30;
+
+#[derive(Clone, Copy, Debug)]
+pub enum ActiveJobKey<'a> {
+    Kind,
+    AssetId(&'a str),
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobState {
@@ -60,6 +70,7 @@ pub struct Job {
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    pub cancel_requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -76,37 +87,87 @@ impl JobQueue {
     /// Adds a queued job. The payload must be valid JSON.
     pub fn enqueue(&self, kind: &str, payload_json: &str, priority: i64) -> Result<Job> {
         serde_json::from_str::<serde_json::Value>(payload_json)?;
-        let id = Uuid::now_v7().to_string();
-        let created_at = timestamp(Utc::now());
-        self.database.with_connection(|connection| {
-            connection.execute(
-                "INSERT INTO jobs(
-                    id, kind, payload, state, priority, progress, error,
-                    created_at, started_at, finished_at
-                 ) VALUES (?1, ?2, ?3, 'queued', ?4, 0, NULL, ?5, NULL, NULL)",
-                params![id, kind, payload_json, priority, created_at],
-            )?;
-            job_by_id(connection, &id)?
-                .ok_or_else(|| Error::InvalidJobState("newly inserted job disappeared".to_owned()))
+        self.database.with_connection_mut(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            prune_terminal_jobs(&transaction)?;
+            if let Err(error) = enforce_admission(&transaction, kind) {
+                transaction.commit()?;
+                return Err(error);
+            }
+            let job = insert_job(&transaction, kind, payload_json, priority)?;
+            transaction.commit()?;
+            Ok(job)
+        })
+    }
+
+    /// Idempotently admits a job while an equivalent queued/running job exists.
+    pub fn enqueue_unique_active(
+        &self,
+        kind: &str,
+        payload_json: &str,
+        priority: i64,
+        key: ActiveJobKey<'_>,
+    ) -> Result<Job> {
+        serde_json::from_str::<serde_json::Value>(payload_json)?;
+        self.database.with_connection_mut(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            prune_terminal_jobs(&transaction)?;
+            if let Some(job) = active_job(&transaction, kind, key)? {
+                transaction.commit()?;
+                return Ok(job);
+            }
+            if let Err(error) = enforce_admission(&transaction, kind) {
+                transaction.commit()?;
+                return Err(error);
+            }
+            let job = insert_job(&transaction, kind, payload_json, priority)?;
+            transaction.commit()?;
+            Ok(job)
         })
     }
 
     /// Atomically claims the first job in `ix_jobs_queue` order.
     pub fn claim(&self) -> Result<Option<Job>> {
+        self.claim_kinds(&[])
+    }
+
+    /// Atomically claims the first queued job whose kind is in `kinds`.
+    /// An empty slice preserves the unrestricted `claim` behavior.
+    pub fn claim_kinds(&self, kinds: &[&str]) -> Result<Option<Job>> {
         self.database.with_connection_mut(|connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let id = transaction
-                .query_row(
-                    "SELECT id
-                     FROM jobs
-                     WHERE state = 'queued'
-                     ORDER BY priority DESC, created_at, id
-                     LIMIT 1",
-                    [],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
+            let id = if kinds.is_empty() {
+                transaction
+                    .query_row(
+                        "SELECT id
+                         FROM jobs
+                         WHERE state = 'queued'
+                         ORDER BY priority DESC, created_at, id
+                         LIMIT 1",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+            } else {
+                let placeholders = (1..=kinds.len())
+                    .map(|index| format!("?{index}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                transaction
+                    .query_row(
+                        &format!(
+                            "SELECT id FROM jobs
+                             WHERE state = 'queued' AND kind IN ({placeholders})
+                             ORDER BY priority DESC, created_at, id LIMIT 1"
+                        ),
+                        rusqlite::params_from_iter(kinds.iter().copied()),
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+            };
             let Some(id) = id else {
                 transaction.commit()?;
                 return Ok(None);
@@ -140,14 +201,37 @@ impl JobQueue {
     }
 
     pub fn cancel(&self, id: &str) -> Result<bool> {
-        self.database.with_connection(|connection| {
-            let changed = connection.execute(
+        self.database.with_connection_mut(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let queued = transaction.execute(
                 "UPDATE jobs
                  SET state = 'cancelled', finished_at = ?2
-                 WHERE id = ?1 AND state IN ('queued','running')",
+                 WHERE id = ?1 AND state = 'queued'",
                 params![id, timestamp(Utc::now())],
             )?;
-            Ok(changed == 1)
+            let running = transaction.execute(
+                "UPDATE jobs SET cancel_requested = 1
+                 WHERE id = ?1 AND state = 'running' AND cancel_requested = 0",
+                [id],
+            )?;
+            prune_terminal_jobs(&transaction)?;
+            transaction.commit()?;
+            Ok(queued + running == 1)
+        })
+    }
+
+    /// Returns true while a running worker has an outstanding cooperative cancel request.
+    pub fn cancellation_requested(&self, id: &str) -> Result<bool> {
+        self.database.with_connection(|connection| {
+            Ok(connection
+                .query_row(
+                    "SELECT cancel_requested FROM jobs WHERE id = ?1 AND state = 'running'",
+                    [id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false))
         })
     }
 
@@ -170,7 +254,7 @@ impl JobQueue {
             let mut statement = connection.prepare(
                 "SELECT
                     id, kind, payload, state, priority, progress, error,
-                    created_at, started_at, finished_at
+                    created_at, started_at, finished_at, cancel_requested
                  FROM jobs
                  ORDER BY created_at DESC, id DESC
                  LIMIT 5000",
@@ -184,35 +268,148 @@ impl JobQueue {
 
     /// Resets jobs left `running` by a previous process to the queue.
     pub fn recover(&self) -> Result<usize> {
-        self.database.with_connection(|connection| {
-            let changed = connection.execute(
+        self.database.with_connection_mut(|connection| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let cancelled = transaction.execute(
+                "UPDATE jobs
+                 SET state = 'cancelled', finished_at = ?1, cancel_requested = 0
+                 WHERE state = 'running' AND cancel_requested = 1",
+                [timestamp(Utc::now())],
+            )?;
+            let requeued = transaction.execute(
                 "UPDATE jobs
                  SET state = 'queued',
                      progress = 0,
                      error = NULL,
                      started_at = NULL,
-                     finished_at = NULL
-                 WHERE state = 'running'",
+                     finished_at = NULL,
+                     cancel_requested = 0
+                 WHERE state = 'running' AND cancel_requested = 0",
                 [],
             )?;
-            Ok(changed)
+            transaction.commit()?;
+            Ok(cancelled + requeued)
         })
     }
 
     fn finish(&self, id: &str, state: &str, error: Option<&str>) -> Result<bool> {
-        self.database.with_connection(|connection| {
-            let changed = connection.execute(
+        self.database.with_connection_mut(|connection| {
+            let transaction = connection.transaction()?;
+            let changed = transaction.execute(
                 "UPDATE jobs
-                 SET state = ?2,
-                     progress = CASE WHEN ?2 = 'done' THEN 1 ELSE progress END,
-                     error = ?3,
-                     finished_at = ?4
+                 SET state = CASE WHEN cancel_requested = 1 THEN 'cancelled' ELSE ?2 END,
+                     progress = CASE
+                       WHEN cancel_requested = 0 AND ?2 = 'done' THEN 1 ELSE progress END,
+                     error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ?3 END,
+                     finished_at = ?4,
+                     cancel_requested = 0
                  WHERE id = ?1 AND state = 'running'",
                 params![id, state, error, timestamp(Utc::now())],
             )?;
+            prune_terminal_jobs(&transaction)?;
+            transaction.commit()?;
             Ok(changed == 1)
         })
     }
+}
+
+fn active_job(
+    connection: &rusqlite::Connection,
+    kind: &str,
+    key: ActiveJobKey<'_>,
+) -> Result<Option<Job>> {
+    let sql = match key {
+        ActiveJobKey::Kind => {
+            "SELECT id, kind, payload, state, priority, progress, error,
+                    created_at, started_at, finished_at, cancel_requested
+             FROM jobs
+             WHERE kind = ?1 AND state IN ('queued','running')
+             ORDER BY created_at, id LIMIT 1"
+        }
+        ActiveJobKey::AssetId(_) => {
+            "SELECT id, kind, payload, state, priority, progress, error,
+                    created_at, started_at, finished_at, cancel_requested
+             FROM jobs
+             WHERE kind = ?1 AND state IN ('queued','running')
+               AND json_extract(payload, '$.asset_id') = ?2
+             ORDER BY created_at, id LIMIT 1"
+        }
+    };
+    match key {
+        ActiveJobKey::Kind => connection
+            .query_row(sql, [kind], job_from_row)
+            .optional()
+            .map_err(Into::into),
+        ActiveJobKey::AssetId(asset_id) => connection
+            .query_row(sql, params![kind, asset_id], job_from_row)
+            .optional()
+            .map_err(Into::into),
+    }
+}
+
+fn enforce_admission(connection: &rusqlite::Connection, kind: &str) -> Result<()> {
+    let active: i64 = connection.query_row(
+        "SELECT count(*) FROM jobs WHERE state IN ('queued','running')",
+        [],
+        |row| row.get(0),
+    )?;
+    if active >= MAX_ACTIVE_JOBS as i64 {
+        return Err(Error::JobQueueFull);
+    }
+    if kind.starts_with("ml_") {
+        let active_ml: i64 = connection.query_row(
+            "SELECT count(*) FROM jobs
+             WHERE kind LIKE 'ml\\_%' ESCAPE '\\'
+               AND state IN ('queued','running')",
+            [],
+            |row| row.get(0),
+        )?;
+        if active_ml >= MAX_ACTIVE_ML_JOBS as i64 {
+            return Err(Error::JobQueueFull);
+        }
+    }
+    Ok(())
+}
+
+fn insert_job(
+    connection: &rusqlite::Connection,
+    kind: &str,
+    payload_json: &str,
+    priority: i64,
+) -> Result<Job> {
+    let id = Uuid::now_v7().to_string();
+    let created_at = timestamp(Utc::now());
+    connection.execute(
+        "INSERT INTO jobs(
+            id, kind, payload, state, priority, progress, error,
+            created_at, started_at, finished_at
+         ) VALUES (?1, ?2, ?3, 'queued', ?4, 0, NULL, ?5, NULL, NULL)",
+        params![id, kind, payload_json, priority, created_at],
+    )?;
+    job_by_id(connection, &id)?
+        .ok_or_else(|| Error::InvalidJobState("newly inserted job disappeared".to_owned()))
+}
+
+fn prune_terminal_jobs(connection: &rusqlite::Connection) -> Result<usize> {
+    let changed = connection.execute(
+        "DELETE FROM jobs
+         WHERE state IN ('done','failed','cancelled')
+           AND (
+             finished_at < datetime('now', ?1)
+             OR id IN (
+               SELECT id FROM jobs
+               WHERE state IN ('done','failed','cancelled')
+               ORDER BY COALESCE(finished_at, created_at) DESC, id DESC
+               LIMIT -1 OFFSET ?2
+             )
+           )",
+        params![
+            format!("-{TERMINAL_RETENTION_DAYS} days"),
+            MAX_TERMINAL_JOBS as i64
+        ],
+    )?;
+    Ok(changed)
 }
 
 type JobHandler = dyn Fn(&Database, &Job) -> Result<()> + Send + Sync + 'static;
@@ -338,17 +535,21 @@ fn worker_loop(
     while !shutdown.load(Ordering::Acquire) {
         match queue.claim() {
             Ok(Some(job)) => {
-                let result = handlers.get(&job.kind).map_or_else(
-                    || Err(Error::InvalidJobState("no handler registered".to_owned())),
-                    |handler| {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            handler(&database, &job)
-                        }))
-                        .unwrap_or_else(|_| {
-                            Err(Error::InvalidJobState("job handler panicked".to_owned()))
-                        })
-                    },
-                );
+                let result = if queue.cancellation_requested(&job.id).unwrap_or(true) {
+                    Ok(())
+                } else {
+                    handlers.get(&job.kind).map_or_else(
+                        || Err(Error::InvalidJobState("no handler registered".to_owned())),
+                        |handler| {
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                handler(&database, &job)
+                            }))
+                            .unwrap_or_else(|_| {
+                                Err(Error::InvalidJobState("job handler panicked".to_owned()))
+                            })
+                        },
+                    )
+                };
                 match result {
                     Ok(()) => {
                         let _ = queue.complete(&job.id);
@@ -447,7 +648,7 @@ fn job_by_id(connection: &rusqlite::Connection, id: &str) -> Result<Option<Job>>
         .query_row(
             "SELECT
                 id, kind, payload, state, priority, progress, error,
-                created_at, started_at, finished_at
+                created_at, started_at, finished_at, cancel_requested
              FROM jobs
              WHERE id = ?1",
             [id],
@@ -470,5 +671,6 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Job> {
         created_at: row.get(7)?,
         started_at: row.get(8)?,
         finished_at: row.get(9)?,
+        cancel_requested: row.get(10)?,
     })
 }

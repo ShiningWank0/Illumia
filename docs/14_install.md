@@ -5,13 +5,13 @@ Illumia は「サーバー 1 台 + 各端末のクライアント」という構
 
 | 形態 | 役割 | 配布物 |
 |---|---|---|
-| Docker (TrueNAS 等) | **サーバー** | GHCR の private イメージ |
+| Docker (TrueNAS 等) | **サーバー** | GHCR のdigest固定イメージ |
 | Web ブラウザ | クライアント | サーバーが配信 (追加インストール不要) |
 | Android | クライアント | GitHub Release の APK (サイドロード) |
 | macOS / Windows | クライアント / all-in-one | 現状は自前ビルド (下記参照) |
 
-> **リポジトリと GHCR イメージは private です。** 配布物を受け取るには
-> collaborator 招待か、`read:packages` 権限の Personal Access Token (PAT) が要ります。
+> リポジトリとGitHub Releaseはpublic。GHCR packageの公開状態はrelease notesを正とし、
+> pullが401になる環境でだけ `read:packages` 権限のPersonal Access Token (PAT)を使う。
 
 ---
 
@@ -21,11 +21,11 @@ TrueNAS 等の常時稼働機に立てる。詳細な運用手順は
 [docker/README.md](../docker/README.md)、セキュリティ要件は
 [docs/12_security.md](12_security.md) を参照。
 
-### 1-1. GHCR にログインする
+### 1-1. GHCR の認証を確認する
 
-イメージは private なので、まず認証する。GitHub の
-Settings → Developer settings → Personal access tokens で
-`read:packages` 権限の PAT を作る。
+public packageはログイン不要でpullできる。401が返る場合はGitHubの
+Settings → Developer settings → Personal access tokensで
+`read:packages` 権限のPATを作り、次のようにログインする。
 
 ```bash
 echo "<あなたのPAT>" | docker login ghcr.io -u <GitHubユーザー名> --password-stdin
@@ -35,12 +35,16 @@ echo "<あなたのPAT>" | docker login ghcr.io -u <GitHubユーザー名> --pas
 
 ```bash
 git clone https://github.com/ShiningWank0/Illumia.git
-cd Illumia/docker
-cp .env.example .env
+cd Illumia
+cp docker/.env.example docker/.env
 ```
 
-`.env` を編集し、`ILLUMIA_SETUP_TOKEN` に 32 文字以上のランダム値を設定する
+`docker/.env` を編集し、`ILLUMIA_SETUP_TOKEN` に 32 文字以上のランダム値を設定する
 (初回セットアップの横取りを防ぐため → docs/12)。
+さらに Release notes に記載された server/ML の immutable digest を
+`ILLUMIA_SERVER_DIGEST` / `ILLUMIA_ML_DIGEST` へ Release notes の64桁 digest 本体を設定する。
+repository と `@sha256:` は production Compose 内で固定し、環境変数から変更できない。
+`.env.example` の zero digest は安全な placeholder であり、そのままでは pull に失敗する。
 
 ```bash
 # 十分にランダムな setup token を生成する例
@@ -50,13 +54,13 @@ openssl rand -hex 32
 **権限を必ず絞る** (docs/12 が要求。世界読み取り可のままにしない):
 
 ```bash
-chmod 600 .env
+chmod 600 docker/.env
 ```
 
 ### 1-3. 起動する
 
 ```bash
-docker compose --profile ml up -d
+./docker/compose-prod.sh --profile ml up -d
 ```
 
 ML (キャラクター認識) を使わない場合は `--profile ml` を外す。
@@ -70,18 +74,19 @@ ML (キャラクター認識) を使わない場合は `--profile ml` を外す�
 ブラウザで `http://127.0.0.1:2283` を開き、パスワードを設定する。
 `ILLUMIA_SETUP_TOKEN` を設定した場合は、その値も入力する。
 
-セットアップ完了後は `.env` から setup token を削除するか rotate し、
+セットアップ完了後は `docker/.env` から setup token を削除するか rotate し、
 コンテナを再作成する。
 
 ### 1-5. 更新する
 
 ```bash
-docker compose pull
-docker compose --profile ml up -d
+./docker/compose-prod.sh --profile ml pull
+./docker/compose-prod.sh --profile ml up -d
 ```
 
-再現性を重視するなら、`latest` ではなく Release notes に載っている
-**digest 指定**を使う (例: `ghcr.io/shiningwank0/illumia-server@sha256:...`)。
+更新時は Release notes の server/ML digest を確認し、`docker/.env` の両値を明示的に更新してから
+pull する。mutable tag や `latest` は production 手順では使用しない。
+wrapper は digest 形式を検証し、`--no-build` で production Compose を起動する。
 
 ---
 
@@ -102,41 +107,14 @@ Google Play には公開しないため、APK を直接インストールする�
 
 ### 3-1. APK をダウンロードする
 
-リポジトリが private なので、**ブラウザでダウンロードするには GitHub に
-ログインしている必要がある**。
+publicなGitHub Releaseからブラウザで取得する。
 
-**方法 A: ブラウザ (かんたん)**
-
-1. Android 端末の Chrome で GitHub にログインする。
-2. <https://github.com/ShiningWank0/Illumia/releases/latest> を開く。
-3. `Assets` を展開し、`app-universal-release.apk` をタップする。
-4. 「この種類のファイルは端末に損害を与える可能性があります」と出るが、
+1. <https://github.com/ShiningWank0/Illumia/releases/latest> を開く。
+2. `Assets` を展開し、`app-universal-release.apk` をタップする。
+3. 「この種類のファイルは端末に損害を与える可能性があります」と出るが、
    自分でビルドした APK なので `OK` / `ダウンロード` を選ぶ。
 
-**方法 B: gh CLI (PC でダウンロードして転送)**
-
-```bash
-gh release download v0.2.0 --repo ShiningWank0/Illumia --pattern "*.apk"
-```
-
-**方法 C: curl (gh CLI が使えない環境)**
-
-`repo` 権限の PAT が必要。private リポジトリのアセットは、ブラウザ用 URL では
-なく **API の asset id** に対して `Accept: application/octet-stream` で
-取得する。
-
-```bash
-TOKEN=<あなたのPAT>; REPO=ShiningWank0/Illumia; TAG=v0.2.0
-ID=$(curl -sH "Authorization: Bearer $TOKEN" \
-  "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
-  | python3 -c "import sys,json;print([a['id'] for a in json.load(sys.stdin)['assets'] if a['name'].endswith('.apk')][0])")
-curl -L -o app-universal-release.apk \
-  -H "Authorization: Bearer $TOKEN" -H "Accept: application/octet-stream" \
-  "https://api.github.com/repos/$REPO/releases/assets/$ID"
-```
-
-> 素のブラウザ用 URL を `curl` で叩くと、APK ではなくログインページの HTML が
-> 落ちてくる。ダウンロード後は必ず 3-2 のハッシュ照合をすること。
+ダウンロード後は必ず3-2のハッシュと署名fingerprintを照合すること。
 
 ### 3-2. 配布物が本物か確認する (推奨)
 
@@ -188,7 +166,7 @@ adb install -r app-universal-release.apk
 ### 3-5. できること
 
 - タイムライン閲覧・ビューア・漫画スタック・検索・人物クラスタ・Vault
-- 生体認証による Vault アンロック
+- Vault のパスワードアンロック (生体認証は専用 Keystore 実装が完成するまで無効)
 - フォアグラウンドでの自動アップロード (アプリ起動中 + 手動「今すぐ同期」)
 
 バックグラウンド常駐での自動アップロードは未対応 (→ docs/10)。
@@ -244,11 +222,21 @@ ILLUMIA_DATA_DIR=~/Illumia ./target/release/illumia-desktop
 ```bash
 ILLUMIA_DESKTOP_MODE=client-only \
 ILLUMIA_SERVER_URL=https://illumia.example.com \
-ILLUMIA_DEVICE_TOKEN=<device token> \
 ./target/release/illumia-desktop
 ```
 
-`ILLUMIA_SERVER_URL` は `https` のみ (平文はループバックのみ許可)。
+初回は terminal で password を echo 無しで入力する。発行された device token と
+`instance_id` は macOS Keychain / Windows Credential Manager に保存され、以後は
+password の再入力なしで利用できる。token を環境変数やコマンドラインへ書かない。
+
+`ILLUMIA_SERVER_URL` は HTTPS を推奨する。平文 HTTP は loopback のみ指定できるが、起動の
+たびに警告への明示確認が必要で、Bearer token を送る前に unauthenticated
+`/api/server/info` の identity を secure storage の pin と照合する。初回 TOFU の pin も
+利用者が表示値を確認して承認するまで password を送らない。
+
+旧手順で `ILLUMIA_DEVICE_TOKEN` を shell に直接書いたことがある場合は、shell history から
+削除したうえで device 管理 API (`GET/DELETE /api/auth/devices`) から古い desktop token を
+失効し、新しい interactive login に移行する。
 
 ### 4-4. M6 v1 の制限
 

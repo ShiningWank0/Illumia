@@ -1,0 +1,14 @@
+services:
+  illumia-server:
+    image: illumia-server:dev
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+
+  illumia-ml:
+    image: illumia-ml:dev
+    pull_policy: build
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.ml

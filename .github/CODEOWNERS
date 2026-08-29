@@ -1,0 +1,9 @@
+# Security-sensitive surfaces require an explicit owner review.
+/.github/workflows/ @ShiningWank0
+/docker/ @ShiningWank0
+/crates/illumia-server/src/auth.rs @ShiningWank0
+/crates/illumia-server/src/security.rs @ShiningWank0
+/crates/illumia-core/src/vault.rs @ShiningWank0
+/crates/illumia-core/src/purge.rs @ShiningWank0
+/apps/android/src-tauri/src/bridge.rs @ShiningWank0
+/SECURITY.md @ShiningWank0

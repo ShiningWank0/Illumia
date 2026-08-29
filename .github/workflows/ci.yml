@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   # event_name を含めないと、release から呼ばれた CI (workflow_call) と
@@ -26,6 +27,33 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  workflow-security:
+    name: Workflow security
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Validate GitHub Actions syntax
+        uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          version: 1.7.12
+          fail-on-error: true
+          pyflakes: false
+          shellcheck: false
+      - name: Audit GitHub Actions security
+        uses: zizmorcore/zizmor-action@3dc1ecc9bcb9e94e9b2c709687979e1298497054 # v0.6.2
+        with:
+          version: 1.29.0
+          persona: auditor
+          min-severity: medium
+          min-confidence: high
+          online-audits: false
+          advanced-security: false
+          annotations: true
+
   changes:
     runs-on: ubuntu-latest
     # release から呼ばれたときは paths-filter を通さず全ジョブを走らせる。
@@ -34,11 +62,12 @@ jobs:
     outputs:
       rust: ${{ inputs.full && 'true' || steps.filter.outputs.rust }}
       web: ${{ inputs.full && 'true' || steps.filter.outputs.web }}
+      android: ${{ inputs.full && 'true' || steps.filter.outputs.android }}
       ml: ${{ inputs.full && 'true' || steps.filter.outputs.ml }}
       docker: ${{ inputs.full && 'true' || steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: ${{ !inputs.full }}
         id: filter
         with:
@@ -51,6 +80,9 @@ jobs:
               - '.github/workflows/**'
             web:
               - 'web/**'
+              - '.github/workflows/**'
+            android:
+              - 'apps/android/**'
               - '.github/workflows/**'
             ml:
               - 'ml/**'
@@ -75,7 +107,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # illumia-desktop (eframe/glow) のビルドに必要な X11/Wayland/GL の開発ヘッダ。
       - name: install desktop build dependencies
         run: |
@@ -121,6 +153,48 @@ jobs:
       - name: build
         run: npm run build
 
+  # apps/android/src-tauri は root から独立した Rust workspace なので専用 gate で検査する。
+  android:
+    needs: changes
+    if: needs.changes.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/android/src-tauri
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: apps/android/package-lock.json
+      - name: install Tauri host test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+      - name: verify locked Android manifests
+        run: cargo metadata --manifest-path apps/android/src-tauri/Cargo.toml --locked --format-version 1 >/dev/null
+      - name: fmt
+        run: cargo fmt --manifest-path apps/android/src-tauri/Cargo.toml --all --check
+      - name: clippy
+        run: cargo clippy --manifest-path apps/android/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
+      - name: test
+        run: cargo test --manifest-path apps/android/src-tauri/Cargo.toml --locked
+      - name: Android-target dependency audit
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file apps/android/src-tauri/Cargo.lock \
+            --target-os android --target-arch aarch64
+      - name: npm dependency audit
+        working-directory: apps/android
+        run: |
+          npm ci --ignore-scripts
+          npm audit --audit-level=high
+
   ml:
     needs: changes
     if: needs.changes.outputs.ml == 'true'
@@ -130,7 +204,7 @@ jobs:
         working-directory: ml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
       - run: uv sync --locked
@@ -164,7 +238,7 @@ jobs:
           cache: npm
           cache-dependency-path: web/package-lock.json
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: build server
         run: cargo build --release -p illumia-server
       - name: install web deps
@@ -191,15 +265,28 @@ jobs:
     if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - image: illumia-server
             dockerfile: docker/Dockerfile.server
+            trivyignore: .trivyignore.server.yaml
           - image: illumia-ml
             dockerfile: docker/Dockerfile.ml
+            trivyignore: .trivyignore.ml.yaml
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          version: v0.36.1
+      - name: validate production image and compose policy
+        env:
+          ILLUMIA_SERVER_DIGEST: '1111111111111111111111111111111111111111111111111111111111111111'
+          ILLUMIA_ML_DIGEST: '2222222222222222222222222222222222222222222222222222222222222222'
+        run: |
+          bash -n docker/compose-prod.sh
+          ./docker/compose-prod.sh --check-only
+          test "$(grep -Ec '^[[:space:]]+build:' docker/compose.dev.yaml)" -eq 2
       - name: validate compose
         run: docker compose --env-file docker/.env.example -f docker/compose.yaml --profile ml config --quiet
       - name: build ${{ matrix.image }} test image
@@ -213,20 +300,34 @@ jobs:
           build-args: SOURCE_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
+      - name: verify MiniZip attack surface is absent
+        if: matrix.image == 'illumia-server'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --entrypoint /bin/sh "$IMAGE:ci" -ceu '
+            ! command -v minizip
+            ! command -v miniunzip
+          '
       - name: scan ${{ matrix.image }} test image
+        env:
+          TRIVY_SHOW_SUPPRESSED: 'true'
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: ${{ matrix.image }}:ci
           format: table
           exit-code: '1'
-          ignore-unfixed: true
+          # 未修正でも既知の HIGH/CRITICAL を黙認しない。例外が必要なら
+          # vulnerability ID・根拠・owner・期限を持つ allowlist を別途レビューする。
+          ignore-unfixed: false
+          trivyignores: ${{ matrix.trivyignore }}
           vuln-type: os,library
           severity: HIGH,CRITICAL
 
   # ブランチ保護の必須チェックはこのジョブだけを指定する。
   # skip されたジョブは成功扱い、failure / cancelled があれば落とす。
   ci-ok:
-    needs: [changes, rust, web, ml, e2e, docker]
+    needs: [workflow-security, changes, rust, web, android, ml, e2e, docker]
     if: always()
     runs-on: ubuntu-latest
     steps:

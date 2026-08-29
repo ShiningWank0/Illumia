@@ -1,7 +1,7 @@
 //! SQLite 接続と versioned migration。
 
 use std::{
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -13,6 +13,9 @@ use zeroize::Zeroizing;
 const MIGRATIONS: &[(u32, &str)] = &[
     (1, include_str!("../migrations/0001_init.sql")),
     (2, include_str!("../migrations/0002_vault_blobs.sql")),
+    (3, include_str!("../migrations/0003_job_admission.sql")),
+    (4, include_str!("../migrations/0004_vault_transfers.sql")),
+    (5, include_str!("../migrations/0005_job_cancellation.sql")),
 ];
 
 /// illumia-core の共通エラー。
@@ -68,6 +71,8 @@ pub enum Error {
     JobRunnerAlreadyStarted,
     #[error("a job worker thread panicked")]
     JobWorkerPanicked,
+    #[error("job queue admission limit reached")]
+    JobQueueFull,
     #[error("vault is already initialized")]
     VaultAlreadyInitialized,
     #[error("vault is not initialized")]
@@ -103,9 +108,22 @@ struct DatabaseInner {
 }
 
 /// WAL 設定済みのメイン DB とデータディレクトリを束ねる共有ハンドル。
-#[derive(Clone, Debug)]
+type AccessGuard = dyn Fn() -> Result<()> + Send + Sync + 'static;
+
+#[derive(Clone)]
 pub struct Database {
     inner: Arc<DatabaseInner>,
+    access_guard: Option<Arc<AccessGuard>>,
+}
+
+impl fmt::Debug for Database {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Database")
+            .field("data_root", &self.inner.data_root)
+            .field("access_guarded", &self.access_guard.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Database {
@@ -118,12 +136,14 @@ impl Database {
         set_private_file_permissions(&database_path)?;
         configure(&connection)?;
         migrate(&mut connection)?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
         Ok(Self {
             inner: Arc::new(DatabaseInner {
                 connection: Mutex::new(connection),
                 data_root: data_root.to_path_buf(),
             }),
+            access_guard: None,
         })
     }
 
@@ -148,13 +168,28 @@ impl Database {
         connection.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))?;
         configure(&connection)?;
         migrate(&mut connection)?;
+        connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
 
         Ok(Self {
             inner: Arc::new(DatabaseInner {
                 connection: Mutex::new(connection),
                 data_root: data_root.to_path_buf(),
             }),
+            access_guard: None,
         })
+    }
+
+    /// Returns a request-scoped clone that revalidates access immediately before and after
+    /// every connection use, including after waiting for the process-wide SQLite mutex.
+    #[must_use]
+    pub fn with_access_guard(
+        &self,
+        guard: impl Fn() -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            access_guard: Some(Arc::new(guard)),
+        }
     }
 
     /// データルート。
@@ -168,24 +203,32 @@ impl Database {
         &self,
         operation: impl FnOnce(&Connection) -> Result<T>,
     ) -> Result<T> {
+        self.ensure_access()?;
         let connection = self
             .inner
             .connection
             .lock()
             .map_err(|_| Error::DatabasePoisoned)?;
-        operation(&connection)
+        self.ensure_access()?;
+        let result = operation(&connection);
+        self.ensure_access()?;
+        result
     }
 
     pub(crate) fn with_connection_mut<T>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T>,
     ) -> Result<T> {
+        self.ensure_access()?;
         let mut connection = self
             .inner
             .connection
             .lock()
             .map_err(|_| Error::DatabasePoisoned)?;
-        operation(&mut connection)
+        self.ensure_access()?;
+        let result = operation(&mut connection);
+        self.ensure_access()?;
+        result
     }
 
     /// WAL の内容を DB 本体へ反映して切り詰める。
@@ -194,6 +237,10 @@ impl Database {
             connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
             Ok(())
         })
+    }
+
+    fn ensure_access(&self) -> Result<()> {
+        self.access_guard.as_ref().map_or(Ok(()), |guard| guard())
     }
 }
 

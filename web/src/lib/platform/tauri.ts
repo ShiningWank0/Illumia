@@ -1,10 +1,8 @@
 // Tauri (アプリモード) 検出とネイティブ機能ブリッジ。
 // ブラウザでは何も読み込まない。すべて動的 import で、Tauri 実行時のみ解決する。
 //
-// 縮退方針 (docs/08):
-//  - デバイストークン / vault パスワードの永続保存には Android Keystore を使うのが理想だが、
-//    Tauri 公式の汎用 Keystore プラグインが無いため v1 は**メモリ内保持**とする
-//    (再起動で失われ、再ログイン / 再アンロックが必要)。Keystore 連携は将来タスク (docs/10)。
+// Android の device token は Rust bridge の process memory に閉じ込め、WebView へ返さない。
+// Keystore 永続化前の縮退として、再起動後は再ログインが必要 (docs/08, docs/10)。
 
 /** Tauri (ネイティブアプリ) 上で動いているか。 */
 export function isTauri(): boolean {
@@ -20,6 +18,16 @@ interface BridgeResponse {
   body_base64: string;
 }
 
+// multipart overhead を含む native bridge request envelope の上限。
+const MAX_NATIVE_REQUEST_BODY = 17 * 1024 * 1024;
+
+export interface NativeProbeResponse {
+  setup_completed: boolean;
+  authenticated: boolean;
+  setup_token_required: boolean;
+  instance_id: string;
+}
+
 function base64ToBytes(encoded: string): Uint8Array {
   const binary = atob(encoded);
   const bytes = new Uint8Array(binary.length);
@@ -29,6 +37,9 @@ function base64ToBytes(encoded: string): Uint8Array {
 
 async function bytesToBase64(body: BodyInit): Promise<string> {
   const buffer = await new Response(body).arrayBuffer();
+  if (buffer.byteLength > MAX_NATIVE_REQUEST_BODY) {
+    throw new Error('native request body exceeds the 17 MiB limit');
+  }
   const bytes = new Uint8Array(buffer);
   let binary = '';
   // 大きな body で引数上限に当たらないよう分割する。
@@ -43,13 +54,26 @@ async function bytesToBase64(body: BodyInit): Promise<string> {
 let boundBaseUrl: string | null = null;
 
 /**
- * ブリッジへ接続先サーバーを登録する。Rust 側でも URL を検証する。
- * 未登録のまま `illumia_request` を呼ぶと拒否される。
+ * credential 無しで native 側から server identity/schema を probe する。
  */
-export async function bindNativeServer(baseUrl: string | null): Promise<void> {
+export async function probeNativeServer(baseUrl: string): Promise<NativeProbeResponse> {
+  if (!isTauri()) {
+    const response = await fetch(`${baseUrl}/api/server/info`, { method: 'GET' });
+    if (!response.ok) throw new Error('server probe failed');
+    return (await response.json()) as NativeProbeResponse;
+  }
+  const { invoke } = await import('@tauri-apps/api/core');
+  return invoke<NativeProbeResponse>('illumia_probe_server', { url: baseUrl });
+}
+
+/**
+ * probe 済み origin と identity を Rust bridge に固定する。Rust 側は同じ値の再指定だけを
+ * 許し、別 origin への再 bind はアプリ再起動まで拒否する。
+ */
+export async function bindNativeServer(baseUrl: string, instanceId: string): Promise<void> {
   if (!isTauri()) return;
   const { invoke } = await import('@tauri-apps/api/core');
-  await invoke('illumia_set_server', { url: baseUrl });
+  await invoke('illumia_bind_server', { url: baseUrl, instanceId });
   boundBaseUrl = baseUrl;
 }
 
@@ -63,10 +87,12 @@ export async function nativeFetch(input: string, init?: RequestInit): Promise<Re
 
   const { invoke } = await import('@tauri-apps/api/core');
 
-  // input は絶対 URL。base 部分はブリッジ側の登録値と突き合わせるので path だけ渡す。
+  // input は絶対 URL。WebView から origin を変更しても自動再 bind しない。
   const url = new URL(input);
   const base = `${url.protocol}//${url.host}`;
-  if (boundBaseUrl !== base) await bindNativeServer(base);
+  if (boundBaseUrl !== base) {
+    throw new Error('native server origin is not bound; reconnect and restart the app');
+  }
 
   const headers: Record<string, string> = {};
   new Headers(init?.headers ?? {}).forEach((value, key) => {
@@ -90,50 +116,32 @@ export async function nativeFetch(input: string, init?: RequestInit): Promise<Re
   );
 }
 
-// ---- 生体認証 (vault アンロックの代替) ----
-
-export interface BiometricAvailability {
-  available: boolean;
-  reason?: string;
-}
-
-/** 端末が生体認証に対応しているか。 */
-export async function biometricStatus(): Promise<BiometricAvailability> {
-  if (!isTauri()) return { available: false, reason: 'not a native app' };
-  try {
-    const mod = await import('@tauri-apps/plugin-biometric');
-    const status = await mod.checkStatus();
-    return { available: status.isAvailable, reason: status.error };
-  } catch (e) {
-    return { available: false, reason: e instanceof Error ? e.message : 'biometric unavailable' };
-  }
-}
-
 /**
- * 生体認証を要求する。成功で true。
- * ここでは「認証の可否」だけを扱い、鍵素材は扱わない (docs/06 の脅威モデル)。
+ * Androidの原本をBase64 IPCへ載せず、native保存先へ直接streamする。
+ * Rust側がmain/Vaultのoriginal endpoint、origin、headersを再検証する。
  */
-export async function biometricAuthenticate(reason: string): Promise<boolean> {
-  if (!isTauri()) return false;
-  try {
-    const mod = await import('@tauri-apps/plugin-biometric');
-    await mod.authenticate(reason, { allowDeviceCredential: true });
-    return true;
-  } catch {
-    return false;
+export async function downloadNativeOriginal(
+  input: string,
+  filename: string,
+  headers: Record<string, string>
+): Promise<boolean> {
+  if (!isTauri()) throw new Error('native download is unavailable');
+  const { invoke } = await import('@tauri-apps/api/core');
+  const url = new URL(input);
+  const base = `${url.protocol}//${url.host}`;
+  if (boundBaseUrl !== base) {
+    throw new Error('native server origin is not bound; reconnect and restart the app');
   }
+  return invoke<boolean>('illumia_download_original', {
+    path: `${url.pathname}${url.search}`,
+    headers,
+    filename
+  });
 }
 
-// ---- セキュアストレージ (現状はメモリ内。将来 Keystore 連携) ----
-
-const memoryStore = new Map<string, string>();
-
-export function secureSet(key: string, value: string): void {
-  memoryStore.set(key, value);
-}
-export function secureGet(key: string): string | null {
-  return memoryStore.get(key) ?? null;
-}
-export function secureDelete(key: string): void {
-  memoryStore.delete(key);
+/** logout の成否にかかわらず Rust process memory の device token を破棄する。 */
+export async function clearNativeAuth(): Promise<void> {
+  if (!isTauri()) return;
+  const { invoke } = await import('@tauri-apps/api/core');
+  await invoke('illumia_clear_auth');
 }
