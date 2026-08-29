@@ -67,12 +67,12 @@
 
 - `ci.yml`: push / PR で実行。paths-filter により変更のあったコンポーネントのみ
   lint + test を走らせる (docs のみの変更でも全体は green になる)。
-  集約ジョブ `ci-ok` をブランチ保護の必須チェックにする。
+  全jobの結果は集約ジョブ `ci-ok` で判定する。
 - 全PR / mainのcheckout済みtreeをTrivy filesystem secret scannerで検査し、検出時は
   `ci-ok` を失敗させる。これはGitHub secret scanningの履歴検査を置き換えず、PRへ新しい
   credentialや秘密鍵を混入させないための追加gateとする。
-- `codeql.yml`: main / PR / 週次で JavaScript/TypeScript、Python、Rust を CodeQL の
-  `security-extended` query で解析する。結果の upload に必要な
+- `codeql.yml`: main / PR / 週次に加え、release workflowからtag / dry-runの同一commitを
+  JavaScript/TypeScript、Python、Rust の CodeQL `security-extended` query で解析する。結果のuploadに必要な
   `security-events: write` 以外は read-only とし、Action は commit SHA へ固定する。
 - `apps/android/**` は独立 Rust workspace / npm lockfile として専用 job で
   `cargo metadata --locked`、fmt、clippy、test、Android target に絞った `cargo audit`、
@@ -87,10 +87,14 @@
   BuildKitで実imageをbuildし、TrivyでHIGH/CRITICALをscanする。
 - `release.yml`: タグ `v*` / 手動 (workflow_dispatch) で本番ビルド。
   公開は `v*` tag の push event からだけ許可し、手動実行は選択refがtagでも常にdry-runとする。
+  production keyを任意refの署名に使わせないため、手動dry-runでのAndroid署名はrepositoryの
+  default branchを選択した場合だけ実行する。release自身が同一commitのfull CIとCodeQLを呼び出す。
   container は publish 時に1回だけbuildしてtag無しのcandidate digestとしてpushし、そのdigestを
-  Trivyでscanする。全container candidateのscanと他の配布build/sign jobの成功後、
-  `release-production` environmentのrequired reviewer承認を待ち、単一jobが同じdigestへ
-  version/`latest` tagを付ける。承認は公開前の実環境チェックリストを確認してから行う。
+  Trivyでscanする。全container candidateのscanと他の配布build/sign jobの成功後、allowlist済み
+  asset bundleでdraft Releaseを作り、単一jobが同じdigestへversion/`latest` tagを付ける。全digest
+  一致を再確認してからdraftを公開する。途中失敗は非公開draftとprivate GHCRに留め、検証bundleの
+  保持期間である1日以内に同一runのfailed `publish-release` jobを再実行して回復する。tagのpushを公開指示として
+  扱うため、tag作成者は事前にdocs/15のAを完了する。
   scan前に配布tagを付けたり、scan後に同じcontextを再buildした別imageを配布したり、
   matrix途中で一部imageだけを先行公開したりしない。
   コンポーネント未実装の間は preflight 判定で該当ジョブを自動スキップする。
@@ -106,22 +110,13 @@
 - production Compose/TrueNAS 手順は release が記録した `image@sha256:<digest>` を必須とし、
   mutable tag へ暗黙 fallback させない。CI の Compose validation では test 用 digest を明示する。
 
-## GitHub repository security settings
+## GitHub repository security notes
 
-- `main` は ruleset / branch protection で PR 経由を必須にし、`ci-ok` と CodeQL の成功を
-  required check にする。force-push と branch deletion は禁止する。
-- vulnerability alerts / Dependabot alerts、secret scanning、private vulnerability reporting
-  を有効化する。公開前に Security タブで未解決 alert が 0 件であることを確認する。
-- Dependency Review Actionを利用できるrepository visibility / planでは、Dependency Graphを
-  有効化し、canary PRの成功と実際のcheck名を確認してからrequired checkへ追加する。個人所有の
-  private repositoryなど利用資格を満たさない場合はrequiredにしない。依存manifest/lockfile変更時は
-  対応ecosystemのCargo/npm/Python監査を `ci-ok` へ必ず集約し、releaseのfull CIでは全lockfileを
-  監査する。visibility変更時はrequired checkの利用可否を再確認する。
+- vulnerability alerts / Dependabot alerts、secret scanning、private vulnerability reportingを
+  利用できる場合は補助的な検知として有効化する。CIのCargo/npm/Python audit、CodeQL、Trivy、
+  repository secret scanを置き換えるものとして扱わない。
 - 脆弱性報告は `SECURITY.md` に従い public Issue へ機密情報を書かない。
 - `CODEOWNERS` は security-sensitive な workflow、Docker、認証、Vault、native bridge を
   repository owner のレビュー対象として明示する。
-- Android署名secretは `release-signing` environmentにだけ登録し、公開releaseでは
-  reviewer approvalを必須にする。通常のbuild jobへ署名secretを渡さない。
-- `release-production` environmentにもrequired reviewerを設定する。全build/scan/sign成功後、
-  container digestのpromotionとGitHub Release作成より前に1回だけ承認し、docs/12の実環境
-  チェック結果を確認する。このenvironmentにはsecretを登録しない。
+- Android署名secretは `release-signing` environmentにだけ登録する。通常のbuild jobへ
+  署名secretを渡さず、repository codeをcheckoutしない専用jobだけで使用する。

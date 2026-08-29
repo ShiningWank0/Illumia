@@ -34,6 +34,7 @@ jobs:
       desktop: ${{ steps.check.outputs.desktop }}
       android: ${{ steps.check.outputs.android }}
       version: ${{ steps.check.outputs.version }}
+      commit_sha: ${{ steps.check.outputs.commit_sha }}
       owner_lc: ${{ steps.check.outputs.owner_lc }}
       publish: ${{ steps.check.outputs.publish }}
     steps:
@@ -46,6 +47,7 @@ jobs:
           [ -f docker/Dockerfile.ml ] && out docker_ml true || out docker_ml false
           [ -f crates/illumia-desktop/Cargo.toml ] && out desktop true || out desktop false
           [ -f apps/android/src-tauri/tauri.conf.json ] && out android true || out android false
+          out commit_sha "$(git rev-parse HEAD)"
           # Docker のリポジトリ名は小文字必須 (owner に大文字が含まれるため変換)
           out owner_lc "${GITHUB_REPOSITORY_OWNER,,}"
           if [[ "${{ github.event_name }}" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
@@ -73,6 +75,16 @@ jobs:
       contents: read
     with:
       full: true
+
+  # tag / dry-run の同一commitへCodeQL 3言語を直接実行する。
+  # mainの保護設定や過去runの状態には依存しない。
+  codeql:
+    needs: preflight
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
 
   docker:
     needs: [preflight, ci]
@@ -220,43 +232,25 @@ jobs:
           name: candidate-digest-${{ matrix.image }}
           path: digests/*
 
-  # 全build/scan/sign成功後、公開担当者がdocs/12の実環境gateを確認する。
-  # environmentにrequired reviewerを設定し、promotion/Release作成を承認前に止める。
-  release-approval:
-    name: Production release approval
-    needs: [preflight, ci, docker, desktop, android, android-sign]
+  # 検証済みbundleからdraft Releaseを作ってからprivate GHCRのdigestをpromotionし、
+  # 全件のdigest一致を確認した最後にdraftを公開する。分散transaction途中の失敗は
+  # 非公開draftとprivate GHCRに限定し、同一runのfailed job rerunで回復する。
+  publish-release:
+    needs: [preflight, prepare-release]
     if: >-
       always() &&
       needs.preflight.outputs.publish == 'true' &&
-      needs.ci.result == 'success' &&
-      needs.docker.result == 'success' &&
-      !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled')
-    runs-on: ubuntu-latest
-    environment: release-production
-    permissions: {}
-    steps:
-      - name: record approval
-        run: echo "Production release approved after external gate review"
-
-  # 全imageのcandidate scanと他の配布build/sign、公開承認の成功後だけ、
-  # 単一jobが同じdigestへrelease tagを付ける。途中失敗でcontainerだけが公開される
-  # 状態を作らない。
-  docker-promote:
-    needs: [preflight, ci, docker, desktop, android, android-sign, release-approval]
-    if: >-
-      always() &&
-      needs.preflight.outputs.publish == 'true' &&
-      needs.ci.result == 'success' &&
-      needs.docker.result == 'success' &&
-      needs.release-approval.result == 'success' &&
-      !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled')
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.prepare-release.result == 'success'
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: validated-release-bundle
+          path: prepared
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: candidate-digest-*
@@ -270,7 +264,7 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: promote all scanned candidate digests
+      - name: validate candidate digests and immutable version tags
         env:
           EXPECT_ML: ${{ needs.preflight.outputs.docker_ml }}
           IMAGE_OWNER: ${{ needs.preflight.outputs.owner_lc }}
@@ -291,8 +285,7 @@ jobs:
             exit 1
           fi
 
-          images=()
-          digests=()
+          : > promotion-plan.txt
           declare -A seen_images=()
           for file in "${files[@]}"; do
             ref=$(tr -d '\r\n' < "$file")
@@ -307,8 +300,7 @@ jobs:
               exit 1
             fi
             seen_images[$image]=1
-            images+=("$image")
-            digests+=("$digest")
+            printf '%s %s\n' "$image" "$digest" >> promotion-plan.txt
           done
 
           inspect_existing_digest() {
@@ -338,10 +330,13 @@ jobs:
           # どのversion tagも変更しないことを全件先に確認する。
           inspect_error=$(mktemp)
           trap 'rm -f "$inspect_error"' EXIT
-          for index in "${!images[@]}"; do
-            version_ref="${images[$index]}:$VERSION"
+          while read -r image digest extra; do
+            if [ -n "${extra:-}" ]; then
+              echo "::error::invalid promotion plan"; exit 1
+            fi
+            version_ref="$image:$VERSION"
             if existing=$(inspect_existing_digest "$version_ref" "$inspect_error"); then
-              if [ "$existing" != "${digests[$index]}" ]; then
+              if [ "$existing" != "$digest" ]; then
                 echo "::error::immutable version tag already points to a different digest"
                 exit 1
               fi
@@ -352,14 +347,157 @@ jobs:
                 exit "$status"
               fi
             fi
-          done
+          done < promotion-plan.txt
           rm -f "$inspect_error"
           trap - EXIT
+          if [ "$(wc -l < promotion-plan.txt)" -ne "$expected" ]; then
+            echo "::error::invalid promotion plan count"; exit 1
+          fi
+          chmod 0444 promotion-plan.txt
+
+      - name: verify tag still targets analyzed commit
+        env:
+          API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.commit_sha }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          response=$(mktemp)
+          cleanup() { rm -f "$response"; }
+          trap cleanup EXIT
+          status=$(curl --silent --show-error --retry 3 --retry-all-errors \
+            --output "$response" --write-out '%{http_code}' \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/ref/tags/$VERSION")
+          if [ "$status" != 200 ]; then
+            echo "::error::could not verify release tag ref"; exit 1
+          fi
+          object_type=$(jq -r '.object.type // ""' "$response")
+          object_sha=$(jq -r '.object.sha // ""' "$response")
+          for _depth in $(seq 1 8); do
+            [ "$object_type" != tag ] && break
+            status=$(curl --silent --show-error --retry 3 --retry-all-errors \
+              --output "$response" --write-out '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $API_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/git/tags/$object_sha")
+            if [ "$status" != 200 ]; then
+              echo "::error::could not peel annotated release tag"; exit 1
+            fi
+            object_type=$(jq -r '.object.type // ""' "$response")
+            object_sha=$(jq -r '.object.sha // ""' "$response")
+          done
+          if [ "$object_type" != commit ] || [ "$object_sha" != "$SOURCE_COMMIT" ]; then
+            echo "::error::release tag no longer targets the analyzed commit"
+            exit 1
+          fi
+          cleanup
+          trap - EXIT
+
+      # 公開済みReleaseをdraftへ戻したりassetを上書きしたりしない。
+      # absentまたは同tagの非公開draftだけを許可する。
+      - name: verify existing release state
+        env:
+          API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          response=$(mktemp)
+          expected_assets=$(mktemp)
+          existing_assets=$(mktemp)
+          existing_body=$(mktemp)
+          cleanup() {
+            rm -f "$response" "$expected_assets" "$existing_assets" "$existing_body"
+          }
+          trap cleanup EXIT
+          find prepared/release-assets -maxdepth 1 -type f -printf '%f\n' | sort > "$expected_assets"
+          test -s "$expected_assets"
+          found=0
+          state=
+          complete=false
+          for page in $(seq 1 100); do
+            status=$(curl --silent --show-error --retry 3 --retry-all-errors \
+              --output "$response" --write-out '%{http_code}' \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $API_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases?per_page=100&page=$page")
+            if [ "$status" != 200 ] || ! jq -e 'type == "array"' "$response" >/dev/null; then
+              echo "::error::could not verify existing release state"; exit 1
+            fi
+            count=$(jq 'length' "$response")
+            matches=$(jq --arg version "$VERSION" \
+              '[.[] | select(.tag_name == $version)] | length' "$response")
+            if [ "$matches" -gt 1 ] || { [ "$matches" -eq 1 ] && [ "$found" -ne 0 ]; }; then
+              echo "::error::duplicate release records for tag"; exit 1
+            fi
+            if [ "$matches" -eq 1 ]; then
+              found=1
+              state=$(jq -r --arg version "$VERSION" \
+                '.[] | select(.tag_name == $version) | .draft' "$response")
+              jq -r --arg version "$VERSION" \
+                '.[] | select(.tag_name == $version) | .assets[].name' \
+                "$response" | sort > "$existing_assets"
+              jq -j --arg version "$VERSION" \
+                '.[] | select(.tag_name == $version) | (.body // "")' \
+                "$response" > "$existing_body"
+            fi
+            if [ "$count" -lt 100 ]; then
+              complete=true
+              break
+            fi
+          done
+          if [ "$complete" != true ]; then
+            echo "::error::release enumeration exceeded safety limit"; exit 1
+          fi
+          if [ "$found" -eq 1 ] && [ "$state" != true ]; then
+            echo "::error::release for this tag is already published; refusing mutation"
+            exit 1
+          fi
+          if [ "$found" -eq 1 ]; then
+            if ! cmp -s "$existing_body" prepared/release-notes.md; then
+              echo "::error::existing draft belongs to a different release candidate"
+              exit 1
+            fi
+            if [ "$(sort -u "$existing_assets" | wc -l)" -ne "$(wc -l < "$existing_assets")" ] ||
+               [ -n "$(comm -23 "$existing_assets" "$expected_assets")" ]; then
+              echo "::error::existing draft contains unexpected release assets"
+              exit 1
+            fi
+          fi
+          cleanup
+          trap - EXIT
+
+      - name: create validated draft release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          name: Illumia ${{ needs.preflight.outputs.version }}
+          files: prepared/release-assets/*
+          body_path: prepared/release-notes.md
+          generate_release_notes: false
+          draft: true
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
+
+      - name: promote all scanned candidate digests
+        env:
+          IMAGE_OWNER: ${{ needs.preflight.outputs.owner_lc }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -f promotion-plan.txt
 
           # 単一source digestをcarbon-copyしてversion/latestへ付与する。
-          for index in "${!images[@]}"; do
-            image=${images[$index]}
-            digest=${digests[$index]}
+          while read -r image digest extra; do
+            if [ -n "${extra:-}" ] ||
+               [[ ! "$image" =~ ^ghcr\.io/$IMAGE_OWNER/illumia-(server|ml)$ ]] ||
+               [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::invalid promotion plan"; exit 1
+            fi
             docker buildx imagetools create --prefer-index=false \
               --tag "$image:$VERSION" --tag "$image:latest" "$image@$digest"
             for tag in "$image:$VERSION" "$image:latest"; do
@@ -371,7 +509,21 @@ jobs:
                 exit 1
               fi
             done
-          done
+          done < promotion-plan.txt
+
+      # draftを再利用し、検証済みassetを再照合・上書きしてから公開する。
+      # promotion途中で失敗したrunではこのstepへ到達しない。
+      - name: publish validated release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          name: Illumia ${{ needs.preflight.outputs.version }}
+          files: prepared/release-assets/*
+          body_path: prepared/release-notes.md
+          generate_release_notes: false
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: true
 
   # 未署名バイナリは配布しない (SEC-007)。ビルド検証と CI artifact 保管のみ行い、
   # GitHub Release へは添付しない。署名・公証を導入したら publish 対象へ戻す。
@@ -468,13 +620,14 @@ jobs:
   # 依存package・Gradle pluginを実行するbuild jobへ署名鍵を渡さない。
   # CI済みのunsigned APKだけを、repository codeをcheckoutしない専用jobで署名する。
   android-sign:
-    needs: [preflight, ci, android]
+    needs: [preflight, ci, codeql, android]
     if: >-
       needs.preflight.outputs.android == 'true' &&
-      needs.preflight.outputs.publish == 'true'
+      (needs.preflight.outputs.publish == 'true' ||
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
     runs-on: ubuntu-latest
-    # 署名secretは専用environmentへ隔離する。Repository settingsでこのenvironmentに
-    # release担当者のapproval ruleを設定する。
+    # 署名secretは専用environmentへ隔離する。手動dry-runではdefault branchだけを署名し、
+    # production keyを任意refの署名oracleにしない。
     environment: release-signing
     permissions:
       contents: read
@@ -557,21 +710,21 @@ jobs:
             signed/*.apk
             fingerprints/*
 
-  # タグ push のとき、署名済み成果物だけを GitHub Release に添付する。
-  # 未署名 desktop バイナリは対象外 (SEC-007)。
-  publish-release:
-    needs: [preflight, ci, docker, docker-promote, desktop, android, android-sign, release-approval]
+  # 全build/scan/signの完了後、署名済み成果物とprovenanceをread-onlyで検証し、
+  # promotion前に再利用可能なbundleへ固定する。未署名desktopは対象外 (SEC-007)。
+  prepare-release:
+    needs: [preflight, ci, codeql, docker, desktop, android, android-sign]
     if: >-
       always() && needs.preflight.outputs.publish == 'true' &&
       startsWith(github.ref, 'refs/tags/v') &&
       needs.ci.result == 'success' &&
-      needs.release-approval.result == 'success' &&
-      needs.docker-promote.result == 'success' &&
+      needs.codeql.result == 'success' &&
+      needs.docker.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
       (needs.android.result == 'success' || needs.docker.result == 'success')
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
@@ -689,12 +842,14 @@ jobs:
           test -s provenance.txt
           cat provenance.txt
       - name: compose provenance notes
+        env:
+          SOURCE_COMMIT: ${{ needs.preflight.outputs.commit_sha }}
         run: |
           {
             echo "## 配布物の同一性"
             echo
             echo "- tag: \`${GITHUB_REF#refs/tags/}\`"
-            echo "- commit: \`$GITHUB_SHA\`"
+            echo "- commit: \`$SOURCE_COMMIT\`"
             echo
             # allowlistでstage・検証したprovenanceだけを公開する。
             if [ -s provenance.txt ]; then
@@ -710,14 +865,18 @@ jobs:
             echo
             echo "## 実環境ゲート"
             echo
-            echo "このReleaseは release-production 承認者がdocs/15のA/Bをprivate証跡で"
-            echo "確認した後に公開されています。endpoint等の機密情報は公開しません。"
+            echo "公開前の実環境確認はCIでは代替できません。tag作成者はdocs/15のAを"
+            echo "完了してからtagをpushしてください。このworkflow実行がBです。"
+            echo "endpoint等の機密情報は公開しません。"
             echo "公開後はdocs/15のCでdigest、APK、GHCR権限、repository visibilityを照合し、"
             echo "Cが成功するまでreleaseを完了扱いにしません。"
           } > release-notes.md
           cat release-notes.md
-      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          files: release-assets/*
-          body_path: release-notes.md
-          generate_release_notes: true
+          name: validated-release-bundle
+          path: |
+            release-assets/
+            release-notes.md
+          if-no-files-found: error
+          retention-days: 1
