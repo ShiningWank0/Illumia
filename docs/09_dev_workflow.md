@@ -71,6 +71,8 @@
 - 全PR / mainのcheckout済みtreeをTrivy filesystem secret scannerで検査し、検出時は
   `ci-ok` を失敗させる。これはGitHub secret scanningの履歴検査を置き換えず、PRへ新しい
   credentialや秘密鍵を混入させないための追加gateとする。
+- 全PRでmanifest、実行時version、Cargo/npm/uv lockfile内のIllumia自身のversionを照合し、
+  不一致を `ci-ok` で失敗させる。tag releaseでは同じ検査をtag文字列とも照合する。
 - `codeql.yml`: main / PR / 週次に加え、release workflowからtag / dry-runの同一commitを
   JavaScript/TypeScript、Python、Rust の CodeQL `security-extended` query で解析する。結果のuploadに必要な
   `security-events: write` 以外は read-only とし、Action は commit SHA へ固定する。
