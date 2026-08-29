@@ -220,16 +220,36 @@ jobs:
           name: candidate-digest-${{ matrix.image }}
           path: digests/*
 
-  # 全imageのcandidate scan成功後だけ、単一jobが同じdigestへrelease tagを付ける。
-  # 他の配布build/signも全て成功してから実行し、途中失敗でcontainerだけが公開される
-  # 状態を作らない。
-  docker-promote:
+  # 全build/scan/sign成功後、公開担当者がdocs/12の実環境gateを確認する。
+  # environmentにrequired reviewerを設定し、promotion/Release作成を承認前に止める。
+  release-approval:
+    name: Production release approval
     needs: [preflight, ci, docker, desktop, android, android-sign]
     if: >-
       always() &&
       needs.preflight.outputs.publish == 'true' &&
       needs.ci.result == 'success' &&
       needs.docker.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    environment: release-production
+    permissions: {}
+    steps:
+      - name: record approval
+        run: echo "Production release approved after external gate review"
+
+  # 全imageのcandidate scanと他の配布build/sign、公開承認の成功後だけ、
+  # 単一jobが同じdigestへrelease tagを付ける。途中失敗でcontainerだけが公開される
+  # 状態を作らない。
+  docker-promote:
+    needs: [preflight, ci, docker, desktop, android, android-sign, release-approval]
+    if: >-
+      always() &&
+      needs.preflight.outputs.publish == 'true' &&
+      needs.ci.result == 'success' &&
+      needs.docker.result == 'success' &&
+      needs.release-approval.result == 'success' &&
       !contains(needs.*.result, 'failure') &&
       !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
@@ -525,11 +545,12 @@ jobs:
   # タグ push のとき、署名済み成果物だけを GitHub Release に添付する。
   # 未署名 desktop バイナリは対象外 (SEC-007)。
   publish-release:
-    needs: [preflight, ci, docker, docker-promote, desktop, android, android-sign]
+    needs: [preflight, ci, docker, docker-promote, desktop, android, android-sign, release-approval]
     if: >-
       always() && needs.preflight.outputs.publish == 'true' &&
       startsWith(github.ref, 'refs/tags/v') &&
       needs.ci.result == 'success' &&
+      needs.release-approval.result == 'success' &&
       needs.docker-promote.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
       (needs.android.result == 'success' || needs.docker.result == 'success')
