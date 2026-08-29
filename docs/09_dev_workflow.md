@@ -68,6 +68,9 @@
 - `ci.yml`: push / PR で実行。paths-filter により変更のあったコンポーネントのみ
   lint + test を走らせる (docs のみの変更でも全体は green になる)。
   集約ジョブ `ci-ok` をブランチ保護の必須チェックにする。
+- 全PR / mainのcheckout済みtreeをTrivy filesystem secret scannerで検査し、検出時は
+  `ci-ok` を失敗させる。これはGitHub secret scanningの履歴検査を置き換えず、PRへ新しい
+  credentialや秘密鍵を混入させないための追加gateとする。
 - `codeql.yml`: main / PR / 週次で JavaScript/TypeScript、Python、Rust を CodeQL の
   `security-extended` query で解析する。結果の upload に必要な
   `security-events: write` 以外は read-only とし、Action は commit SHA へ固定する。

@@ -54,6 +54,27 @@ jobs:
           advanced-security: false
           annotations: true
 
+  # 一時的にpublicでCIを実行する場合も、PRの現在treeへcredentialや秘密鍵を混入させない。
+  # GitHub secret scanningは履歴全体、これはcheckout済みtreeを対象とする相補的なgate。
+  repository-secrets:
+    name: Repository secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: scan current tree for secrets
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          version: v0.70.0
+          scan-type: fs
+          scan-ref: .
+          scanners: secret
+          format: table
+          exit-code: '1'
+
   changes:
     runs-on: ubuntu-latest
     # release から呼ばれたときは paths-filter を通さず全ジョブを走らせる。
@@ -327,7 +348,7 @@ jobs:
   # ブランチ保護の必須チェックはこのジョブだけを指定する。
   # skip されたジョブは成功扱い、failure / cancelled があれば落とす。
   ci-ok:
-    needs: [workflow-security, changes, rust, web, android, ml, e2e, docker]
+    needs: [workflow-security, repository-secrets, changes, rust, web, android, ml, e2e, docker]
     if: always()
     runs-on: ubuntu-latest
     steps:
