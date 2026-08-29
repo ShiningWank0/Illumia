@@ -3,9 +3,10 @@
 > **配布ポリシー (重要)**: リポジトリ、GitHub Release、
 > `ghcr.io/shiningwank0/illumia-server` / `illumia-ml` package は通常 **private** とする。
 > GitHub Actionsの実行枠を確保するためリポジトリを一時的にpublicへ切り替えることはあるが、
-> その期間は本番tagや配布物を公開せず、完了後にprivateへ戻す。packageのVisibilityもpublicへ
-> 変更しない。配布先はcollaboratorへ限定するか、`read:packages` だけを持つtokenで認証し、
-> release notesに記録したimmutable digestをpullする。
+> GitHub Releaseはその期間中に公開してよい。公開repository上のReleaseは第三者から閲覧可能に
+> なることを理解した上で実行し、CI/CD作業後はrepositoryをprivateへ戻す。GHCR packageの
+> Visibilityはpublicへ変更せず、配布先はcollaboratorへ限定するか、`read:packages` だけを持つ
+> tokenで認証し、release notesに記録したimmutable digestをpullする。
 
 Illumia のサーバーと Web UI を1つのコンテナで実行します。コンテナは TCP
 `0.0.0.0:2283` で待ち受けますが、Compose が host へ publish するのは既定で

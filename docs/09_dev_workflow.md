@@ -84,8 +84,6 @@
   BuildKitで実imageをbuildし、TrivyでHIGH/CRITICALをscanする。
 - `release.yml`: タグ `v*` / 手動 (workflow_dispatch) で本番ビルド。
   公開は `v*` tag の push event からだけ許可し、手動実行は選択refがtagでも常にdry-runとする。
-  tag publish時はrepositoryがprivateであることをpreflightで必須化し、CI枠確保のための
-  一時public状態では本番image・署名APK・GitHub Releaseを一切公開しない。
   container は publish 時に1回だけbuildしてtag無しのcandidate digestとしてpushし、そのdigestを
   Trivyでscanする。全container candidateのscanと他の配布build/sign jobの成功後、単一jobが
   同じdigestへversion/`latest` tagを付ける。scan前に配布tagを付けたり、scan後に同じcontextを

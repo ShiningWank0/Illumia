@@ -55,16 +55,6 @@ jobs:
             out version "dev-$(git rev-parse --short HEAD)"
             out publish false
           fi
-      # CI枠確保のため一時的にpublicへ変更している間は、本番配布をfail closedにする。
-      # workflow_dispatchは常にdry-runなのでこのgateの対象外。
-      - name: refuse production release from a public repository
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        env:
-          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
-        run: |
-          if [[ "$REPOSITORY_PRIVATE" != "true" ]]; then
-            echo "::error::Production releases require the repository to be private"; exit 1
-          fi
       # タグと全 manifest の version 一致を必須にする (SEC-006)。
       # 不一致のまま publish すると、GHCR のタグと server が返す version がずれる。
       - name: verify component versions

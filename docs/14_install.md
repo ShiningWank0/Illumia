@@ -11,8 +11,10 @@ Illumia は「サーバー 1 台 + 各端末のクライアント」という構
 | macOS / Windows | クライアント / all-in-one | 現状は自前ビルド (下記参照) |
 
 > リポジトリ、GitHub Release、GHCR packageは通常private。CI/CDの実行枠を確保するため
-> リポジトリを一時的にpublicへ切り替える場合も、本番tagや配布物は公開せず、CI完了後に
-> privateへ戻す。配布先はcollaboratorまたは最小権限のtokenを持つ利用者に限定する。
+> リポジトリを一時的にpublicへ切り替えることがあり、その期間中にGitHub Releaseを公開してもよい。
+> public期間中のReleaseは第三者から閲覧可能になるため、公開を意図した内容だけを含め、作業後は
+> repositoryをprivateへ戻す。GHCR packageはprivateを維持し、配布先はcollaboratorまたは
+> 最小権限のtokenを持つ利用者に限定する。
 
 ---
 
