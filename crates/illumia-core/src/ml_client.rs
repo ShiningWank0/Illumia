@@ -41,6 +41,10 @@ const MAX_HEALTH_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_ANALYZE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_CLUSTER_RESPONSE_BYTES: usize = 1024 * 1024;
+// Darwin's SO_RCVTIMEO/SO_SNDTIMEO converts sub-microsecond durations to a zero timeval,
+// which the kernel rejects with EINVAL. Treat that final fraction as an expired deadline.
+#[cfg(unix)]
+const MIN_SOCKET_TIMEOUT: Duration = Duration::from_micros(1);
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -48,8 +52,12 @@ pub enum Error {
     Unavailable,
     #[error("ML sidecar request timed out")]
     Timeout,
-    #[error("ML sidecar I/O failed")]
-    Io(#[source] std::io::Error),
+    #[error("ML sidecar I/O failed during {operation}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("invalid ML sidecar HTTP response: {0}")]
     Protocol(&'static str),
     #[error("ML sidecar returned HTTP {0}")]
@@ -329,7 +337,8 @@ impl MlClient {
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or(Error::Timeout)?;
-        let mut stream = UnixStream::connect(&self.socket_path).map_err(map_io)?;
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|error| map_io("connect", error))?;
         let mut head = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
@@ -343,7 +352,9 @@ impl MlClient {
         write_all_deadline(&mut stream, head.as_bytes(), deadline)?;
         write_all_deadline(&mut stream, body, deadline)?;
         set_write_deadline(&stream, deadline)?;
-        stream.flush().map_err(map_io)?;
+        stream
+            .flush()
+            .map_err(|error| map_io("request flush", error))?;
         let response_limit = if path == "/ml/v1/health" {
             MAX_HEALTH_RESPONSE_BYTES
         } else if path.starts_with("/ml/v1/analyze") {
@@ -520,41 +531,50 @@ impl TryFrom<InstanceWire> for Instance {
 }
 
 #[cfg(unix)]
-fn map_io(error: std::io::Error) -> Error {
+fn map_io(operation: &'static str, error: std::io::Error) -> Error {
     match error.kind() {
         std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => Error::Unavailable,
         std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Error::Timeout,
-        _ => Error::Io(error),
+        _ => Error::Io {
+            operation,
+            source: error,
+        },
     }
 }
 
 #[cfg(unix)]
 fn remaining(deadline: Instant) -> Result<Duration> {
-    deadline
+    let remaining = deadline
         .checked_duration_since(Instant::now())
         .filter(|remaining| !remaining.is_zero())
-        .ok_or(Error::Timeout)
+        .ok_or(Error::Timeout)?;
+    if remaining < MIN_SOCKET_TIMEOUT {
+        return Err(Error::Timeout);
+    }
+    Ok(remaining)
 }
 
 #[cfg(unix)]
 fn set_read_deadline(stream: &UnixStream, deadline: Instant) -> Result<()> {
     stream
         .set_read_timeout(Some(remaining(deadline)?))
-        .map_err(map_io)
+        .map_err(|error| map_io("read timeout configuration", error))
 }
 
 #[cfg(unix)]
 fn set_write_deadline(stream: &UnixStream, deadline: Instant) -> Result<()> {
     stream
         .set_write_timeout(Some(remaining(deadline)?))
-        .map_err(map_io)
+        .map_err(|error| map_io("write timeout configuration", error))
 }
 
 #[cfg(unix)]
 fn write_all_deadline(stream: &mut UnixStream, mut bytes: &[u8], deadline: Instant) -> Result<()> {
     while !bytes.is_empty() {
         set_write_deadline(stream, deadline)?;
-        let written = stream.write(bytes).map_err(map_io)?;
+        let written = stream
+            .write(bytes)
+            .map_err(|error| map_io("request write", error))?;
         if written == 0 {
             return Err(Error::Protocol("incomplete request write"));
         }
@@ -574,7 +594,9 @@ fn read_response(
     let header_end = loop {
         let mut buffer = [0_u8; 8192];
         set_read_deadline(stream, deadline)?;
-        let count = stream.read(&mut buffer).map_err(map_io)?;
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| map_io("response header read", error))?;
         if count == 0 {
             return Err(Error::Protocol("incomplete headers"));
         }
@@ -631,7 +653,9 @@ fn read_response(
         let mut buffer = [0_u8; 8192];
         let read_len = remaining.min(buffer.len());
         set_read_deadline(stream, deadline)?;
-        let count = stream.read(&mut buffer[..read_len]).map_err(map_io)?;
+        let count = stream
+            .read(&mut buffer[..read_len])
+            .map_err(|error| map_io("response body read", error))?;
         if count == 0 {
             return Err(Error::Protocol("incomplete response body"));
         }

@@ -233,6 +233,35 @@ fn i3_stack_references_block_duplicate_and_trashed_purge() -> Result<()> {
 }
 
 #[test]
+fn i3_resume_purging_restores_stack_referenced_asset_without_deleting_anything() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let uploaded = instant(2025, 3, 2, 0);
+    let asset = fixture.ingest(32, "legacy-purging.png", uploaded);
+    let asset_path = fixture.absolute_path(&asset);
+    let stack = fixture
+        .stacks
+        .create("再開保護スタック", std::slice::from_ref(&asset.id))?;
+
+    // Simulate a crash tombstone created by an older build after stack validation.
+    fixture.force_expired(&asset.id, "purging", uploaded - Duration::seconds(1));
+    assert_eq!(fixture.purge.resume_purging()?, 1);
+
+    let restored = fixture
+        .assets
+        .get(&asset.id)?
+        .expect("stack-referenced tombstone must be restored");
+    assert_eq!(restored.lifecycle, Lifecycle::Active);
+    assert!(asset_path.is_file());
+    let restored_stack = fixture
+        .stacks
+        .get(&stack.id)?
+        .expect("stack must remain present");
+    assert_eq!(restored_stack.chapters[0].pages.len(), 1);
+    assert_eq!(restored_stack.chapters[0].pages[0].asset.id, asset.id);
+    Ok(())
+}
+
+#[test]
 fn i4_retrash_resets_timer_from_current_operation() -> Result<()> {
     let fixture = Fixture::new()?;
     Settings::new(fixture.database.clone()).set_trash_retention_days(12)?;

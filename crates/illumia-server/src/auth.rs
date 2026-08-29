@@ -441,6 +441,14 @@ pub async fn setup(
     headers: HeaderMap,
     Json(credentials): Json<Credentials>,
 ) -> ApiResult<Response> {
+    // Completed setup is a permanent public state. Check it before the setup secret so callers
+    // cannot use 403/409 differences as an oracle for a stale token after initialization.
+    if state.auth.setup_completed()? {
+        return Err(ApiError::conflict(
+            "setup_already_completed",
+            "initial setup has already completed",
+        ));
+    }
     state.security.verify_setup_token(&headers)?;
     let cookie_only = wants_cookie_only(&headers);
     validate_setup_credentials(&credentials.password, &credentials.device_name)?;

@@ -2,6 +2,10 @@ use std::{
     io::{Cursor, Read, Write},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread,
     time::Duration,
 };
@@ -19,6 +23,9 @@ use tempfile::TempDir;
 
 struct MockSidecar {
     socket: PathBuf,
+    stop: Arc<AtomicBool>,
+    served: Arc<AtomicUsize>,
+    expected: usize,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -30,27 +37,50 @@ impl MockSidecar {
     ) -> std::io::Result<Self> {
         let socket = directory.join("ml.sock");
         let listener = UnixListener::bind(&socket)?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let served = Arc::new(AtomicUsize::new(0));
+        let worker_stop = Arc::clone(&stop);
+        let worker_served = Arc::clone(&served);
         let thread = thread::spawn(move || {
-            for index in 0..requests {
-                let (mut stream, _) = listener.accept().expect("mock should accept");
-                let (path, content_type, body) = read_request(&mut stream);
-                let request = if content_type.as_deref() == Some("application/json") {
-                    serde_json::from_slice(&body).expect("cluster request should be JSON")
-                } else {
-                    Value::Null
-                };
-                let response = handler(index, &path, &request).to_string();
-                write!(
-                    stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.len(),
-                    response
-                )
-                .expect("mock response should write");
+            while worker_served.load(Ordering::Acquire) < requests {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let index = worker_served.load(Ordering::Acquire);
+                        let (path, content_type, body) = read_request(&mut stream);
+                        let request = if content_type.as_deref() == Some("application/json") {
+                            serde_json::from_slice(&body).expect("cluster request should be JSON")
+                        } else {
+                            Value::Null
+                        };
+                        let response = handler(index, &path, &request).to_string();
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            response.len(),
+                            response
+                        )
+                        .expect("mock response should write");
+                        worker_served.fetch_add(1, Ordering::Release);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if worker_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("mock should accept: {error}"),
+                }
             }
         });
         Ok(Self {
             socket,
+            stop,
+            served,
+            expected: requests,
             thread: Some(thread),
         })
     }
@@ -62,8 +92,16 @@ impl MockSidecar {
 
 impl Drop for MockSidecar {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
             thread.join().expect("mock thread should finish");
+        }
+        if !thread::panicking() {
+            assert_eq!(
+                self.served.load(Ordering::Acquire),
+                self.expected,
+                "mock received an unexpected number of requests"
+            );
         }
     }
 }

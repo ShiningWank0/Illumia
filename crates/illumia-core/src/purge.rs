@@ -8,7 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{OptionalExtension, named_params};
+use rusqlite::{OptionalExtension, TransactionBehavior, named_params};
 use uuid::Uuid;
 
 use crate::{
@@ -118,38 +118,61 @@ impl PurgeService {
     }
 
     fn finish_purging(&self, id: &str) -> Result<()> {
-        if self.restore_referenced_legacy_tombstone(id)? {
+        if self.restore_blocked_legacy_tombstone(id)? {
             return Ok(());
         }
-        let (library_path, blob_ids) = self.database.with_connection(|connection| {
-            let library_path = connection
+        let data_root = self.database.data_root().to_path_buf();
+        self.database.with_connection_mut(|connection| {
+            // Keep SQLite's write lock across filesystem deletion. Every supported writer must
+            // wait, so an asset cannot gain a new I2/I3 reference after the final check. A crash
+            // rolls this transaction back while the committed `purging` tombstone remains.
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let library_path = transaction
                 .query_row(
                     "SELECT library_path FROM assets
-                     WHERE id = ?1 AND lifecycle = 'purging'",
+                     WHERE id = ?1
+                       AND lifecycle = 'purging'
+                       AND NOT EXISTS (
+                         SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id
+                       )
+                       AND NOT EXISTS (
+                         SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id
+                       )",
                     [id],
                     |row| row.get::<_, String>(0),
                 )
                 .optional()?
                 .ok_or(Error::AssetNotFound)?;
             let mut statement =
-                connection.prepare("SELECT blob_id FROM vault_blobs WHERE asset_id = ?1")?;
+                transaction.prepare("SELECT blob_id FROM vault_blobs WHERE asset_id = ?1")?;
             let blob_ids = statement
                 .query_map([id], |row| row.get::<_, String>(0))?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok((library_path, blob_ids))
-        })?;
+            drop(statement);
 
-        let blob_paths = checked_vault_blob_paths(self.database.data_root(), &blob_ids)?;
-        purge_asset_files(self.database.data_root(), id, &library_path)?;
-        for path in blob_paths {
-            remove_owned_file(&path)?;
-        }
+            let blob_paths = checked_vault_blob_paths(&data_root, &blob_ids)?;
+            purge_asset_files(&data_root, id, &library_path)?;
+            for path in blob_paths {
+                remove_owned_file(&path)?;
+            }
 
-        self.database.with_connection(|connection| {
-            connection.execute(
-                "DELETE FROM assets WHERE id = ?1 AND lifecycle = 'purging'",
+            let deleted = transaction.execute(
+                "DELETE FROM assets
+                 WHERE id = ?1
+                   AND lifecycle = 'purging'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id
+                   )",
                 [id],
             )?;
+            if deleted != 1 {
+                return Err(Error::AssetNotFound);
+            }
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -157,20 +180,39 @@ impl PurgeService {
     /// Older builds could mark a canonical row as `purging` even while duplicate rows
     /// still referenced it. Never resume physical deletion for that state: recover the
     /// original lifecycle from the retained trash/dedup metadata instead.
-    fn restore_referenced_legacy_tombstone(&self, id: &str) -> Result<bool> {
+    fn restore_blocked_legacy_tombstone(&self, id: &str) -> Result<bool> {
         self.database.with_connection_mut(|connection| {
             let transaction = connection.transaction()?;
             let changed = transaction.execute(
                 "UPDATE assets
                  SET lifecycle = CASE
                        WHEN trashed_at IS NOT NULL THEN 'trashed'
+                       WHEN EXISTS (
+                         SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id
+                       ) THEN 'active'
                        WHEN duplicate_of IS NOT NULL THEN 'duplicate'
                        ELSE 'trashed'
                      END,
-                     visible_in_timeline = 0
+                     visible_in_timeline = CASE
+                       WHEN trashed_at IS NULL
+                        AND EXISTS (
+                          SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id
+                        )
+                        AND in_timeline = 1
+                        AND NOT EXISTS (
+                          SELECT 1 FROM stack_pages sp
+                          WHERE sp.asset_id = assets.id AND sp.show_in_timeline = 0
+                        )
+                       THEN 1 ELSE 0
+                     END
                  WHERE id = ?1
                    AND lifecycle = 'purging'
-                   AND EXISTS (SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id)",
+                   AND (
+                     EXISTS (SELECT 1 FROM assets d WHERE d.duplicate_of = assets.id)
+                     OR EXISTS (
+                       SELECT 1 FROM stack_pages sp WHERE sp.asset_id = assets.id
+                     )
+                   )",
                 [id],
             )?;
             transaction.commit()?;

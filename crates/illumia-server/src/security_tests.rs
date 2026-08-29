@@ -590,6 +590,22 @@ async fn setup_token_body_limit_rate_limit_and_cors_are_enforced() {
         .expect("setup token response")
         .to_owned();
 
+    for headers in [
+        Vec::new(),
+        vec![("x-illumia-setup-token", "definitely-the-wrong-token-value")],
+        vec![("x-illumia-setup-token", setup_token)],
+    ] {
+        let repeated = app
+            .json(
+                Method::POST,
+                "/api/auth/setup",
+                json!({"password": "another secure password", "device_name": "attacker"}),
+                &headers,
+            )
+            .await;
+        assert_eq!(repeated.status(), StatusCode::CONFLICT);
+    }
+
     let oversized = app
         .request(
             Request::builder()
