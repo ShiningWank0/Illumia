@@ -262,18 +262,50 @@ jobs:
             digests+=("$digest")
           done
 
+          inspect_existing_digest() {
+            local ref=$1
+            local error_file=$2
+            local output
+            local attempt
+            for attempt in 1 2 3; do
+              if output=$(docker buildx imagetools inspect \
+                  --format '{{json .Manifest.Digest}}' "$ref" 2>"$error_file"); then
+                output=${output#\"}; output=${output%\"}
+                printf '%s' "$output"
+                return 0
+              fi
+              # GHCR may report a missing tag using either OCI's MANIFEST_UNKNOWN or HTTP 404.
+              # Authentication, rate-limit, DNS, and other registry errors must fail closed.
+              if grep -Eqi 'manifest unknown|manifest not found|no such manifest|unexpected status.*404' \
+                   "$error_file" || grep -Fqi "$ref: not found" "$error_file"; then
+                return 44
+              fi
+              [ "$attempt" -lt 3 ] && sleep "$((attempt * 2))"
+            done
+            cat "$error_file" >&2
+            return 1
+          }
+
           # どのversion tagも変更しないことを全件先に確認する。
+          inspect_error=$(mktemp)
+          trap 'rm -f "$inspect_error"' EXIT
           for index in "${!images[@]}"; do
             version_ref="${images[$index]}:$VERSION"
-            if existing=$(docker buildx imagetools inspect \
-                --format '{{json .Manifest.Digest}}' "$version_ref" 2>/dev/null); then
-              existing=${existing#\"}; existing=${existing%\"}
+            if existing=$(inspect_existing_digest "$version_ref" "$inspect_error"); then
               if [ "$existing" != "${digests[$index]}" ]; then
                 echo "::error::immutable version tag already points to a different digest"
                 exit 1
               fi
+            else
+              status=$?
+              if [ "$status" -ne 44 ]; then
+                echo "::error::could not verify immutable version tag"
+                exit "$status"
+              fi
             fi
           done
+          rm -f "$inspect_error"
+          trap - EXIT
 
           # 単一source digestをcarbon-copyしてversion/latestへ付与する。
           for index in "${!images[@]}"; do
