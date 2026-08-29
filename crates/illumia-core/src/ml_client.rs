@@ -44,8 +44,8 @@ const MAX_HEALTH_RESPONSE_BYTES: usize = 64 * 1024;
 const MAX_ANALYZE_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(unix)]
 const MAX_CLUSTER_RESPONSE_BYTES: usize = 1024 * 1024;
-// Darwin's SO_RCVTIMEO/SO_SNDTIMEO converts sub-microsecond durations to a zero timeval,
-// which the kernel rejects with EINVAL. Treat that final fraction as an expired deadline.
+// Unix socket timeout APIs have microsecond precision. Treat the final smaller fraction as an
+// expired deadline instead of extending the absolute deadline through rounding.
 #[cfg(unix)]
 const MIN_SOCKET_TIMEOUT: Duration = Duration::from_micros(1);
 
@@ -569,10 +569,51 @@ fn remaining(deadline: Instant) -> Result<Duration> {
 }
 
 #[cfg(unix)]
-fn set_read_deadline(stream: &UnixStream, deadline: Instant) -> Result<()> {
+#[cfg(target_os = "macos")]
+fn read_after_darwin_timeout_einval(
+    stream: &mut UnixStream,
+    buffer: &mut [u8],
+    operation: &'static str,
+    timeout_error: std::io::Error,
+) -> Result<usize> {
+    // Darwin rejects SO_RCVTIMEO with EINVAL after the peer has fully closed, even when response
+    // bytes remain buffered. Never ignore EINVAL and perform a blocking read: prove that data or
+    // EOF is immediately available with one nonblocking read instead.
     stream
-        .set_read_timeout(Some(remaining(deadline)?))
-        .map_err(|error| map_io("read timeout configuration", error))
+        .set_nonblocking(true)
+        .map_err(|error| map_io("read fallback configuration", error))?;
+    let read_result = stream.read(buffer);
+    let restore_result = stream.set_nonblocking(false);
+    if let Err(error) = restore_result {
+        return Err(map_io("read blocking mode restoration", error));
+    }
+    match read_result {
+        Ok(count) => Ok(count),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(map_io("read timeout configuration", timeout_error))
+        }
+        Err(error) => Err(map_io(operation, error)),
+    }
+}
+
+#[cfg(unix)]
+fn read_with_deadline(
+    stream: &mut UnixStream,
+    buffer: &mut [u8],
+    deadline: Instant,
+    operation: &'static str,
+) -> Result<usize> {
+    match stream.set_read_timeout(Some(remaining(deadline)?)) {
+        Ok(()) => {}
+        #[cfg(target_os = "macos")]
+        Err(timeout_error) if timeout_error.kind() == std::io::ErrorKind::InvalidInput => {
+            return read_after_darwin_timeout_einval(stream, buffer, operation, timeout_error);
+        }
+        Err(error) => return Err(map_io("read timeout configuration", error)),
+    }
+    stream
+        .read(buffer)
+        .map_err(|error| map_io(operation, error))
 }
 
 #[cfg(unix)]
@@ -607,10 +648,7 @@ fn read_response(
     let mut response = Vec::new();
     let header_end = loop {
         let mut buffer = [0_u8; 8192];
-        set_read_deadline(stream, deadline)?;
-        let count = stream
-            .read(&mut buffer)
-            .map_err(|error| map_io("response header read", error))?;
+        let count = read_with_deadline(stream, &mut buffer, deadline, "response header read")?;
         if count == 0 {
             return Err(Error::Protocol("incomplete headers"));
         }
@@ -666,10 +704,12 @@ fn read_response(
         let remaining = content_length - body.len();
         let mut buffer = [0_u8; 8192];
         let read_len = remaining.min(buffer.len());
-        set_read_deadline(stream, deadline)?;
-        let count = stream
-            .read(&mut buffer[..read_len])
-            .map_err(|error| map_io("response body read", error))?;
+        let count = read_with_deadline(
+            stream,
+            &mut buffer[..read_len],
+            deadline,
+            "response body read",
+        )?;
         if count == 0 {
             return Err(Error::Protocol("incomplete response body"));
         }
@@ -727,12 +767,101 @@ fn base64_value(byte: u8) -> Option<u8> {
     }
 }
 
-// Some macOS application sandboxes reject AF_UNIX bind with EPERM. Linux CI exercises
-// the real accept-queue saturation path used by the supported server environment.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
+    #[test]
+    fn buffered_response_is_read_after_peer_fully_closes() {
+        let (mut client, mut peer) = UnixStream::pair().expect("unix stream pair");
+        peer.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+        )
+        .expect("response should write");
+        drop(peer);
+
+        let body = read_response(
+            &mut client,
+            Instant::now() + Duration::from_secs(30),
+            MAX_HEALTH_RESPONSE_BYTES,
+        )
+        .expect("buffered response should remain readable after peer close");
+        assert_eq!(body, b"{}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_timeout_fallback_restores_blocking_after_buffered_read() {
+        let (mut client, mut peer) = UnixStream::pair().expect("unix stream pair");
+        peer.write_all(b"a").expect("first byte should write");
+        let (send, receive) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            receive.recv().expect("send signal");
+            std::thread::sleep(Duration::from_millis(20));
+            peer.write_all(b"b").expect("delayed byte should write");
+        });
+
+        let mut first = [0_u8; 1];
+        let count = read_after_darwin_timeout_einval(
+            &mut client,
+            &mut first,
+            "synthetic read",
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "synthetic timeout failure",
+            ),
+        )
+        .expect("buffered byte should be read");
+        assert_eq!(count, 1);
+        assert_eq!(first, *b"a");
+
+        send.send(()).expect("send signal");
+        let mut next = [0_u8; 1];
+        let next_result = client.read_exact(&mut next);
+        sender.join().expect("sender should finish");
+        next_result.expect("the stream should be restored to blocking mode");
+        assert_eq!(next, *b"b");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_timeout_fallback_restores_blocking_after_would_block() {
+        let (mut client, mut peer) = UnixStream::pair().expect("unix stream pair");
+        let (send, receive) = std::sync::mpsc::channel();
+        let sender = std::thread::spawn(move || {
+            receive.recv().expect("send signal");
+            std::thread::sleep(Duration::from_millis(20));
+            peer.write_all(b"x").expect("delayed byte should write");
+        });
+
+        let mut buffer = [0_u8; 1];
+        let result = read_after_darwin_timeout_einval(
+            &mut client,
+            &mut buffer,
+            "synthetic read",
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "synthetic timeout failure",
+            ),
+        );
+        let Err(Error::Io { operation, source }) = result else {
+            panic!("no-data fallback should preserve the timeout configuration error");
+        };
+        assert_eq!(operation, "read timeout configuration");
+        assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(source.to_string(), "synthetic timeout failure");
+
+        send.send(()).expect("send signal");
+        let mut next = [0_u8; 1];
+        let next_result = client.read_exact(&mut next);
+        sender.join().expect("sender should finish");
+        next_result.expect("the stream should be restored to blocking mode");
+        assert_eq!(next, *b"x");
+    }
+
+    // Some macOS application sandboxes reject AF_UNIX bind with EPERM. Linux CI exercises
+    // the real accept-queue saturation path used by the supported server environment.
+    #[cfg(target_os = "linux")]
     #[test]
     fn connect_deadline_bounds_a_full_unix_accept_queue() {
         let directory = tempfile::tempdir().expect("temporary directory");
