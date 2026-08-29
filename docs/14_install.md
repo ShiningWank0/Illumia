@@ -5,13 +5,13 @@ Illumia は「サーバー 1 台 + 各端末のクライアント」という構
 
 | 形態 | 役割 | 配布物 |
 |---|---|---|
-| Docker (TrueNAS 等) | **サーバー** | GHCR の private イメージ |
+| Docker (TrueNAS 等) | **サーバー** | GHCR のdigest固定イメージ |
 | Web ブラウザ | クライアント | サーバーが配信 (追加インストール不要) |
 | Android | クライアント | GitHub Release の APK (サイドロード) |
 | macOS / Windows | クライアント / all-in-one | 現状は自前ビルド (下記参照) |
 
-> **リポジトリと GHCR イメージは private です。** 配布物を受け取るには
-> collaborator 招待か、`read:packages` 権限の Personal Access Token (PAT) が要ります。
+> リポジトリとGitHub Releaseはpublic。GHCR packageの公開状態はrelease notesを正とし、
+> pullが401になる環境でだけ `read:packages` 権限のPersonal Access Token (PAT)を使う。
 
 ---
 
@@ -21,11 +21,11 @@ TrueNAS 等の常時稼働機に立てる。詳細な運用手順は
 [docker/README.md](../docker/README.md)、セキュリティ要件は
 [docs/12_security.md](12_security.md) を参照。
 
-### 1-1. GHCR にログインする
+### 1-1. GHCR の認証を確認する
 
-イメージは private なので、まず認証する。GitHub の
-Settings → Developer settings → Personal access tokens で
-`read:packages` 権限の PAT を作る。
+public packageはログイン不要でpullできる。401が返る場合はGitHubの
+Settings → Developer settings → Personal access tokensで
+`read:packages` 権限のPATを作り、次のようにログインする。
 
 ```bash
 echo "<あなたのPAT>" | docker login ghcr.io -u <GitHubユーザー名> --password-stdin
@@ -107,41 +107,14 @@ Google Play には公開しないため、APK を直接インストールする�
 
 ### 3-1. APK をダウンロードする
 
-リポジトリが private なので、**ブラウザでダウンロードするには GitHub に
-ログインしている必要がある**。
+publicなGitHub Releaseからブラウザで取得する。
 
-**方法 A: ブラウザ (かんたん)**
-
-1. Android 端末の Chrome で GitHub にログインする。
-2. <https://github.com/ShiningWank0/Illumia/releases/latest> を開く。
-3. `Assets` を展開し、`app-universal-release.apk` をタップする。
-4. 「この種類のファイルは端末に損害を与える可能性があります」と出るが、
+1. <https://github.com/ShiningWank0/Illumia/releases/latest> を開く。
+2. `Assets` を展開し、`app-universal-release.apk` をタップする。
+3. 「この種類のファイルは端末に損害を与える可能性があります」と出るが、
    自分でビルドした APK なので `OK` / `ダウンロード` を選ぶ。
 
-**方法 B: gh CLI (PC でダウンロードして転送)**
-
-```bash
-gh release download v0.2.0 --repo ShiningWank0/Illumia --pattern "*.apk"
-```
-
-**方法 C: curl (gh CLI が使えない環境)**
-
-`repo` 権限の PAT が必要。private リポジトリのアセットは、ブラウザ用 URL では
-なく **API の asset id** に対して `Accept: application/octet-stream` で
-取得する。
-
-```bash
-TOKEN=<あなたのPAT>; REPO=ShiningWank0/Illumia; TAG=v0.2.0
-ID=$(curl -sH "Authorization: Bearer $TOKEN" \
-  "https://api.github.com/repos/$REPO/releases/tags/$TAG" \
-  | python3 -c "import sys,json;print([a['id'] for a in json.load(sys.stdin)['assets'] if a['name'].endswith('.apk')][0])")
-curl -L -o app-universal-release.apk \
-  -H "Authorization: Bearer $TOKEN" -H "Accept: application/octet-stream" \
-  "https://api.github.com/repos/$REPO/releases/assets/$ID"
-```
-
-> 素のブラウザ用 URL を `curl` で叩くと、APK ではなくログインページの HTML が
-> 落ちてくる。ダウンロード後は必ず 3-2 のハッシュ照合をすること。
+ダウンロード後は必ず3-2のハッシュと署名fingerprintを照合すること。
 
 ### 3-2. 配布物が本物か確認する (推奨)
 

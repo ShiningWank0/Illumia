@@ -6,7 +6,7 @@ Immich を基軸に、イラスト閲覧・漫画スタック・キャラクタ�
 ([anime_character_recognize](https://github.com/ShiningWank0/anime_character_recognize))
 に特化する。
 
-## 特徴 (設計済み・実装順に構築中)
+## 特徴
 
 - Google Photos / Immich ライクな justified タイルのタイムライン (日 / 月 / 年の 3 段ズーム)
 - 漫画スタック: ページ順・話区切りを管理して作品として読める
@@ -19,7 +19,8 @@ Immich を基軸に、イラスト閲覧・漫画スタック・キャラクタ�
 
 ## リポジトリ状態
 
-現在は設計フェーズ完了・実装準備中。設計仕様は [docs/](docs/) が正。
+基本機能は実装済みで、現在は v1.0 release candidate の安定化・実環境検証中。
+設計仕様は [docs/](docs/) が正。
 
 | doc | 内容 |
 |---|---|
@@ -34,6 +35,9 @@ Immich を基軸に、イラスト閲覧・漫画スタック・キャラクタ�
 | [09_dev_workflow.md](docs/09_dev_workflow.md) | 開発体制・CI ポリシー |
 | [10_future_features.md](docs/10_future_features.md) | 将来的な機能追加プラン |
 | [11_dedup_and_trash.md](docs/11_dedup_and_trash.md) | 重複・ゴミ箱・誤削除防止 |
+| [12_security.md](docs/12_security.md) | 脅威モデル・公開前セキュリティゲート |
+| [13_model_requirements.md](docs/13_model_requirements.md) | MLモデルバンドル契約 |
+| [14_install.md](docs/14_install.md) | インストール・運用手順 |
 
 ## 開発
 
