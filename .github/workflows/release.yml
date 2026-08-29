@@ -528,8 +528,10 @@ jobs:
             "$apksigner" verify --print-certs "$target" > certs.txt
             echo "file: $(basename "$target")" >> "$out"
             echo "sha256: $(sha256sum "$target" | cut -d' ' -f1)" >> "$out"
-            grep -iE 'SHA-256 digest|SHA-1 digest|Signer #1 certificate DN' certs.txt \
-              >> "$out"
+            # Release notes are public while the repository is temporarily public.
+            # Do not expose certificate DN or legacy SHA-1; publish only the
+            # certificate SHA-256 fingerprint needed for identity verification.
+            grep -iF 'Signer #1 certificate SHA-256 digest:' certs.txt >> "$out"
             echo >> "$out"
           done
           cleanup
