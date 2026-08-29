@@ -49,6 +49,12 @@ impl MockSidecar {
                         if worker_stop.load(Ordering::Acquire) {
                             break;
                         }
+                        // BSD/Darwin may propagate the listener's nonblocking mode to an
+                        // accepted socket. Request parsing is intentionally blocking inside the
+                        // dedicated mock worker, so make that contract explicit.
+                        stream
+                            .set_nonblocking(false)
+                            .expect("accepted mock stream should block");
                         let index = worker_served.load(Ordering::Acquire);
                         let (path, content_type, body) = read_request(&mut stream);
                         let request = if content_type.as_deref() == Some("application/json") {

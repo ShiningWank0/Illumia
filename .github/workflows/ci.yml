@@ -1,5 +1,5 @@
 # CI: push / PR で変更のあったコンポーネントのみ lint + test を実行する。
-# docs のみの変更でも必ず green になる (集約ジョブ ci-ok を必須チェックにする)。
+# docs のみの変更でも必ず green になり、集約ジョブ ci-ok が全体結果を判定する。
 # 仕様: docs/09_dev_workflow.md
 name: CI
 
@@ -75,6 +75,21 @@ jobs:
           format: table
           exit-code: '1'
 
+  # manifest・実行時version・lockfileのIllumia自身のversionを常に照合する。
+  # paths-filter外に置き、どのPRでもrelease metadata driftを見逃さない。
+  version-metadata:
+    name: Version metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - name: verify release version metadata
+        run: uv run --no-project scripts/check-versions.py
+
   changes:
     runs-on: ubuntu-latest
     # release から呼ばれたときは paths-filter を通さず全ジョブを走らせる。
@@ -146,6 +161,20 @@ jobs:
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
           cargo audit --deny warnings
+
+  # Darwin固有のUDS close / SO_RCVTIMEO回帰を実kernel上で検証する。
+  rust-macos-uds:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: test macOS Unix socket deadline regressions
+        run: 'cargo test -p illumia-core --lib ml_client::tests::'
 
   web:
     needs: changes
@@ -345,10 +374,9 @@ jobs:
           vuln-type: os,library
           severity: HIGH,CRITICAL
 
-  # ブランチ保護の必須チェックはこのジョブだけを指定する。
-  # skip されたジョブは成功扱い、failure / cancelled があれば落とす。
+  # skip されたジョブは成功扱い、failure / cancelled があれば集約結果を落とす。
   ci-ok:
-    needs: [workflow-security, repository-secrets, changes, rust, web, android, ml, e2e, docker]
+    needs: [workflow-security, repository-secrets, version-metadata, changes, rust, rust-macos-uds, web, android, ml, e2e, docker]
     if: always()
     runs-on: ubuntu-latest
     steps:
