@@ -300,6 +300,15 @@ jobs:
           build-args: SOURCE_COMMIT=${{ github.sha }}
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,scope=${{ matrix.image }},mode=max
+      - name: verify MiniZip attack surface is absent
+        if: matrix.image == 'illumia-server'
+        env:
+          IMAGE: ${{ matrix.image }}
+        run: |
+          docker run --rm --entrypoint /bin/sh "$IMAGE:ci" -ceu '
+            ! command -v minizip
+            ! command -v miniunzip
+          '
       - name: scan ${{ matrix.image }} test image
         env:
           TRIVY_SHOW_SUPPRESSED: 'true'

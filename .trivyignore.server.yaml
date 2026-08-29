@@ -1,1 +1,59 @@
-vulnerabilities: []
+# Temporary, image-specific risk exceptions for Debian 12 packages in the server runtime.
+# CI keeps ignore-unfixed=false and shows every suppressed finding. New IDs and expired entries
+# fail automatically; the short expiry forces fixed packages and reachability changes to be reviewed.
+vulnerabilities:
+  - id: CVE-2026-53613
+    statement: &unused_mount >-
+      Owner: @ShiningWank0. The non-root server runs with all capabilities dropped and never
+      invokes mount, libmount, libblkid, or other util-linux tools; the mount path is unreachable.
+    expired_at: 2026-09-29
+  - id: CVE-2026-53615
+    statement: *unused_mount
+    expired_at: 2026-09-29
+  - id: CVE-2026-41992
+    statement: >-
+      Owner: @ShiningWank0. The server never executes the system gzip binary or accepts archives
+      for system gzip processing; HTTP body handling does not invoke this package.
+    expired_at: 2026-09-29
+  - id: CVE-2026-54369
+    statement: >-
+      Owner: @ShiningWank0. The read-only, non-root runtime never reads or writes POSIX ACLs;
+      no API or startup path invokes the vulnerable libacl operation.
+    expired_at: 2026-09-29
+  - id: CVE-2025-69720
+    statement: >-
+      Owner: @ShiningWank0. The only potential ncurses consumer is a fixed, non-interactive bash
+      healthcheck; it never invokes readline/tic/infocmp or parses attacker-controlled terminfo.
+    expired_at: 2026-09-29
+  - id: CVE-2026-13221
+    statement: &unused_perl >-
+      Owner: @ShiningWank0. The runtime never starts Perl or loads Perl regex, archive,
+      compression, or Storable modules; requests cannot invoke the installed Perl package.
+    expired_at: 2026-09-29
+  - id: CVE-2026-42496
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-42497
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-48962
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-57432
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-57433
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-8376
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2026-9538
+    statement: *unused_perl
+    expired_at: 2026-09-29
+  - id: CVE-2023-45853
+    statement: >-
+      Owner: @ShiningWank0. This advisory affects MiniZip archive handling. The final image does
+      not invoke MiniZip, and CI verifies minizip/miniunzip are absent; Rust image decoding uses
+      miniz_oxide rather than the affected system archive API.
+    expired_at: 2026-09-29
