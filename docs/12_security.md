@@ -211,6 +211,8 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 Pangolin/Newt・回線・実機が無いと確認できない。**v0.2.0 はこれらを未実施のまま
 リリースしている**。インターネットへ公開する前に必ず実施すること。
 完了をもって v1.0 以降の公開運用へ進む。
+結果は [docs/15_release_evidence.md](15_release_evidence.md) の様式に従ってprivateに保管し、
+機密情報をIssue、PR、Actions logへ残さない。
 
 - [ ] Pangolin/Newt 配下の外部回線から adversarial test を実施する
 - [ ] 外部回線から origin IP / host port へ直接到達できないことを IPv4 / IPv6 双方で確認する

@@ -140,3 +140,4 @@ ML モデルは application data と同じ tree に置かない。Docker では�
 | 12_security.md | 脅威モデル・認証境界・インターネット公開時の必須要件 |
 | 13_model_requirements.md | ML モデルバンドルの要件・配置・較正手順 (ACR 契約) |
 | 14_install.md | プラットフォーム別のインストール・使い方 (Docker / Web / Android APK / デスクトップ) |
+| 15_release_evidence.md | v1公開前の実環境検証記録とrelease承認手順 |
