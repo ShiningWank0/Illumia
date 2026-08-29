@@ -1,11 +1,11 @@
 # Illumia の Docker 配布
 
-> **配布ポリシー (重要)**: v1の配布物である
-> `ghcr.io/shiningwank0/illumia-server` と `ghcr.io/shiningwank0/illumia-ml` は、
-> GitHub Releaseと同様に **public package** として公開する。初回publish後に両packageの
-> Visibilityをpublicへ設定し、未ログイン環境からrelease notes記載のdigestをpullできることを
-> 公開前ゲートで確認する。公開前のcandidate digestは推測困難でも秘密とは扱わず、機密情報を
-> imageへ含めない。401になる暫定環境でだけ `read:packages` のPATを使用する。
+> **配布ポリシー (重要)**: リポジトリ、GitHub Release、
+> `ghcr.io/shiningwank0/illumia-server` / `illumia-ml` package は通常 **private** とする。
+> GitHub Actionsの実行枠を確保するためリポジトリを一時的にpublicへ切り替えることはあるが、
+> その期間は本番tagや配布物を公開せず、完了後にprivateへ戻す。packageのVisibilityもpublicへ
+> 変更しない。配布先はcollaboratorへ限定するか、`read:packages` だけを持つtokenで認証し、
+> release notesに記録したimmutable digestをpullする。
 
 Illumia のサーバーと Web UI を1つのコンテナで実行します。コンテナは TCP
 `0.0.0.0:2283` で待ち受けますが、Compose が host へ publish するのは既定で
