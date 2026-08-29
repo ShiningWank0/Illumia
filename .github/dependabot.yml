@@ -9,6 +9,17 @@ updates:
       day: monday
       time: "03:00"
       timezone: Asia/Tokyo
+    # 0.x の minor は互換性を壊し得るため、通常のgroup更新へ混ぜず
+    # migrationとtarget別テストを伴う手動PRで更新する。
+    ignore:
+      - dependency-name: eframe
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: egui
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: egui_extras
+        update-types: ["version-update:semver-minor"]
+      - dependency-name: tokio-tungstenite
+        update-types: ["version-update:semver-minor"]
     groups:
       rust-dependencies:
         patterns:
@@ -100,6 +111,11 @@ updates:
       day: monday
       time: "04:15"
       timezone: Asia/Tokyo
+    # 0.23 は default-on unsafe SIMD を追加するため、通常のgroup更新へ
+    # 混ぜず、feature選択とAndroid targetの安全性レビューを必須にする。
+    ignore:
+      - dependency-name: base64
+        update-types: ["version-update:semver-minor"]
     groups:
       android-rust-dependencies:
         patterns:
