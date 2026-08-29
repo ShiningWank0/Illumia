@@ -88,9 +88,11 @@
 - `release.yml`: タグ `v*` / 手動 (workflow_dispatch) で本番ビルド。
   公開は `v*` tag の push event からだけ許可し、手動実行は選択refがtagでも常にdry-runとする。
   container は publish 時に1回だけbuildしてtag無しのcandidate digestとしてpushし、そのdigestを
-  Trivyでscanする。全container candidateのscanと他の配布build/sign jobの成功後、単一jobが
-  同じdigestへversion/`latest` tagを付ける。scan前に配布tagを付けたり、scan後に同じcontextを
-  再buildした別imageを配布したり、matrix途中で一部imageだけを先行公開したりしない。
+  Trivyでscanする。全container candidateのscanと他の配布build/sign jobの成功後、
+  `release-production` environmentのrequired reviewer承認を待ち、単一jobが同じdigestへ
+  version/`latest` tagを付ける。承認は公開前の実環境チェックリストを確認してから行う。
+  scan前に配布tagを付けたり、scan後に同じcontextを再buildした別imageを配布したり、
+  matrix途中で一部imageだけを先行公開したりしない。
   コンポーネント未実装の間は preflight 判定で該当ジョブを自動スキップする。
   成果物: Docker イメージ (ghcr: server / ml)、egui バイナリ (macOS universal / Windows)、
   Android APK (署名は GitHub Secrets)。
@@ -117,3 +119,6 @@
   repository owner のレビュー対象として明示する。
 - Android署名secretは `release-signing` environmentにだけ登録し、公開releaseでは
   reviewer approvalを必須にする。通常のbuild jobへ署名secretを渡さない。
+- `release-production` environmentにもrequired reviewerを設定する。全build/scan/sign成功後、
+  container digestのpromotionとGitHub Release作成より前に1回だけ承認し、docs/12の実環境
+  チェック結果を確認する。このenvironmentにはsecretを登録しない。

@@ -221,6 +221,8 @@ Pangolin/Newt・回線・実機が無いと確認できない。**v0.2.0 はこ�
 - [ ] `main` ruleset で `ci-ok` / CodeQL を必須化し、force-push / deletion を禁止する
 - [ ] `release-signing` environment に required reviewer とAndroid署名secret 3点を設定し、
       workflow_dispatchのdry-run成功後、tag releaseで署名fingerprintを照合する
+- [ ] `release-production` environment に required reviewer を設定し、上記の実環境項目と
+      全build/scan/sign成功を確認してからdigest promotion / GitHub Releaseを承認する
 - [ ] CI枠確保のため一時的にpublicへ変更したrepositoryを、作業後にprivateへ戻す。public期間中に
       GitHub Releaseを公開する場合は第三者から閲覧可能な内容だけであることを確認する。server / ML
       のGHCR packageはprivateを維持し、許可したアカウントの `read:packages` tokenでrelease notes
