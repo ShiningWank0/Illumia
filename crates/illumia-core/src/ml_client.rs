@@ -13,8 +13,11 @@ use std::{
 // 以下は Unix domain socket 経由の実装専用。Windows では named pipe 実装が
 // 入るまで参照されないので、cfg で分けて dead_code 警告を出さない。
 #[cfg(unix)]
+use socket2::{Domain, SockAddr, Socket, Type};
+#[cfg(unix)]
 use std::{
     io::{Read, Write},
+    os::fd::OwnedFd,
     os::unix::net::UnixStream,
     time::Instant,
 };
@@ -337,8 +340,7 @@ impl MlClient {
         let deadline = Instant::now()
             .checked_add(self.timeout)
             .ok_or(Error::Timeout)?;
-        let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|error| map_io("connect", error))?;
+        let mut stream = connect_unix_with_deadline(&self.socket_path, deadline)?;
         let mut head = format!(
             "{method} {path} HTTP/1.1\r\nHost: localhost\r\nAccept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\nContent-Length: {}\r\n",
             body.len()
@@ -542,6 +544,18 @@ fn map_io(operation: &'static str, error: std::io::Error) -> Error {
     }
 }
 
+/// Connect without allowing a full or wedged sidecar accept queue to occupy a worker forever.
+#[cfg(unix)]
+fn connect_unix_with_deadline(path: &Path, deadline: Instant) -> Result<UnixStream> {
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)
+        .map_err(|error| map_io("socket creation", error))?;
+    let address = SockAddr::unix(path).map_err(|error| map_io("socket address", error))?;
+    socket
+        .connect_timeout(&address, remaining(deadline)?)
+        .map_err(|error| map_io("connect", error))?;
+    Ok(UnixStream::from(OwnedFd::from(socket)))
+}
+
 #[cfg(unix)]
 fn remaining(deadline: Instant) -> Result<Duration> {
     let remaining = deadline
@@ -710,5 +724,46 @@ fn base64_value(byte: u8) -> Option<u8> {
         b'+' => Some(62),
         b'/' => Some(63),
         _ => None,
+    }
+}
+
+// Some macOS application sandboxes reject AF_UNIX bind with EPERM. Linux CI exercises
+// the real accept-queue saturation path used by the supported server environment.
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_deadline_bounds_a_full_unix_accept_queue() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("full.sock");
+        let address = SockAddr::unix(&path).expect("unix socket address");
+        let _listener = std::os::unix::net::UnixListener::bind(&path)
+            .expect("listener should bind without accepting connections");
+
+        let mut fillers = Vec::new();
+        let mut saturated = false;
+        for _ in 0..1_024 {
+            let filler = Socket::new(Domain::UNIX, Type::STREAM, None).expect("filler socket");
+            match filler.connect_timeout(&address, Duration::from_millis(5)) {
+                Ok(()) => fillers.push(filler),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    saturated = true;
+                    break;
+                }
+                Err(error) => panic!("accept queue saturation should be bounded: {error}"),
+            }
+        }
+        assert!(saturated, "test did not saturate the unix accept queue");
+
+        let started = Instant::now();
+        let result = connect_unix_with_deadline(&path, started + Duration::from_millis(25));
+        assert!(matches!(result, Err(Error::Timeout)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

@@ -80,7 +80,8 @@
   Rust 側は settings のオーバーライド値 (ml.tau_high_override 等) があれば渡す。
 - body は 32 MiB 上限で analyze と同じ先行・streaming 検証を行う。Rust client は health
   64 KiB、analyze 8 MiB、cluster 1 MiB の endpoint 別 response 上限、HTTP の absolute
-  deadline、duplicate Content-Length / Transfer-Encoding の拒否を必須とする。
+  deadline を必須とする。deadline は socket connect (accept queue 飽和を含む)・request write・
+  response read の全区間を覆う。duplicate Content-Length / Transfer-Encoding は拒否する。
 
 ### 将来の受け皿 (v1 では未実装。namespace だけ予約)
 - `POST /ml/v1/ocr` (manga-ocr) / `POST /ml/v1/text_embed` (スマートサーチのクエリ埋め込み)
