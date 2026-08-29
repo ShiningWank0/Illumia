@@ -170,17 +170,19 @@ Illumia はシングルユーザーで、Illumia 自身にはログイン ID が
 - Cargo/npm/Python/Docker/GitHub Actions の dependency update と脆弱性監査を CI で行う。
   release job の token permission は job 単位の最小権限とし、SBOM/provenance を生成する。
 - JavaScript/TypeScript、Python、Rust は CodeQL の `security-extended` query を
-  main / PR / 週次で実行する。Rust はこれに加えて clippy、RustSec、adversarial
+  main / PR / 週次とreleaseの同一commitで実行する。Rust はこれに加えて clippy、RustSec、adversarial
   integration test も必須とし、静的解析だけでruntime境界の検証を代替しない。
 - Android signing key/passwordはnpm/Gradleやrepository codeを実行するbuild jobへ渡さない。
   full CI済みunsigned artifactを別jobへ渡し、そのjobはrepositoryをcheckoutせず、署名と
   fingerprint検証だけを行う。unsigned APKをGitHub Releaseへ添付しない。
 - Docker base imageとGitHub Actionはdigest / commit SHAへ固定し、Dependabotで追従する。
-- production artifact は GitHub Actions の固定 workflow だけで作り、review 済み commit と
+- production artifact は GitHub Actions の固定 workflow だけで作り、検証済み commit と
   image digest を deployment 時に記録する。container はtag無しcandidate digestとして1回だけbuildし、
   registry上の同じdigestをscanする。全container candidateのscanと他の配布build/sign jobの
-  成功後に単一jobからのみversion/`latest` tagへpromoteする。scan前やmatrix途中にrelease tagを
-  公開せず、scan後の再buildで配布物を差し替えない。
+  成功後にallowlist済みassetでdraft Releaseを作り、単一jobからのみversion/`latest` tagへpromoteする。
+  全digest一致後にdraftを公開する。途中失敗は非公開draftとprivate GHCRに限定し、検証bundleの保持期間である1日以内に
+  同一runのfailed `publish-release` jobを再実行して収束させる。scan前やmatrix途中にrelease tagを公開せず、
+  scan後の再buildで配布物を差し替えない。
 - production Compose は server/ML の repository と `@sha256:` を YAML 内で固定し、環境変数には
   64桁 digest 本体だけを要求する。未設定時に
   `latest` や local build へ fallback しない。production file に `build:` を置かず
@@ -220,9 +222,9 @@ Cの照合が完了するまでv1.0 releaseを完了扱いにしない。
       (router の port forward、UPnP、IPv6 firewall を含め Pangolin を迂回する経路を閉じる)
 - [ ] 配布 APK を実機へ導入し、動作と署名証明書の fingerprint を確認する
 - [ ] reverse proxy の upload/body/idle timeout、rate limit、sensitive header のログ除外を確認する
-- [ ] `release-signing` environment にAndroid署名secret 3点を設定し、workflow_dispatchの
-      dry-runで署名済みAPKを実機確認してからtagを作成する
-- [ ] tag releaseのfull CI、audit、Trivy、secret scanが成功し、scan済みdigestと
+- [ ] `release-signing` environment にAndroid署名secret 3点を設定し、default branchを選択した
+      workflow_dispatch dry-runで署名済みAPKを実機確認してからtagを作成する
+- [ ] tag releaseのfull CI、CodeQL、audit、Trivy、secret scanが成功し、scan済みdigestと
       allowlist済みの署名済みassetだけが公開されたことを確認する
 - [ ] CI枠確保のため一時的にpublicへ変更したrepositoryを、作業後にprivateへ戻す。public期間中に
       GitHub Releaseを公開する場合は第三者から閲覧可能な内容だけであることを確認する。server / ML

@@ -26,7 +26,7 @@ artifact SHA-256、署名証明書SHA-256 fingerprint、container image名/diges
 - [ ] `uv run --no-project scripts/check-versions.py --tag vX.Y.Z` が成功した
 - [ ] candidate commitの `ci-ok` とCodeQL 3言語が成功した
 - [ ] Repository secret scan、Cargo/npm/Python audit、server/ML Trivy scanが成功した
-- [ ] workflow_dispatch dry-runでfull CI、build、scan、Android署名・検証が成功した
+- [ ] default branchのworkflow_dispatch dry-runでfull CI、CodeQL、build、scan、Android署名・検証が成功した
 - [ ] dry-runがGHCR tag、GitHub Release、repository contentsへ書き込んでいない
 - [ ] Android署名secret 3点を `release-signing` environmentだけに登録した
 - [ ] unsigned build jobに署名secretが渡っていない
@@ -101,17 +101,20 @@ install/update smoke test: pass / fail
 
 ## B. tag pushによる自動release
 
-Aを完了した後だけtagをpushする。workflowはfull CI、build、scan、signを再実行し、scan済みの
-container candidate digestだけをversion/`latest`へpromotionしてGitHub Releaseを作る。
+Aを完了した後だけtagをpushする。workflowはfull CI、CodeQL、build、scan、signを再実行する。
+allowlist済みassetでdraft Releaseを作った後、scan済みcontainer candidate digestだけを
+version/`latest`へpromotionし、全digest一致を確認してからdraftを公開する。
 
 - [ ] tagのversionとtarget commitがAのversion / candidate commitに一致する
-- [ ] tag release runのfull CI、全build/scan、Android署名・検証が成功した
+- [ ] tag release runのfull CI、CodeQL、全build/scan、Android署名・検証が成功した
 - [ ] Trivyが成功したcandidate digestとpromotion対象digestが同一である
 - [ ] 単一signer、APK SHA-256、署名証明書SHA-256のfail-closed検証が成功した
 - [ ] Release添付assetが署名済みAPKと検証済みprovenance recordのallowlistだけである
 - [ ] provenance recordはartifact名・SHA-256・署名証明書SHA-256・image名/digest・tag・commit
-      だけを含み、Release notes / change logに「記録の機密性と追跡性」の禁止情報がない
+      だけを含み、自動生成change logを使わず、検証済みRelease notesに「記録の機密性と追跡性」の禁止情報がない
 - [ ] unsigned desktop artifact、unsigned APK、Docker build recordがReleaseへ添付されていない
+- [ ] 途中失敗から回復した場合、bundle保持期間の1日以内に同一runのfailed `publish-release` jobだけを
+      再実行し、同じversion/digestでdraft公開まで成功した
 
 ```text
 tag release run URL:
@@ -128,7 +131,7 @@ released signing certificate SHA-256 fingerprint:
 - [ ] ReleaseからAPKをdownloadし、SHA-256を再計算してBのrecordとRelease notesに一致する
 - [ ] downloadしたAPKへ `apksigner verify --print-certs` を実行し、証明書SHA-256を再取得して
       BのrecordとRelease notesに一致する
-- [ ] 公開assetがallowlistどおりで、provenanceに許可項目以外がなく、Release notes / change logに
+- [ ] 公開assetがallowlistどおりで、provenanceに許可項目以外がなく、検証済みRelease notesに
       「記録の機密性と追跡性」の禁止情報がない
 - [ ] 許可したアカウントの `read:packages` tokenでdigest固定pullが成功する
 - [ ] 権限のない未認証clientからprivate GHCR packageをpullできない
