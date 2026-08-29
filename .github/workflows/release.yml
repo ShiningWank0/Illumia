@@ -220,36 +220,16 @@ jobs:
           name: candidate-digest-${{ matrix.image }}
           path: digests/*
 
-  # 全build/scan/sign成功後、公開担当者がdocs/12の実環境gateを確認する。
-  # environmentにrequired reviewerを設定し、promotion/Release作成を承認前に止める。
-  release-approval:
-    name: Production release approval
+  # 全imageのcandidate scanと他の配布build/signの成功後だけ、
+  # 単一jobが同じdigestへrelease tagを付ける。途中失敗でcontainerだけが公開される
+  # 状態を作らない。
+  docker-promote:
     needs: [preflight, ci, docker, desktop, android, android-sign]
     if: >-
       always() &&
       needs.preflight.outputs.publish == 'true' &&
       needs.ci.result == 'success' &&
       needs.docker.result == 'success' &&
-      !contains(needs.*.result, 'failure') &&
-      !contains(needs.*.result, 'cancelled')
-    runs-on: ubuntu-latest
-    environment: release-production
-    permissions: {}
-    steps:
-      - name: record approval
-        run: echo "Production release approved after external gate review"
-
-  # 全imageのcandidate scanと他の配布build/sign、公開承認の成功後だけ、
-  # 単一jobが同じdigestへrelease tagを付ける。途中失敗でcontainerだけが公開される
-  # 状態を作らない。
-  docker-promote:
-    needs: [preflight, ci, docker, desktop, android, android-sign, release-approval]
-    if: >-
-      always() &&
-      needs.preflight.outputs.publish == 'true' &&
-      needs.ci.result == 'success' &&
-      needs.docker.result == 'success' &&
-      needs.release-approval.result == 'success' &&
       !contains(needs.*.result, 'failure') &&
       !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
@@ -469,12 +449,10 @@ jobs:
   # CI済みのunsigned APKだけを、repository codeをcheckoutしない専用jobで署名する。
   android-sign:
     needs: [preflight, ci, android]
-    if: >-
-      needs.preflight.outputs.android == 'true' &&
-      needs.preflight.outputs.publish == 'true'
+    if: needs.preflight.outputs.android == 'true'
     runs-on: ubuntu-latest
-    # 署名secretは専用environmentへ隔離する。Repository settingsでこのenvironmentに
-    # release担当者のapproval ruleを設定する。
+    # 署名secretは専用environmentへ隔離する。手動dry-runでも署名済みartifactを生成し、
+    # tag作成前に実機確認できるようにする。
     environment: release-signing
     permissions:
       contents: read
@@ -560,12 +538,11 @@ jobs:
   # タグ push のとき、署名済み成果物だけを GitHub Release に添付する。
   # 未署名 desktop バイナリは対象外 (SEC-007)。
   publish-release:
-    needs: [preflight, ci, docker, docker-promote, desktop, android, android-sign, release-approval]
+    needs: [preflight, ci, docker, docker-promote, desktop, android, android-sign]
     if: >-
       always() && needs.preflight.outputs.publish == 'true' &&
       startsWith(github.ref, 'refs/tags/v') &&
       needs.ci.result == 'success' &&
-      needs.release-approval.result == 'success' &&
       needs.docker-promote.result == 'success' &&
       !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') &&
       (needs.android.result == 'success' || needs.docker.result == 'success')
@@ -710,8 +687,9 @@ jobs:
             echo
             echo "## 実環境ゲート"
             echo
-            echo "このReleaseは release-production 承認者がdocs/15のA/Bをprivate証跡で"
-            echo "確認した後に公開されています。endpoint等の機密情報は公開しません。"
+            echo "公開前の実環境確認はCIでは代替できません。tag作成者はdocs/15のAを"
+            echo "完了してからtagをpushしてください。このworkflow実行がBです。"
+            echo "endpoint等の機密情報は公開しません。"
             echo "公開後はdocs/15のCでdigest、APK、GHCR権限、repository visibilityを照合し、"
             echo "Cが成功するまでreleaseを完了扱いにしません。"
           } > release-notes.md
