@@ -110,7 +110,8 @@ Google Play には公開しないため、APK を直接インストールする�
 
 ### 3-1. APK をダウンロードする
 
-権限のあるGitHubアカウントでprivate GitHub Releaseから取得する。
+GitHub Releaseから取得する。repositoryがprivateの場合は、権限のあるGitHubアカウントで
+sign inしてから開く。一時public期間中に公開したReleaseは認証なしでも取得できる。
 
 1. <https://github.com/ShiningWank0/Illumia/releases/latest> を開く。
 2. `Assets` を展開し、`app-universal-release.apk` をタップする。
