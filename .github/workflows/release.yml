@@ -660,7 +660,7 @@ jobs:
           fi
           printf '%s' "$KEYSTORE_B64" | base64 -d > illumia.keystore
           chmod 600 illumia.keystore
-          cleanup() { rm -f illumia.keystore certs.txt; }
+          cleanup() { rm -f illumia.keystore certs.txt signer.pem signer.der; }
           trap cleanup EXIT
           mkdir -p signed fingerprints
           out=fingerprints/android-apk.txt
@@ -683,15 +683,25 @@ jobs:
               --ks-pass env:ILLUMIA_KEYSTORE_PASSWORD \
               --ks-key-alias "$ILLUMIA_KEY_ALIAS" \
               --out "$target" "$apk"
-            "$apksigner" verify --print-certs "$target" > certs.txt
-            mapfile -t cert_sha_lines < <(
-              grep -iE '^Signer #[0-9]+ certificate SHA-256 digest:' certs.txt || true
-            )
-            if [ "${#cert_sha_lines[@]}" -ne 1 ] ||
-               [[ ! "${cert_sha_lines[0]}" =~ ^Signer\ \#1\ certificate\ SHA-256\ digest:\ ([0-9A-Fa-f]{64})$ ]]; then
-              echo "::error::単一signerのSHA-256 fingerprintを取得できない"; exit 1
+            # Human-readable digest lines vary between apksigner versions. Extract the
+            # verified signing certificate itself and hash its canonical DER bytes.
+            "$apksigner" verify --print-certs-pem "$target" > certs.txt
+            begin_count=$(grep -c '^-----BEGIN CERTIFICATE-----$' certs.txt || true)
+            end_count=$(grep -c '^-----END CERTIFICATE-----$' certs.txt || true)
+            if [ "$begin_count" -ne 1 ] || [ "$end_count" -ne 1 ]; then
+              echo "::error::単一signerの証明書を取得できない"; exit 1
             fi
-            cert_sha=${BASH_REMATCH[1]}
+            awk '
+              /^-----BEGIN CERTIFICATE-----$/ { capture = 1 }
+              capture { print }
+              /^-----END CERTIFICATE-----$/ { capture = 0 }
+            ' certs.txt > signer.pem
+            if [ "$(grep -c '^-----BEGIN CERTIFICATE-----$' signer.pem || true)" -ne 1 ] ||
+               [ "$(grep -c '^-----END CERTIFICATE-----$' signer.pem || true)" -ne 1 ] ||
+               ! openssl x509 -in signer.pem -outform DER -out signer.der; then
+              echo "::error::signer証明書を解析できない"; exit 1
+            fi
+            cert_sha=$(sha256sum signer.der | cut -d' ' -f1)
             apk_sha=$(sha256sum "$target" | cut -d' ' -f1)
             if [[ ! "$cert_sha" =~ ^[0-9A-Fa-f]{64}$ ]] ||
                [[ ! "$apk_sha" =~ ^[0-9a-f]{64}$ ]]; then
