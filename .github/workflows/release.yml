@@ -39,7 +39,7 @@ jobs:
       publish: ${{ steps.check.outputs.publish }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
       - id: check
         run: |
           out() { echo "$1=$2" >> "$GITHUB_OUTPUT"; echo "$1=$2"; }
@@ -111,7 +111,7 @@ jobs:
           persist-credentials: false
       - if: matrix.image == 'illumia-ml' && needs.preflight.outputs.docker_ml != 'true'
         run: echo "skip=1" >> "$GITHUB_ENV"
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         if: env.skip != '1'
         with:
           version: v0.36.1
@@ -130,7 +130,7 @@ jobs:
         env:
           DOCKER_BUILD_SUMMARY: false
           DOCKER_BUILD_RECORD_UPLOAD: false
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -180,7 +180,7 @@ jobs:
         env:
           DOCKER_BUILD_SUMMARY: false
           DOCKER_BUILD_RECORD_UPLOAD: false
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: ${{ matrix.dockerfile }}
@@ -257,7 +257,7 @@ jobs:
           pattern: candidate-digest-*
           path: candidate-digests
           merge-multiple: true
-      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         with:
           version: v0.36.1
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
@@ -473,7 +473,7 @@ jobs:
           trap - EXIT
 
       - name: create validated draft release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           name: Illumia ${{ needs.preflight.outputs.version }}
           files: prepared/release-assets/*
@@ -515,7 +515,7 @@ jobs:
       # draftを再利用し、検証済みassetを再照合・上書きしてから公開する。
       # promotion途中で失敗したrunではこのstepへ到達しない。
       - name: publish validated release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           name: Illumia ${{ needs.preflight.outputs.version }}
           files: prepared/release-assets/*
@@ -581,7 +581,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
       - name: install Android NDK
         run: |
           sdkmanager "ndk;26.1.10909125"
@@ -633,7 +633,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      - uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: android-apk-unsigned
