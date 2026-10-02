@@ -103,6 +103,8 @@ jobs:
       docker: ${{ inputs.full && 'true' || steps.filter.outputs.docker }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         if: ${{ !inputs.full }}
         id: filter
@@ -110,15 +112,21 @@ jobs:
           filters: |
             rust:
               - 'crates/**'
+              - '.cargo/**'
+              - 'testdata/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
               - '.github/workflows/**'
             web:
               - 'web/**'
+              - 'testdata/**'
               - '.github/workflows/**'
             android:
               - 'apps/android/**'
+              - 'web/**'
+              - '.cargo/**'
+              - 'rust-toolchain.toml'
               - '.github/workflows/**'
             ml:
               - 'ml/**'
@@ -132,49 +140,76 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.trivyignore.*.yaml'
               - '.github/workflows/**'
 
   rust:
+    name: Rust (${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # illumia-desktop (eframe/glow) のビルドに必要な X11/Wayland/GL の開発ヘッダ。
       - name: install desktop build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev \
             libxcb-xfixes0-dev libx11-dev libgl1-mesa-dev
       - name: fmt
+        if: runner.os == 'Linux'
         run: cargo fmt --all --check
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
+      # PR でも release と同じ target/profile を検証する。署名・公開はしない。
+      - name: build Windows desktop
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --release --locked -p illumia-desktop
+          mkdir -p dist
+          cp target/release/illumia-desktop.exe dist/illumia-desktop-windows-x64.exe
+      - name: build macOS universal desktop
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release --locked -p illumia-desktop --target aarch64-apple-darwin
+          cargo build --release --locked -p illumia-desktop --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/illumia-desktop \
+            target/x86_64-apple-darwin/release/illumia-desktop \
+            -output dist/illumia-desktop-macos-universal
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: runner.os != 'Linux'
+        with:
+          name: pr-desktop-${{ runner.os }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 3
       - name: dependency audit
+        if: runner.os == 'Linux'
         run: |
           cargo install cargo-audit --version 0.22.2 --locked
           cargo audit --deny warnings
-
-  # Darwin固有のUDS close / SO_RCVTIMEO回帰を実kernel上で検証する。
-  rust-macos-uds:
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: test macOS Unix socket deadline regressions
-        run: 'cargo test -p illumia-core --lib ml_client::tests::'
 
   web:
     needs: changes
@@ -208,11 +243,15 @@ jobs:
     needs: changes
     if: needs.changes.outputs.android == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           components: rustfmt, clippy
+          targets: aarch64-linux-android
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/android/src-tauri
@@ -220,7 +259,19 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: apps/android/package-lock.json
+          cache-dependency-path: |
+            apps/android/package-lock.json
+            web/package-lock.json
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+      - name: install Android NDK (same version as release)
+        run: |
+          sdkmanager "ndk;26.1.10909125"
+          echo "ANDROID_NDK_ROOT=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$ANDROID_SDK_ROOT/ndk/26.1.10909125" >> "$GITHUB_ENV"
       - name: install Tauri host test dependencies
         run: |
           sudo apt-get update
@@ -244,6 +295,26 @@ jobs:
         run: |
           npm ci --ignore-scripts
           npm audit --audit-level=high
+      - name: build web frontend
+        working-directory: web
+        run: |
+          npm ci --ignore-scripts
+          npm run build
+      - name: initialize Android project
+        working-directory: apps/android
+        run: npm run tauri android init -- --ci --skip-targets-install
+      # PR は ARM64 の実 APK を検証し、全 ABI の配布 build は release に残す。
+      - name: build unsigned ARM64 APK
+        working-directory: apps/android
+        run: npm run tauri android build -- --apk --target aarch64 -- --locked
+      - name: verify Android lockfile did not change
+        run: git diff --exit-code -- apps/android/src-tauri/Cargo.lock
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: pr-android-arm64-unsigned
+          path: apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 3
 
   ml:
     needs: changes
@@ -290,7 +361,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: build server
-        run: cargo build --release -p illumia-server
+        run: cargo build --release --locked -p illumia-server
       - name: install web deps
         working-directory: web
         run: npm ci --ignore-scripts
@@ -376,7 +447,7 @@ jobs:
 
   # skip されたジョブは成功扱い、failure / cancelled があれば集約結果を落とす。
   ci-ok:
-    needs: [workflow-security, repository-secrets, version-metadata, changes, rust, rust-macos-uds, web, android, ml, e2e, docker]
+    needs: [workflow-security, repository-secrets, version-metadata, changes, rust, web, android, ml, e2e, docker]
     if: always()
     runs-on: ubuntu-latest
     steps:

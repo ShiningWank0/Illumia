@@ -73,17 +73,29 @@
   credentialや秘密鍵を混入させないための追加gateとする。
 - 全PRでmanifest、実行時version、Cargo/npm/uv lockfile内のIllumia自身のversionを照合し、
   不一致を `ci-ok` で失敗させる。tag releaseでは同じ検査をtag文字列とも照合する。
-- Rust変更時はmacOS runnerでもML clientのUDS close / absolute deadline回帰テストを実行し、
-  Darwin固有のsocket timeout挙動を `ci-ok` の判定対象に含める。
+- Rust変更時はLinux / macOS / Windowsでworkspace全体のlocked clippyとtestを実行する。
+  macOSのML client UDS close / absolute deadline回帰もこの全体testに含める。
+  Windows x64とmacOS universal (ARM64 + x86_64) のrelease-profile desktop buildをPRで検証し、
+  未署名成果物を3日間のCI artifactとして保存する。既存macOS専用socket jobは統合する。
+  UDS mockを使うML orchestration統合テストはUnixのみで実行する。WindowsのML transportは
+  未実装 (`Unavailable`) のため、このCI追加をnamed pipe対応・動作検証として扱わない。
 - `codeql.yml`: main / PR / 週次に加え、release workflowからtag / dry-runの同一commitを
   JavaScript/TypeScript、Python、Rust の CodeQL `security-extended` query で解析する。結果のuploadに必要な
   `security-events: write` 以外は read-only とし、Action は commit SHA へ固定する。
 - `apps/android/**` は独立 Rust workspace / npm lockfile として専用 job で
   `cargo metadata --locked`、fmt、clippy、test、Android target に絞った `cargo audit`、
-  `npm audit` を行う。Android-only 変更でもこの job と `ci-ok` を必ず通し、release の
+  `npm audit` を行う。同じjobでJDK 17 / NDK 26.1.10909125を使い、web SPAを組み込んだ
+  ARM64の未署名APKをlockedでクロスビルドし、3日間のCI artifactとして保存する。
+  PRでは他のAndroid ABI、署名、インストール、実機動作は検証しない。
+  Android-only 変更でもこの job と `ci-ok` を必ず通し、release の
   APK は同一 lockfile に対する full CI 成功後だけ build する。依存packageとGradle pluginを
   実行するbuild jobには署名鍵を渡さず、repositoryをcheckoutしない専用jobがunsigned artifact
   だけを `apksigner` で署名・検証する。
+- 変更検知にはRustの `.cargo/**` / `testdata/**`、Webの共有fixture `testdata/**`、Androidの `web/**` /
+  `rust-toolchain.toml` / `.cargo/**`、Dockerの `.cargo/**` / Trivy例外ファイルも含める。
+  Rust/Android jobは45分を上限とし、Rustとnpmの既存cacheをOS/workspace別に再利用する。
+  `ci-ok` は全matrix結果とAPK build結果を集約する。branch protectionで必須化する場合は
+  `ci-ok` を指定する (workflow内の集約だけではrepository設定の必須チェックにはならない)。
 - Rust は `cargo audit`、Web は `npm audit`、Python は `uv export` + `pip-audit` を
   品質ゲートに含める。`cargo audit` の例外は `.cargo/audit.toml` に限定し、
   **修正版が存在せず、かつ脆弱性ではない勧告 (unmaintained 等) のみ**許可する。
