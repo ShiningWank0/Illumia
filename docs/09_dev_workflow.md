@@ -96,6 +96,8 @@
   Rust/Android jobは45分を上限とし、Rustとnpmの既存cacheをOS/workspace別に再利用する。
   `ci-ok` は全matrix結果とAPK build結果を集約する。branch protectionで必須化する場合は
   `ci-ok` を指定する (workflow内の集約だけではrepository設定の必須チェックにはならない)。
+  Web/Androidの依存監査はbuild後にも必須gateとして実行する。監査不合格の未署名artifactは
+  検証用途に限り、CI成功・配布可能な成果物として扱わない。
 - Rust は `cargo audit`、Web は `npm audit`、Python は `uv export` + `pip-audit` を
   品質ゲートに含める。`cargo audit` の例外は `.cargo/audit.toml` に限定し、
   **修正版が存在せず、かつ脆弱性ではない勧告 (unmaintained 等) のみ**許可する。

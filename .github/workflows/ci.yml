@@ -228,8 +228,6 @@ jobs:
           cache-dependency-path: web/package-lock.json
       - name: install without arbitrary lifecycle scripts
         run: npm ci --ignore-scripts
-      - name: dependency audit
-        run: npm audit --audit-level=high
       - name: lint / check
         run: |
           npm run lint --if-present
@@ -238,6 +236,8 @@ jobs:
         run: npm test --if-present
       - name: build
         run: npm run build
+      - name: dependency audit
+        run: npm audit --audit-level=high
 
   # apps/android/src-tauri は root から独立した Rust workspace なので専用 gate で検査する。
   android:
@@ -289,16 +289,9 @@ jobs:
         run: cargo clippy --manifest-path apps/android/src-tauri/Cargo.toml --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --manifest-path apps/android/src-tauri/Cargo.toml --locked
-      - name: Android-target dependency audit
-        run: |
-          cargo install cargo-audit --version 0.22.2 --locked
-          cargo audit --file apps/android/src-tauri/Cargo.lock \
-            --target-os android --target-arch aarch64
-      - name: npm dependency audit
+      - name: install Tauri CLI without lifecycle scripts
         working-directory: apps/android
-        run: |
-          npm ci --ignore-scripts
-          npm audit --audit-level=high
+        run: npm ci --ignore-scripts
       - name: build web frontend
         working-directory: web
         run: |
@@ -319,6 +312,15 @@ jobs:
           path: apps/android/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 3
+      # 未署名検証artifactの後に監査する。検出があればjobとci-okは必ず失敗する。
+      - name: Android-target dependency audit
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit --file apps/android/src-tauri/Cargo.lock \
+            --target-os android --target-arch aarch64
+      - name: npm dependency audit
+        working-directory: apps/android
+        run: npm audit --audit-level=high
 
   ml:
     needs: changes
