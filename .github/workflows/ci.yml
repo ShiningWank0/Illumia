@@ -156,7 +156,8 @@ jobs:
     timeout-minutes: 45
     defaults:
       run:
-        shell: bash
+        # WindowsではGit Bash付属の縮小Perlではなくrunnerのnative Perlを使う。
+        shell: ${{ matrix.os == 'windows-latest' && 'pwsh' || 'bash' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -185,8 +186,8 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           cargo build --release --locked -p illumia-desktop
-          mkdir -p dist
-          cp target/release/illumia-desktop.exe dist/illumia-desktop-windows-x64.exe
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -LiteralPath target/release/illumia-desktop.exe -Destination dist/illumia-desktop-windows-x64.exe
       - name: build macOS universal desktop
         if: runner.os == 'macOS'
         run: |
