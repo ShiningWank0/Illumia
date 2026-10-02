@@ -77,9 +77,8 @@
   macOSのML client UDS close / absolute deadline回帰もこの全体testに含める。
   Windows x64とmacOS universal (ARM64 + x86_64) のrelease-profile desktop buildをPRで検証し、
   未署名成果物を3日間のCI artifactとして保存する。既存macOS専用socket jobは統合する。
-  WindowsのdebugテストはVaultのstack overflowを避けるためtest-thread stackを8 MiBにする。
-  最適化済みVault単体テストは既定stackでも実行する。このテスト設定を製品プロセスの
-  stack設定やWindows実機でのVault動作保証として扱わない。
+  Windowsも既定stackでdebug workspace testを実行し、最適化済みVault単体テストを別途検証する。
+  失敗時はcore testのEXE/PDBのみを1日間の診断artifactとして保存し、VaultのDB・鍵を含めない。
   UDS mockを使うML orchestration統合テストはUnixのみで実行する。WindowsのML transportは
   未実装 (`Unavailable`) のため、このCI追加をnamed pipe対応・動作検証として扱わない。
 - `codeql.yml`: main / PR / 週次に加え、release workflowからtag / dry-runの同一commitを
