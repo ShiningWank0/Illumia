@@ -321,10 +321,10 @@ mod tests {
             database.with_connection(|connection| {
                 let source: String =
                     connection.query_row("PRAGMA cipher_log_source", [], |row| row.get(0))?;
-                let memory_security: i64 =
+                let memory_security: String =
                     connection.query_row("PRAGMA cipher_memory_security", [], |row| row.get(0))?;
                 assert_eq!(source, "NONE");
-                assert_eq!(memory_security, 1);
+                assert_eq!(memory_security, "1");
                 let tables: i64 = connection.query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
                     [],
