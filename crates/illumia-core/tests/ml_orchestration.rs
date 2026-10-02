@@ -453,6 +453,89 @@ fn full_recluster_cannot_move_confirmed_or_rejected_and_refuses_rejection_pairs(
 }
 
 #[test]
+fn failed_quality_is_review_only_through_analyze_assign_and_full_recluster() {
+    for flags in [json!([]), json!(["small_crop"])] {
+        let (directory, database) = database();
+        let asset = AssetService::new(database.clone())
+            .ingest(&png(), "review-only.png", None)
+            .expect("asset ingests")
+            .asset;
+        let seed = AssetService::new(database.clone())
+            .ingest(&png_with_marker(1), "seed.png", None)
+            .expect("seed ingests")
+            .asset;
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO clusters(id, name, created_by, created_at)
+                 VALUES ('known', NULL, 'user', '2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO faces(id, asset_id, kind, bbox, det_conf, quality_flags,
+                    embedding, model_version, cluster_id, state)
+                 VALUES ('medoid', ?1, 'face', '[0,0,1,1]', 1, '[]', ?2,
+                    'test-v1', 'known', 'confirmed')",
+                    rusqlite::params![
+                        seed.id,
+                        [1.0_f32.to_le_bytes(), 0.0_f32.to_le_bytes()].concat()
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("seed inserts");
+        let Some(mock) = mock_or_skip(MockSidecar::new(
+            directory.path(),
+            4,
+            move |index, path, request| {
+                if index == 0 {
+                    assert!(path.starts_with("/ml/v1/analyze"));
+                    let mut response = analysis();
+                    response["instances"][0]["quality"] = json!({"passed": false, "flags": flags});
+                    return response;
+                }
+                assert_eq!(path, "/ml/v1/cluster");
+                if index == 2 {
+                    assert_eq!(request["mode"], "full");
+                    assert_eq!(
+                        request["ids"],
+                        json!(["medoid"]),
+                        "failed quality must not seed clusters"
+                    );
+                } else {
+                    assert_eq!(request["mode"], "assign");
+                    assert_eq!(request["medoids"]["known"], json!([1.0, 0.0]));
+                }
+                json!({"assignments": [{
+                "id": request["ids"][0], "cluster":"known", "state":"auto", "similarity":1.0
+            }], "new_clusters": []})
+            },
+        )) else {
+            return;
+        };
+        let service = MlService::new(database.clone(), mock.client());
+        service
+            .analyze_bytes(&asset.id, b"mock-image")
+            .expect("analysis succeeds");
+        assert_eq!(
+            service.review_candidates().expect("candidates query").len(),
+            1
+        );
+        service.recluster().expect("full recluster succeeds");
+        let candidates = service.review_candidates().expect("candidates query");
+        assert_eq!(candidates.len(), 1);
+        assert!(!candidates[0].face.quality_flags.is_empty());
+        assert_eq!(
+            service
+                .cluster_medoids("test-v1")
+                .expect("medoids query")
+                .len(),
+            1
+        );
+    }
+}
+
+#[test]
 fn client_reports_unavailable_and_timeout_separately() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let missing = MlClient::with_timeout(

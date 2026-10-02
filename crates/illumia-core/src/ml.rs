@@ -209,6 +209,22 @@ impl MlService {
         }
         let dimension = common_dimension(&rows)?;
         validate_cluster_budget(rows.len(), dimension)?;
+        // Low-quality detections may be reviewed against established clusters, but must not
+        // seed automatic clusters. Human decisions remain part of the protected input.
+        let (review_rows, rows): (Vec<_>, Vec<_>) = rows.into_iter().partition(|row| {
+            !row.quality_passed && !matches!(row.state.as_str(), "confirmed" | "rejected")
+        });
+        let review_ids = review_rows
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            return if cancelled()? {
+                Ok(())
+            } else {
+                self.assign_faces(&review_ids)
+            };
+        }
         let ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
         let embeddings = rows
             .iter()
@@ -232,7 +248,11 @@ impl MlService {
         if cancelled()? {
             return Ok(());
         }
-        self.apply_full_clustering(response.assignments, response.new_clusters)
+        self.apply_full_clustering(response.assignments, response.new_clusters)?;
+        if !cancelled()? {
+            self.assign_faces(&review_ids)?;
+        }
+        Ok(())
     }
 
     pub fn cluster_medoids(&self, model_version: &str) -> Result<Vec<ClusterMedoid>> {
@@ -244,6 +264,9 @@ impl MlService {
         validate_cluster_budget(rows.len(), dimension)?;
         let mut grouped = BTreeMap::<String, Vec<EmbeddingRow>>::new();
         for row in rows {
+            if !row.quality_passed && row.state != "confirmed" {
+                continue;
+            }
             if let Some(cluster_id) = &row.cluster_id {
                 grouped.entry(cluster_id.clone()).or_default().push(row);
             }
@@ -551,12 +574,15 @@ impl MlService {
                 return Ok(Vec::new());
             }
             let mut inserted = Vec::new();
-            for instance in analysis.instances {
+            for mut instance in analysis.instances {
                 if !matches!(instance.kind.as_str(), "person" | "head" | "face") {
                     return Err(Error::InvalidMl("unsupported detection kind".into()));
                 }
                 if quality_gate == QualityGate::Strict && !instance.quality_passed {
                     continue;
+                }
+                if !instance.quality_passed && instance.quality_flags.is_empty() {
+                    instance.quality_flags.push("quality_gate_failed".into());
                 }
                 let id = Uuid::now_v7().to_string();
                 transaction.execute(
@@ -655,12 +681,14 @@ impl MlService {
             for assignment in assignments {
                 let current = transaction
                     .query_row(
-                        "SELECT state FROM faces WHERE id = ?1",
+                        "SELECT state, quality_flags FROM faces WHERE id = ?1",
                         [&assignment.id],
-                        |row| row.get::<_, String>(0),
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                     )
                     .optional()?;
-                let Some(current) = current else { continue };
+                let Some((current, flags)) = current else {
+                    continue;
+                };
                 if matches!(current.as_str(), "confirmed" | "rejected") {
                     continue;
                 }
@@ -692,6 +720,8 @@ impl MlService {
                     || !matches!(assignment.state.as_str(), "auto" | "candidate")
                 {
                     "unassigned"
+                } else if !serde_json::from_str::<Vec<String>>(&flags)?.is_empty() {
+                    "candidate"
                 } else {
                     assignment.state.as_str()
                 };
@@ -740,7 +770,7 @@ impl MlService {
                 ""
             };
             let sql = format!(
-                "SELECT id, embedding, model_version, cluster_id, state FROM faces
+                "SELECT id, embedding, model_version, cluster_id, state, quality_flags FROM faces
                  WHERE embedding IS NOT NULL AND model_version = ?1{predicate}
                  ORDER BY id LIMIT ?2"
             );
@@ -758,7 +788,7 @@ impl MlService {
     fn rows_by_ids(&self, face_ids: &[String]) -> Result<Vec<EmbeddingRow>> {
         self.database.with_connection(|connection| {
             let mut statement = connection.prepare(
-                "SELECT id, embedding, model_version, cluster_id, state FROM faces
+                "SELECT id, embedding, model_version, cluster_id, state, quality_flags FROM faces
                  WHERE id = ?1 AND embedding IS NOT NULL",
             )?;
             face_ids
@@ -1044,9 +1074,10 @@ struct EmbeddingRow {
     model_version: String,
     cluster_id: Option<String>,
     state: String,
+    quality_passed: bool,
 }
 
-type RawEmbeddingRow = (String, Vec<u8>, String, Option<String>, String);
+type RawEmbeddingRow = (String, Vec<u8>, String, Option<String>, String, String);
 
 fn embedding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEmbeddingRow> {
     Ok((
@@ -1055,11 +1086,12 @@ fn embedding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEmbeddingR
         row.get(2)?,
         row.get(3)?,
         row.get(4)?,
+        row.get(5)?,
     ))
 }
 
 fn decode_embedding_row(
-    (id, bytes, model_version, cluster_id, state): RawEmbeddingRow,
+    (id, bytes, model_version, cluster_id, state, flags): RawEmbeddingRow,
 ) -> Result<EmbeddingRow> {
     if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
         return Err(Error::InvalidMl("invalid stored embedding".into()));
@@ -1077,6 +1109,7 @@ fn decode_embedding_row(
         model_version,
         cluster_id,
         state,
+        quality_passed: serde_json::from_str::<Vec<String>>(&flags)?.is_empty(),
     })
 }
 
@@ -1168,4 +1201,180 @@ fn escape_like(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+    use crate::ml_client::Instance;
+    use std::io::Cursor;
+
+    fn fixture() -> (tempfile::TempDir, Database, String) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = Database::open(directory.path()).expect("database opens");
+        let mut image = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut image, image::ImageFormat::Png)
+            .expect("PNG encodes");
+        let asset = AssetService::new(database.clone())
+            .ingest(&image.into_inner(), "quality.png", None)
+            .expect("asset ingests")
+            .asset;
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO clusters(id, name, created_by, created_at)
+                 VALUES ('known', NULL, 'user', '2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("cluster inserts");
+        (directory, database, asset.id)
+    }
+
+    fn persist(service: &MlService, asset: &str, passed: bool, flags: Vec<String>) -> Vec<String> {
+        service
+            .persist_analysis(
+                asset,
+                Analysis {
+                    model_version: "quality-v1".into(),
+                    instances: vec![Instance {
+                        kind: "face".into(),
+                        bbox: [0.0, 0.0, 1.0, 1.0],
+                        det_conf: 0.99,
+                        quality_passed: passed,
+                        quality_flags: flags,
+                        embedding: 1.0_f32.to_le_bytes().to_vec(),
+                        embedding_dim: 1,
+                    }],
+                },
+            )
+            .expect("analysis persists")
+    }
+
+    #[test]
+    fn failed_quality_with_or_without_flags_remains_review_only_after_apply() {
+        for flags in [Vec::new(), vec!["small_crop".into()]] {
+            let (_directory, database, asset) = fixture();
+            let service = MlService::new(database.clone(), MlClient::new("unused.sock"));
+            let ids = persist(&service, &asset, false, flags);
+            assert_eq!(ids.len(), 1);
+            service
+                .apply_assignments(
+                    vec![Assignment {
+                        id: ids[0].clone(),
+                        cluster: Some("known".into()),
+                        state: "auto".into(),
+                        similarity: 1.0,
+                    }],
+                    &HashMap::new(),
+                )
+                .expect("assignment applies");
+            let candidate = service.review_candidates().expect("candidates query");
+            assert_eq!(candidate.len(), 1, "failed quality must not become auto");
+            assert!(!candidate[0].face.quality_flags.is_empty());
+            assert_eq!(candidate[0].face.similarity, Some(1.0));
+            assert!(
+                service
+                    .cluster_medoids("quality-v1")
+                    .expect("medoids query")
+                    .is_empty()
+            );
+            service
+                .review_candidate(&ids[0], true)
+                .expect("human accepts");
+            assert_eq!(
+                service
+                    .cluster_medoids("quality-v1")
+                    .expect("medoids query")
+                    .len(),
+                1
+            );
+            service
+                .apply_assignments(
+                    vec![Assignment {
+                        id: ids[0].clone(),
+                        cluster: None,
+                        state: "unassigned".into(),
+                        similarity: 0.0,
+                    }],
+                    &HashMap::new(),
+                )
+                .expect("assignment applies");
+            let state: String = database
+                .with_connection(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT state FROM faces WHERE id = ?1",
+                        [&ids[0]],
+                        |r| r.get(0),
+                    )?)
+                })
+                .expect("state queries");
+            assert_eq!(state, "confirmed");
+        }
+    }
+
+    #[test]
+    fn strict_gate_discards_failed_quality_even_with_empty_flags() {
+        let (_directory, database, asset) = fixture();
+        Settings::new(database.clone())
+            .set_quality_gate(QualityGate::Strict)
+            .expect("strict gate");
+        let service = MlService::new(database, MlClient::new("unused.sock"));
+        assert!(persist(&service, &asset, false, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn passed_quality_still_allows_automatic_assignment() {
+        let (_directory, database, asset) = fixture();
+        let service = MlService::new(database.clone(), MlClient::new("unused.sock"));
+        let ids = persist(&service, &asset, true, Vec::new());
+        service
+            .apply_assignments(
+                vec![Assignment {
+                    id: ids[0].clone(),
+                    cluster: Some("known".into()),
+                    state: "auto".into(),
+                    similarity: 1.0,
+                }],
+                &HashMap::new(),
+            )
+            .expect("assignment applies");
+        assert_eq!(
+            service
+                .cluster_medoids("quality-v1")
+                .expect("medoids query")
+                .len(),
+            1
+        );
+        assert!(
+            service
+                .review_candidates()
+                .expect("candidates query")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn legacy_failed_auto_rows_do_not_become_medoids() {
+        let (_directory, database, asset) = fixture();
+        let service = MlService::new(database.clone(), MlClient::new("unused.sock"));
+        let ids = persist(&service, &asset, false, vec!["small_crop".into()]);
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "UPDATE faces SET state = 'auto', cluster_id = 'known' WHERE id = ?1",
+                    [&ids[0]],
+                )?;
+                Ok(())
+            })
+            .expect("legacy auto fixture updates");
+        assert!(
+            service
+                .cluster_medoids("quality-v1")
+                .expect("medoids query")
+                .is_empty()
+        );
+    }
 }

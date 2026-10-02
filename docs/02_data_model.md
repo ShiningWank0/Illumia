@@ -87,7 +87,7 @@ CREATE TABLE faces (
   kind          TEXT NOT NULL CHECK (kind IN ('person','head','face')),
   bbox          TEXT NOT NULL,                     -- JSON [x,y,w,h] 正規化座標
   det_conf      REAL NOT NULL,
-  quality_flags TEXT NOT NULL DEFAULT '[]',        -- JSON。品質ゲート結果
+  quality_flags TEXT NOT NULL DEFAULT '[]',        -- JSON。非空はreview-only。理由なし不合格はquality_gate_failed
   embedding     BLOB,                              -- f32 LE。model_version とペア
   model_version TEXT NOT NULL,
   cluster_id    TEXT REFERENCES clusters(id) ON DELETE SET NULL,
