@@ -21,6 +21,12 @@
   すべて Rust 側 (illumia-core) が行う。→ vault 対応 (docs/06) と Rust 移行が単純になる。
 - 「自動処理がユーザーの確定 (confirmed/rejected) を上書きしない」不変条件は
   Rust 側で担保する。
+- `quality.passed=false` は `review_only` でも自動割り当てしない。理由flagsが空なら
+  Rustが `quality_gate_failed` を補い、DBの `quality_flags` に不合格を保持する。
+  非空flagsを持つ未確定の検出はfull clusteringのseed・auto medoidから除外し、
+  既存の高品質/人間確定medoidへのassignで候補を提示する。sidecarがautoを返しても
+  Rustの保存境界でcandidateへ降格する。strictでは保存せず、人間のconfirmed/rejectedは保護する。
+  旧版がflagsなしの不合格を保存した行は合格と識別できないため、旧結果の再解析が必要。
 
 ## プロセス管理・通信
 
