@@ -72,9 +72,7 @@ providers: [CPUExecutionProvider]   # 必須対応 EP。CoreML/OpenVINO は任�
 - checksum 対象の bundle 総量は 512 MiB を hard limit とする。検証済み ONNX bytes は path を
   reopen せず ORT session constructor へ渡し、両 session の生成成功後に Python 側の保持を解放する。
 
-## thresholds.yaml 必須スキーマ (較正済み値)
-
-### 前処理契約の拡張案 (未実装・ACRとの合意前)
+## 前処理契約の拡張案 (未実装・ACRとの合意前)
 
 2026-10-02にIllumia `d75a135` とACR `bf323260` を再確認した。
 Illumiaの [OnnxBackend._encode](https://github.com/ShiningWank0/Illumia/blob/d75a135f7e8d73e4e77f6ba652950187c7749a05/ml/illumia_ml/backends.py)
@@ -118,6 +116,8 @@ resize:
 syntheticな8×8 / 7×3 / 3×7 RGB連番画像を8×8へ処理し、両repoの現行関数を比較した。
 mean=0/std=1では最大tensor差は正方形0、横長/縦長とも約0.243137だった。
 これは学習済みモデルを使わない前処理差の再現であり、実bundleのparity合格ではない。
+
+## thresholds.yaml 必須スキーマ (較正済み値)
 
 ```yaml
 tau_high: 0.82      # 自動割り当て閾値 (Wilson 95% 下限で precision ≥ 0.98 を満たす値)
