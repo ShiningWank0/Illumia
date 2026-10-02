@@ -77,6 +77,9 @@
   macOSのML client UDS close / absolute deadline回帰もこの全体testに含める。
   Windows x64とmacOS universal (ARM64 + x86_64) のrelease-profile desktop buildをPRで検証し、
   未署名成果物を3日間のCI artifactとして保存する。既存macOS専用socket jobは統合する。
+  WindowsのdebugテストはVaultのstack overflowを避けるためtest-thread stackを8 MiBにする。
+  最適化済みVault単体テストは既定stackでも実行する。このテスト設定を製品プロセスの
+  stack設定やWindows実機でのVault動作保証として扱わない。
   UDS mockを使うML orchestration統合テストはUnixのみで実行する。WindowsのML transportは
   未実装 (`Unavailable`) のため、このCI追加をnamed pipe対応・動作検証として扱わない。
 - `codeql.yml`: main / PR / 週次に加え、release workflowからtag / dry-runの同一commitを
@@ -94,6 +97,7 @@
 - 変更検知にはRustの `.cargo/**` / `testdata/**`、Webの共有fixture `testdata/**`、Androidの `web/**` /
   `rust-toolchain.toml` / `.cargo/**`、Dockerの `.cargo/**` / Trivy例外ファイルも含める。
   Rust/Android jobは45分を上限とし、Rustとnpmの既存cacheをOS/workspace別に再利用する。
+  Rust matrixのcacheはテスト失敗時も保存し、次回のnative依存コンパイルの待ち時間を減らす。
   `ci-ok` は全matrix結果とAPK build結果を集約する。branch protectionで必須化する場合は
   `ci-ok` を指定する (workflow内の集約だけではrepository設定の必須チェックにはならない)。
   Web/Androidの依存監査はbuild後にも必須gateとして実行する。監査不合格の未署名artifactは
