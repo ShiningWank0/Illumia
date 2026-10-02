@@ -159,7 +159,13 @@ impl Database {
         set_private_file_permissions(&database_path)?;
         let key = Zeroizing::new(hex::encode(sqlcipher_key));
         let key_pragma = Zeroizing::new(format!(
-            "PRAGMA key = \"x'{}'\";
+            // Filter native logs before keying (which activates SQLCipher's default logger).
+            // On Windows a failed VirtualLock can log through sqlite3_vmprintf, allocate
+            // via sqlcipher_mem_malloc, and recursively attempt another lock/log.
+            // The process-global filter also enforces Vault's no-log policy; keep memory
+            // sanitization enabled and let database errors propagate through Result.
+            "PRAGMA cipher_log_source = NONE;
+             PRAGMA key = \"x'{}'\";
              PRAGMA cipher_memory_security = ON;",
             key.as_str()
         ));
@@ -298,4 +304,36 @@ fn migrate(connection: &mut Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_open_suppresses_native_logs_without_disabling_memory_security() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let key = [7_u8; 32];
+        // Exercise first keying and reopening. Native settings are process-global, so the
+        // privacy filter must be in place before allocator-wide memory security is enabled.
+        for _ in 0..2 {
+            let database = Database::open_vault(directory.path(), &key)?;
+            database.with_connection(|connection| {
+                let source: String =
+                    connection.query_row("PRAGMA cipher_log_source", [], |row| row.get(0))?;
+                let memory_security: i64 =
+                    connection.query_row("PRAGMA cipher_memory_security", [], |row| row.get(0))?;
+                assert_eq!(source, "NONE");
+                assert_eq!(memory_security, 1);
+                let tables: i64 = connection.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert!(tables > 0);
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
 }

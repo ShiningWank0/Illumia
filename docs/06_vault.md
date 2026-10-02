@@ -11,6 +11,11 @@ Immich の Locked Folder 相当 + 独自要件。vault に入れたものは
 - 守らないもの: アンロック中のサーバープロセスメモリ。サーバー管理者 = ユーザー本人という
   シングルユーザー前提であり、アンロック中はサーバー RAM に鍵が存在する。
 - 平文側 DB・ログ・ジョブ履歴に vault 内のファイル名・ID・件数以上の情報を残さない。
+- SQLCipherのnative診断は、key設定より前にprocess-globalな
+  `cipher_log_source = NONE`で抑制する。WindowsではVirtualLock失敗のログ整形がSQLite allocatorへ
+  再入してstack overflowを起こすため、`cipher_memory_security = ON`を維持したままこの再帰を防ぐ。
+  SQLCipherのmemory sanitization設定は有効だが、OSのmemory lock成功を保証するものではない。
+  DB操作の失敗は従来どおりRustのResultとして返す。暗号化形式・鍵・migrationは変更しない。
 - Vault が保証する at-rest 保護は、画像が **Vault へ直接暗号化 ingest された時点以降**、
   または main → Vault transfer の source cleanup が完了した時点以降の live dataset に対する
   ものとする。main library に一度平文保存された画像の過去 snapshot、既存 backup、SSD の
