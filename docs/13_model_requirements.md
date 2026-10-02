@@ -72,6 +72,51 @@ providers: [CPUExecutionProvider]   # 必須対応 EP。CoreML/OpenVINO は任�
 - checksum 対象の bundle 総量は 512 MiB を hard limit とする。検証済み ONNX bytes は path を
   reopen せず ORT session constructor へ渡し、両 session の生成成功後に Python 側の保持を解放する。
 
+## 前処理契約の拡張案 (未実装・ACRとの合意前)
+
+2026-10-02にIllumia `d75a135` とACR `bf323260` を再確認した。
+Illumiaの [OnnxBackend._encode](https://github.com/ShiningWank0/Illumia/blob/d75a135f7e8d73e4e77f6ba652950187c7749a05/ml/illumia_ml/backends.py)
+はdetectorとencoderの両方にbilinear letterbox (黒padding)を使う。一方、ACRの
+[Phase-3 preprocess](https://github.com/ShiningWank0/anime_character_recognize/blob/bf323260b27ca0a5c1fe612c17f47e53cc627b6b/Phase-3/10_embed_with_onnx.py#L49-L65)
+はcropを正方形へ直接bilinear resizeする。現行manifestはこの選択を表現できない。
+
+これは前処理のコード差であり、未完成のbundleが実際に非互換であることや、
+認識精度への影響を実モデルで確認したものではない。runtimeの方式はこの提案で変更しない。
+両repoのdocsと較正/export側の仕様を合意し、fixtureで一致を確認してから実装する。
+
+各モデルの `input` に、例えば次の宣言を追加する案とする (現行runtimeは未対応)。
+
+```yaml
+# detector: 検出器のexport/較正経路で検証して確定する
+resize:
+  mode: letterbox             # letterbox | stretch
+  interpolation: bilinear     # Pillowとtorchvisionのkernel/antialias差もfixtureで確認
+  size_order: height_width
+  rounding: ties_to_even       # resize後の辺長をround、最小1px
+  padding:
+    value: [0, 0, 0]           # 正規化前のRGB uint8。値はbundleごとに明示
+    placement: center_floor    # 左/上=floor(余白/2)、余りは右/下
+# crop_encoder: Phase-3と一致する候補。未検証のモデルへ強制しない
+# resize: { mode: stretch, interpolation: bilinear, size_order: height_width, padding: null }
+```
+
+- detector / crop_encoderで独立して宣言する。RGB変換、0〜255からfloat32への変換、
+  1/255 scaling、mean/std、NCHW/NHWC順序も含めて前処理の順序を固定する。
+- 新契約を採用するbundleはresize宣言を必須とし、不明なmode・interpolation・paddingは
+  load時に拒否する。旧manifestの暗黙letterboxとの互換方針は別途合意し、黙ってstretchへ変えない。
+- fixtureには正方形・横長・縦長・奇数辺のcropと、入力tensorのshape/dtype/期待値を含める。
+  padding端、resizeの丸め、detector bboxの逆変換を確認する。ONNX出力だけの比較では
+  前処理の不一致とモデルの数値誤差を切り分けられない。
+- `fixtures/` の画像・期待tensor・検出結果・encoder出力はchecksums.sha256の対象に含め、
+  外部trusted digestで同じbundleへ結び付ける。生成元ACR commit、ライブラリversion、
+  tensorとONNX出力それぞれの比較許容誤差 (初期候補: abs 1e-4) を記録する。
+- 合意後の受け入れテストは、ACR export/較正とIllumia双方で同じfixtureを読み、
+  tensor一致、CPU EPの検出/embedding一致、異なる方式の宣言を拒否することを検証する。
+
+syntheticな8×8 / 7×3 / 3×7 RGB連番画像を8×8へ処理し、両repoの現行関数を比較した。
+mean=0/std=1では最大tensor差は正方形0、横長/縦長とも約0.243137だった。
+これは学習済みモデルを使わない前処理差の再現であり、実bundleのparity合格ではない。
+
 ## thresholds.yaml 必須スキーマ (較正済み値)
 
 ```yaml
