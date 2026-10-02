@@ -1169,3 +1169,157 @@ fn escape_like(value: &str) -> String {
         .replace('%', "\\%")
         .replace('_', "\\_")
 }
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+    use crate::ml_client::Instance;
+    use std::io::Cursor;
+
+    fn fixture() -> (tempfile::TempDir, Database, String) {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database = Database::open(directory.path()).expect("database opens");
+        let mut image = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut image, image::ImageFormat::Png)
+            .expect("PNG encodes");
+        let asset = AssetService::new(database.clone())
+            .ingest(&image.into_inner(), "quality.png", None)
+            .expect("asset ingests")
+            .asset;
+        database
+            .with_connection(|connection| {
+                connection.execute(
+                    "INSERT INTO clusters(id, name, created_by, created_at)
+                 VALUES ('known', NULL, 'user', '2026-01-01T00:00:00Z')",
+                    [],
+                )?;
+                Ok(())
+            })
+            .expect("cluster inserts");
+        (directory, database, asset.id)
+    }
+
+    fn persist(service: &MlService, asset: &str, passed: bool, flags: Vec<String>) -> Vec<String> {
+        service
+            .persist_analysis(
+                asset,
+                Analysis {
+                    model_version: "quality-v1".into(),
+                    instances: vec![Instance {
+                        kind: "face".into(),
+                        bbox: [0.0, 0.0, 1.0, 1.0],
+                        det_conf: 0.99,
+                        quality_passed: passed,
+                        quality_flags: flags,
+                        embedding: 1.0_f32.to_le_bytes().to_vec(),
+                        embedding_dim: 1,
+                    }],
+                },
+            )
+            .expect("analysis persists")
+    }
+
+    #[test]
+    fn failed_quality_with_or_without_flags_remains_review_only_after_apply() {
+        for flags in [Vec::new(), vec!["small_crop".into()]] {
+            let (_directory, database, asset) = fixture();
+            let service = MlService::new(database.clone(), MlClient::new("unused.sock"));
+            let ids = persist(&service, &asset, false, flags);
+            assert_eq!(ids.len(), 1);
+            service
+                .apply_assignments(
+                    vec![Assignment {
+                        id: ids[0].clone(),
+                        cluster: Some("known".into()),
+                        state: "auto".into(),
+                        similarity: Some(1.0),
+                    }],
+                    &HashMap::new(),
+                )
+                .expect("assignment applies");
+            let candidate = service.review_candidates().expect("candidates query");
+            assert_eq!(candidate.len(), 1, "failed quality must not become auto");
+            assert!(!candidate[0].face.quality_flags.is_empty());
+            assert_eq!(candidate[0].face.similarity, Some(1.0));
+            assert!(
+                service
+                    .cluster_medoids("quality-v1")
+                    .expect("medoids query")
+                    .is_empty()
+            );
+            service
+                .review_candidate(&ids[0], true)
+                .expect("human accepts");
+            assert_eq!(
+                service
+                    .cluster_medoids("quality-v1")
+                    .expect("medoids query")
+                    .len(),
+                1
+            );
+            service
+                .apply_assignments(
+                    vec![Assignment {
+                        id: ids[0].clone(),
+                        cluster: None,
+                        state: "unassigned".into(),
+                        similarity: None,
+                    }],
+                    &HashMap::new(),
+                )
+                .expect("assignment applies");
+            let state: String = database
+                .with_connection(|connection| {
+                    Ok(connection.query_row(
+                        "SELECT state FROM faces WHERE id = ?1",
+                        [&ids[0]],
+                        |r| r.get(0),
+                    )?)
+                })
+                .expect("state queries");
+            assert_eq!(state, "confirmed");
+        }
+    }
+
+    #[test]
+    fn strict_gate_discards_failed_quality_even_with_empty_flags() {
+        let (_directory, database, asset) = fixture();
+        Settings::new(database.clone())
+            .set_quality_gate(QualityGate::Strict)
+            .expect("strict gate");
+        let service = MlService::new(database, MlClient::new("unused.sock"));
+        assert!(persist(&service, &asset, false, Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn passed_quality_still_allows_automatic_assignment() {
+        let (_directory, database, asset) = fixture();
+        let service = MlService::new(database.clone(), MlClient::new("unused.sock"));
+        let ids = persist(&service, &asset, true, Vec::new());
+        service
+            .apply_assignments(
+                vec![Assignment {
+                    id: ids[0].clone(),
+                    cluster: Some("known".into()),
+                    state: "auto".into(),
+                    similarity: Some(1.0),
+                }],
+                &HashMap::new(),
+            )
+            .expect("assignment applies");
+        assert_eq!(
+            service
+                .cluster_medoids("quality-v1")
+                .expect("medoids query")
+                .len(),
+            1
+        );
+        assert!(
+            service
+                .review_candidates()
+                .expect("candidates query")
+                .is_empty()
+        );
+    }
+}
