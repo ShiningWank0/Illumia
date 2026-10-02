@@ -190,7 +190,17 @@ jobs:
         # 最適化済みVaultテストも後段で既定stackのまま実行して確認する。
         env:
           RUST_MIN_STACK: '8388608'
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --no-capture --test-threads=1
+      - name: collect Windows test diagnostics on failure
+        if: failure() && runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-core-test-diagnostics
+          path: |
+            target/debug/deps/illumia_core-*.exe
+            target/debug/deps/illumia_core-*.pdb
+          if-no-files-found: ignore
+          retention-days: 1
       # PR でも release と同じ target/profile を検証する。署名・公開はしない。
       - name: build Windows desktop
         if: runner.os == 'Windows'
@@ -200,7 +210,7 @@ jobs:
           Copy-Item -LiteralPath target/release/illumia-desktop.exe -Destination dist/illumia-desktop-windows-x64.exe
       - name: test Windows optimized Vault with default stack
         if: runner.os == 'Windows'
-        run: cargo test --release --locked -p illumia-core 'vault::tests::'
+        run: cargo test --release --locked -p illumia-core --lib 'vault::tests::'
       - name: build macOS universal desktop
         if: runner.os == 'macOS'
         run: |

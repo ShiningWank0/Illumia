@@ -3252,6 +3252,8 @@ mod tests {
 
     #[test]
     fn export_failure_injection_preserves_a_complete_copy_at_every_boundary() -> Result<()> {
+        #[cfg(windows)]
+        eprintln!("Vault export test: entered");
         for failed_phase in [
             ExportPhase::SourcePrepared,
             ExportPhase::MainStaged,
@@ -3261,13 +3263,21 @@ mod tests {
         ] {
             let directory = tempfile::tempdir()?;
             let main = Database::open(directory.path())?;
+            #[cfg(windows)]
+            eprintln!("Vault export test: plain database opened");
             init_with_kdf(directory.path(), "password", KdfParams::for_tests())?;
+            #[cfg(windows)]
+            eprintln!("Vault export test: keyfile initialized");
             let vault = VaultHandle::open(directory.path(), unlock(directory.path(), "password")?)?;
+            #[cfg(windows)]
+            eprintln!("Vault export test: vault database opened");
             let bytes = png();
             let asset = AssetService::new(main.clone())
                 .ingest(&bytes, "boundary.png", None)?
                 .asset;
             import_assets(&main, &vault, std::slice::from_ref(&asset.id))?;
+            #[cfg(windows)]
+            eprintln!("Vault export test: source imported");
 
             let mut injected = false;
             let result = export_assets_inner(
