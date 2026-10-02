@@ -82,7 +82,8 @@
   UDS mockを使うML orchestration統合テストはUnixのみで実行する。WindowsのML transportは
   未実装 (`Unavailable`) のため、このCI追加をnamed pipe対応・動作検証として扱わない。
 - `codeql.yml`: main / PR / 週次に加え、release workflowからtag / dry-runの同一commitを
-  JavaScript/TypeScript、Python、Rust の CodeQL `security-extended` query で解析する。結果のuploadに必要な
+  解析する。PRはbase branchで制限せず、stacked PRも同じ静的解析で検証する。
+  JavaScript/TypeScript、Python、Rust の CodeQL `security-extended` query とbuild-mode noneを使う。結果のuploadに必要な
   `security-events: write` 以外は read-only とし、Action は commit SHA へ固定する。
 - `apps/android/**` は独立 Rust workspace / npm lockfile として専用 job で
   `cargo metadata --locked`、fmt、clippy、test、Android target に絞った `cargo audit`、

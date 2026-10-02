@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  # stacked PRもmain向けPRと同じ静的解析を行う。build-modeはnoneのまま。
   # release.yml からtag / dry-runの同一commitを解析する。
   workflow_call:
   schedule:
@@ -30,6 +30,8 @@ jobs:
         language: [javascript-typescript, python, rust]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Initialize CodeQL
         uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
         with:
