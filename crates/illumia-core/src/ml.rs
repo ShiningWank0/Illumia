@@ -1233,7 +1233,7 @@ mod quality_tests {
                         id: ids[0].clone(),
                         cluster: Some("known".into()),
                         state: "auto".into(),
-                            similarity: 1.0,
+                        similarity: 1.0,
                     }],
                     &HashMap::new(),
                 )
@@ -1264,7 +1264,7 @@ mod quality_tests {
                         id: ids[0].clone(),
                         cluster: None,
                         state: "unassigned".into(),
-                            similarity: 0.0,
+                        similarity: 0.0,
                     }],
                     &HashMap::new(),
                 )
@@ -1303,7 +1303,7 @@ mod quality_tests {
                     id: ids[0].clone(),
                     cluster: Some("known".into()),
                     state: "auto".into(),
-                        similarity: 1.0,
+                    similarity: 1.0,
                 }],
                 &HashMap::new(),
             )
