@@ -1,3 +1,6 @@
+// The mock sidecar uses Unix domain sockets. Windows ML transport is not implemented yet.
+#![cfg(unix)]
+
 use std::{
     io::{Cursor, Read, Write},
     os::unix::net::{UnixListener, UnixStream},

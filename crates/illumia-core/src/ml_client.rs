@@ -320,7 +320,7 @@ impl MlClient {
             // Windows の named pipe 実装は未了 (docs/01)。TCP へは決してフォールバック
             // しない。呼び出し側は ML 無効時と同じ経路で扱う。
             let _ = (method, path, content_type, body);
-            return Err(Error::Unavailable);
+            Err(Error::Unavailable)
         }
 
         #[cfg(unix)]
